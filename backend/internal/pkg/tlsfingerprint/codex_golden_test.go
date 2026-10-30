@@ -152,7 +152,7 @@ func assertHelloMatchesGolden(t *testing.T, ours, golden goldenHello, orderedExt
 }
 
 func TestCodexGolden_OpenSSLHTTPLane(t *testing.T) {
-	for _, version := range []string{"0.163.0", "0.164.0"} {
+	for _, version := range []string{"0.163.0", "0.164.0", "0.166.0"} {
 		t.Run(version, func(t *testing.T) {
 			golden := pickGolden(t, loadGoldenHellos(t, version, "tls_clienthellos.json"), "openssl", false)
 			ours := captureOurHello(t, BuiltinProfile("openssl36"))
@@ -162,7 +162,7 @@ func TestCodexGolden_OpenSSLHTTPLane(t *testing.T) {
 }
 
 func TestCodexGolden_RustlsWSLane(t *testing.T) {
-	for _, version := range []string{"0.163.0", "0.164.0"} {
+	for _, version := range []string{"0.163.0", "0.164.0", "0.166.0"} {
 		t.Run(version, func(t *testing.T) {
 			golden := pickGolden(t, loadGoldenHellos(t, version, "tls_clienthellos.json"), "rustls", false)
 			for i := 0; i < 5; i++ { // shuffled order: check several handshakes
@@ -174,7 +174,7 @@ func TestCodexGolden_RustlsWSLane(t *testing.T) {
 }
 
 func TestCodexGolden_RustlsCustomCAHTTPLane(t *testing.T) {
-	for _, version := range []string{"0.163.0", "0.164.0"} {
+	for _, version := range []string{"0.163.0", "0.164.0", "0.166.0"} {
 		t.Run(version, func(t *testing.T) {
 			golden := pickGolden(t, loadGoldenHellos(t, version, "tls_clienthellos_custom_ca.json"), "rustls", true)
 			// Later resumption attempts add pre_shared_key(41); compare a fresh one.

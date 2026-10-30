@@ -2,10 +2,18 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
@@ -60,8 +68,29 @@ func TestCodexEgressRequiresOptInAndExactAllowlist(t *testing.T) {
 		{"account not allowlisted", func(c *config.Config, a *Account, _ *http.Request) { a.ID = 42 }},
 		{"non-openai platform", func(_ *config.Config, a *Account, _ *http.Request) { a.Platform = PlatformAnthropic }},
 		{"setup token", func(_ *config.Config, a *Account, _ *http.Request) { a.Type = AccountTypeSetupToken }},
-		{"newer unverified version", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Version", "0.166.0") }},
+		{"newer unverified version", func(_ *config.Config, _ *Account, r *http.Request) {
+			r.Header.Set("Version", "0.167.0")
+			r.Header.Set("User-Agent", buildCodexCLIUserAgent("0.167.0"))
+		}},
+		{"alpha version", func(_ *config.Config, _ *Account, r *http.Request) {
+			r.Header.Set("Version", "0.166.0-alpha.5.1")
+			r.Header.Set("User-Agent", buildCodexCLIUserAgent("0.166.0-alpha.5.1"))
+		}},
+		{"mismatched version", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Version", "0.166.0") }},
 		{"mismatched identity", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Originator", "codex-tui") }},
+		{"mismatched exec identity", func(_ *config.Config, _ *Account, r *http.Request) {
+			r.Header.Set("Version", "0.166.0")
+			r.Header.Set("User-Agent", buildCodexCLIUserAgent("0.166.0"))
+			r.Header.Set("Originator", "codex_exec")
+		}},
+		{"uncaptured exec version", func(_ *config.Config, _ *Account, r *http.Request) {
+			r.Header.Set("Originator", "codex_exec")
+			r.Header.Set("User-Agent", "codex_exec/0.164.0 (Ubuntu 24.4.0; x86_64) xterm-256color")
+		}},
+		{"non-linux identity", func(_ *config.Config, _ *Account, r *http.Request) {
+			r.Header.Set("Version", "0.166.0")
+			r.Header.Set("User-Agent", "codex_cli_rs/0.166.0 (Windows 11; x86_64)")
+		}},
 		{"lookalike host", func(_ *config.Config, _ *Account, r *http.Request) { r.URL.Host = "chatgpt.com.attacker.invalid" }},
 		{"other path", func(_ *config.Config, _ *Account, r *http.Request) { r.URL.Path = "/backend-api/codex/models" }},
 	}
@@ -73,6 +102,152 @@ func TestCodexEgressRequiresOptInAndExactAllowlist(t *testing.T) {
 				t.Fatal("unexpectedly selected experimental egress")
 			}
 		})
+	}
+}
+
+// Use the official 0.166.0 requests, including refresh/tool-loop requests,
+// rather than merely updating a hand-written version string in a fixture.
+func TestCodexEgress166CapturedRequests(t *testing.T) {
+	files, err := filepath.Glob("../pkg/codexwire/testdata/golden/0.166.0/*.jsonl")
+	if err != nil || len(files) != 6 {
+		t.Fatalf("expected six captured scenarios, got %d: %v", len(files), err)
+	}
+	for _, file := range files {
+		t.Run(filepath.Base(file), func(t *testing.T) {
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := 0
+			for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+				var rec struct {
+					Kind    string                         `json:"kind"`
+					Method  string                         `json:"method"`
+					Target  string                         `json:"target"`
+					Headers []struct{ Name, Value string } `json:"headers"`
+					Body    json.RawMessage                `json:"body_json"`
+				}
+				if err := json.Unmarshal(line, &rec); err != nil {
+					t.Fatal(err)
+				}
+				if rec.Target != "/backend-api/codex/responses" {
+					continue
+				}
+				cfg, account, _ := codexEgressFixture()
+				scheme := "https"
+				if rec.Kind == "ws_handshake" {
+					scheme = "wss"
+				}
+				r, err := http.NewRequest(rec.Method, scheme+"://chatgpt.com"+rec.Target, bytes.NewReader(rec.Body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, h := range rec.Headers {
+					r.Header.Set(h.Name, h.Value)
+				}
+				if !codexEgressEligible(cfg, account, r.URL, r.Header) {
+					t.Fatal("captured 0.166.0 request did not select Codex egress")
+				}
+				checked++
+				if rec.Method != http.MethodPost {
+					continue
+				}
+				if r.Header.Get("Content-Encoding") != "zstd" {
+					t.Fatal("expected official HTTP zstd encoding")
+				}
+				// The recorder stores decoded JSON; the gateway receives JSON before encoding.
+				r.Header.Del("Content-Encoding")
+				u := &codexEgressUpstreamStub{}
+				if _, err := doCodexEgressHTTP(cfg, u, r, "", account); err != nil {
+					t.Fatal(err)
+				}
+				if u.doCalls != 0 || u.doWithTLSCalls != 1 {
+					t.Fatal("wrong HTTP transport selected")
+				}
+				decoder, err := zstd.NewReader(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoded, err := decoder.DecodeAll(u.body, nil)
+				decoder.Close()
+				if err != nil || !bytes.Equal(decoded, rec.Body) {
+					t.Fatal("captured JSON changed during HTTP compression")
+				}
+				cfg.Gateway.CodexEgress.Enabled = false
+				u = &codexEgressUpstreamStub{}
+				if _, err := doCodexEgressHTTP(cfg, u, r, "", account); err != nil {
+					t.Fatal(err)
+				}
+				if u.doCalls != 1 || u.doWithTLSCalls != 0 {
+					t.Fatal("disabled transport failed to fall back")
+				}
+			}
+			if checked == 0 {
+				t.Fatal("scenario has no Responses requests")
+			}
+		})
+	}
+}
+
+type codexEgressFallbackDialer struct{ calls int }
+
+func (d *codexEgressFallbackDialer) Dial(context.Context, string, http.Header, string) (openAIWSClientConn, int, http.Header, error) {
+	d.calls++
+	return nil, 0, nil, errors.New("fallback dialer")
+}
+
+// A rejecting local CONNECT proxy proves actual WS dialer selection and proxy
+// preservation without connecting to chatgpt.com or relaxing TLS verification.
+func TestCodexEgress166WebSocketRoute(t *testing.T) {
+	requests := make(chan string, 4)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Method + " " + r.Host
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	for _, tc := range []struct {
+		version string
+		enabled bool
+		allowed bool
+		wire    bool
+	}{
+		{"0.166.0", true, true, true},
+		{"0.166.0", false, true, false},
+		{"0.166.0", true, false, false},
+		{"0.167.0", true, true, false},
+		{"0.166.0-alpha.5.1", true, true, false},
+	} {
+		cfg, account, r := codexEgressFixture()
+		cfg.Gateway.CodexEgress.Enabled = tc.enabled
+		if !tc.allowed {
+			cfg.Gateway.CodexEgress.AccountIDs = nil
+		}
+		r.Header.Set("Version", tc.version)
+		r.Header.Set("User-Agent", buildCodexCLIUserAgent(tc.version))
+		fallback := &codexEgressFallbackDialer{}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _, _, err := dialOpenAIWSForAccount(ctx, cfg, openAIWSAcquireRequest{
+			Account: account, WSURL: "wss://chatgpt.com/backend-api/codex/responses", ProxyURL: proxy.URL,
+		}, r.Header, fallback)
+		cancel()
+		if err == nil {
+			t.Fatal("expected rejecting proxy or fallback error")
+		}
+		if tc.wire {
+			if fallback.calls != 0 || !strings.Contains(err.Error(), "502") {
+				t.Fatalf("wire route not selected: %v", err)
+			}
+			select {
+			case got := <-requests:
+				if got != "CONNECT chatgpt.com:443" {
+					t.Fatalf("wrong proxy destination: %s", got)
+				}
+			default:
+				t.Fatal("configured proxy was bypassed")
+			}
+		} else if fallback.calls != 1 {
+			t.Fatal("unverified or disabled request did not fall back")
+		}
 	}
 }
 

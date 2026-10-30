@@ -16,7 +16,7 @@ import (
 )
 
 // codexEgressEligible deliberately fails closed to the existing transport when
-// any boundary is unverified. Captures from 0.164.0 do not verify newer clients.
+// any boundary is unverified. Each allowed version has its own captured fixtures.
 // Never rewrite global identity settings or silently pin the advertised version.
 func codexEgressEligible(cfg *config.Config, account *Account, target *url.URL, headers http.Header) bool {
 	if cfg == nil || !cfg.Gateway.CodexEgress.Enabled || account == nil || account.ID <= 0 ||
@@ -30,9 +30,13 @@ func codexEgressEligible(cfg *config.Config, account *Account, target *url.URL, 
 		return false
 	}
 	version := headers.Get("Version")
-	return (version == "0.163.0" || version == "0.164.0") &&
-		headers.Get("Originator") == openai.CodexCLIOriginator &&
-		strings.HasPrefix(headers.Get("User-Agent"), openai.CodexCLIOriginator+"/") &&
+	originator := headers.Get("Originator")
+	// The 0.166.0 fixtures were recorded with `codex exec`. Keep the existing
+	// canonical CLI identity and accept this captured identity only for 0.166.0.
+	verifiedIdentity := originator == openai.CodexCLIOriginator || (version == "0.166.0" && originator == "codex_exec")
+	return (version == "0.163.0" || version == "0.164.0" || version == "0.166.0") &&
+		verifiedIdentity &&
+		strings.HasPrefix(headers.Get("User-Agent"), originator+"/") &&
 		openai.CodexUserAgentVersion(headers.Get("User-Agent")) == version &&
 		strings.Contains(headers.Get("User-Agent"), " (Ubuntu ")
 }
