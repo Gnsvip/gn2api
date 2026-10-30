@@ -95,13 +95,13 @@ func TestResolveOpenAIWSDecisionByClientTransport(t *testing.T) {
 		Reason:    "ws_v2_enabled",
 	}
 
-	httpDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportHTTP)
+	httpDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportHTTP, nil)
 	require.Equal(t, OpenAIUpstreamTransportHTTPSSE, httpDecision.Transport)
-	require.Equal(t, "client_protocol_http", httpDecision.Reason)
+	require.Equal(t, "http_relay_preserved", httpDecision.Reason)
 
-	wsDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportWS)
+	wsDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportWS, nil)
 	require.Equal(t, base, wsDecision)
 
-	unknownDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportUnknown)
+	unknownDecision := resolveOpenAIWSDecisionByClientTransport(base, OpenAIClientTransportUnknown, nil)
 	require.Equal(t, base, unknownDecision)
 }

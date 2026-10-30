@@ -2209,29 +2209,23 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 // - accounts.extra.openai_ws_enabled（历史开关）
 //
 // 优先级：
-// 1. 按账号类型读取分类型字段
+// 1. 分类型 mode 字段优先于 enabled 字段，与模式路由保持一致
 // 2. 分类型字段缺失时，回退兼容字段
+// 3. 全部缺失时：OAuth/SetupToken 默认开启，API Key 默认关闭
 func (a *Account) IsOpenAIResponsesWebSocketV2Enabled() bool {
-	if a == nil || !a.IsOpenAI() || a.Extra == nil {
+	if a == nil || !a.IsOpenAI() {
 		return false
 	}
+	defaultMode := OpenAIWSIngressModeOff
 	if a.IsOpenAIOAuthLike() {
-		if enabled, ok := a.Extra["openai_oauth_responses_websockets_v2_enabled"].(bool); ok {
-			return enabled
-		}
+		defaultMode = OpenAIWSIngressModeCtxPool
 	}
-	if a.IsOpenAIApiKey() {
-		if enabled, ok := a.Extra["openai_apikey_responses_websockets_v2_enabled"].(bool); ok {
-			return enabled
-		}
+	switch a.ResolveOpenAIResponsesWebSocketV2Mode(defaultMode) {
+	case OpenAIWSIngressModeOff, OpenAIWSIngressModeHTTPBridge:
+		return false
+	default:
+		return true
 	}
-	if enabled, ok := a.Extra["responses_websockets_v2_enabled"].(bool); ok {
-		return enabled
-	}
-	if enabled, ok := a.Extra["openai_ws_enabled"].(bool); ok {
-		return enabled
-	}
-	return false
 }
 
 const (

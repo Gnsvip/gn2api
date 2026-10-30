@@ -120,6 +120,24 @@ func TestOpenAIGatewayService_Forward_PreservePreviousResponseIDWhenWSEnabled(t 
 	require.Nil(t, upstream.lastReq, "WS 模式下失败时不应回退 HTTP")
 }
 
+func TestBuildOpenAIWSCreatePayloadProjectsInstructionsToCodexDeveloperItem(t *testing.T) {
+	service := &OpenAIGatewayService{}
+	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	payload := service.buildOpenAIWSCreatePayload(map[string]any{
+		"model":        "gpt-6-astra",
+		"instructions": "Follow the project rules.",
+		"input":        []any{map[string]any{"type": "message", "role": "user"}},
+	}, account)
+	require.NotContains(t, payload, "instructions")
+	items, ok := payload["input"].([]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+	first, ok := items[0].(json.RawMessage)
+	require.True(t, ok)
+	require.Equal(t, "developer", gjson.GetBytes(first, "role").String())
+	require.Equal(t, "model.base_instructions", gjson.GetBytes(first, "internal_chat_message_metadata_passthrough.content_item_kinds.0").String())
+}
+
 func TestOpenAIGatewayService_Forward_HTTPIngressStaysHTTPWhenWSEnabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	wsFallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -183,7 +201,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressStaysHTTPWhenWSEnabled(t *testi
 	decision, _ := c.Get("openai_ws_transport_decision")
 	reason, _ := c.Get("openai_ws_transport_reason")
 	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
+	require.Equal(t, "http_relay_preserved", reason)
 }
 
 func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentOnce(t *testing.T) {
@@ -269,7 +287,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentO
 	decision, _ := c.Get("openai_ws_transport_decision")
 	reason, _ := c.Get("openai_ws_transport_reason")
 	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
+	require.Equal(t, "http_relay_preserved", reason)
 }
 
 func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedContentOnce(t *testing.T) {
@@ -353,7 +371,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedC
 	decision, _ := c.Get("openai_ws_transport_decision")
 	reason, _ := c.Get("openai_ws_transport_reason")
 	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
+	require.Equal(t, "http_relay_preserved", reason)
 }
 
 func TestOpenAIGatewayService_Forward_APIKeyHTTPPreservesPreviousResponseIDWhenWSDisabled(t *testing.T) {

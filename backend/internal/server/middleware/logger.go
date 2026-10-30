@@ -77,6 +77,14 @@ func Logger() gin.HandlerFunc {
 		if model != "" {
 			fields = append(fields, zap.String("model", model))
 		}
+		for _, key := range []string{"openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason"} {
+			if value := c.GetString(key); value != "" {
+				fields = append(fields, zap.String(key, value))
+			}
+		}
+		if connected, exists := c.Get("openai_upstream_ws_connected"); exists {
+			fields = append(fields, zap.Bool("openai_upstream_ws_connected", connected == true))
+		}
 
 		l := logger.FromContext(c.Request.Context()).With(fields...)
 		l.Info("http request completed", zap.Time("completed_at", endTime))

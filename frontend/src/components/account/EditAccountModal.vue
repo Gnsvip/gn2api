@@ -4155,7 +4155,7 @@ const openAIResponsesMode = ref<OpenAIResponsesMode>('auto')
 // Images 非流式响应缺 b64_json 时由网关下载 url 回填（仅 OpenAI API Key）。
 const openAIImagesUrlToB64JsonEnabled = ref(false)
 const openAIEndpointCapabilities = ref<OpenAIEndpointCapability[]>(['chat_completions', 'embeddings'])
-const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
+const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_CTX_POOL)
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
@@ -4652,7 +4652,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   openAIResponsesMode.value = 'auto'
   openAIEndpointCapabilities.value = ['chat_completions', 'embeddings']
   openAICompactModelMappings.value = []
-  openaiOAuthResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_OFF
+  openaiOAuthResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_CTX_POOL
   openaiAPIKeyResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_OFF
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
@@ -4695,7 +4695,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       modeKey: 'openai_oauth_responses_websockets_v2_mode',
       enabledKey: 'openai_oauth_responses_websockets_v2_enabled',
       fallbackEnabledKeys: ['responses_websockets_v2_enabled', 'openai_ws_enabled'],
-      defaultMode: OPENAI_WS_MODE_OFF
+      defaultMode: OPENAI_WS_MODE_CTX_POOL
     })
     openaiAPIKeyResponsesWebSocketV2Mode.value = resolveOpenAIWSModeFromExtra(extra, {
       modeKey: 'openai_apikey_responses_websockets_v2_mode',

@@ -1702,7 +1702,7 @@ const openAIEndpointCapabilities = ref<OpenAIEndpointCapability[]>([
   'embeddings'
 ])
 const openAIResponsesMode = ref<OpenAIResponsesMode>('auto')
-const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
+const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_CTX_POOL)
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const upstreamBillingAutoProbeMode = ref<'enabled' | 'disabled'>('enabled')
 const codexCLIOnlyEnabled = ref(false)

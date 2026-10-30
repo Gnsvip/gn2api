@@ -63,9 +63,10 @@ func normalizeOpenAIClientTransport(transport OpenAIClientTransport) OpenAIClien
 func resolveOpenAIWSDecisionByClientTransport(
 	decision OpenAIWSProtocolDecision,
 	clientTransport OpenAIClientTransport,
+	account *Account,
 ) OpenAIWSProtocolDecision {
-	if clientTransport == OpenAIClientTransportHTTP {
-		return openAIWSHTTPDecision("client_protocol_http")
+	if clientTransport == OpenAIClientTransportHTTP && (account == nil || !account.IsOpenAI() || !account.IsOpenAIOAuthLike()) {
+		return openAIWSHTTPDecision("http_relay_preserved")
 	}
 	return decision
 }

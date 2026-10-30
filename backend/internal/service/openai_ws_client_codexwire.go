@@ -33,7 +33,11 @@ func (c *codexWireClientConn) WriteJSON(ctx context.Context, value any) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return c.conn.WriteJSON(ctx, value)
+	payload, err := codexwire.PrepareWSMessage(value)
+	if err != nil {
+		return err
+	}
+	return c.conn.WriteMessage(ctx, payload)
 }
 
 func (c *codexWireClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
@@ -77,7 +81,11 @@ func (c *codexWireClientConn) WriteFrame(ctx context.Context, msgType coderws.Me
 	if msgType == coderws.MessageBinary {
 		return c.conn.WriteMessageBinary(ctx, payload)
 	}
-	return c.conn.WriteMessage(ctx, payload)
+	ordered, err := codexwire.PrepareWSMessage(payload)
+	if err != nil {
+		return err
+	}
+	return c.conn.WriteMessage(ctx, ordered)
 }
 
 func (c *codexWireClientConn) Ping(ctx context.Context) error {
@@ -144,6 +152,8 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 	if plaintextProxy || !codexEgressEligible(cfg, req.Account, target, headers) {
 		return fallback.Dial(ctx, req.WSURL, headers, req.ProxyURL)
 	}
+	headers = headers.Clone()
+	codexwire.ProjectBusinessHeaders(headers, true)
 	ordered, leftover := codexwire.SplitCodexWSHeaders(headers)
 	// 未命中模板头（如 x-codex-turn-state 已挪进 client_metadata 后不应再出现；
 	// cookie/attestation 等模板外注入头）按出现顺序附在官方头之后。

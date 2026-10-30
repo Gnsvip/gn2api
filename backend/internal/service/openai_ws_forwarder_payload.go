@@ -3,11 +3,13 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -215,7 +217,46 @@ func (s *OpenAIGatewayService) buildOpenAIWSCreatePayload(reqBody map[string]any
 	if account != nil && account.UsesOpenAICodexProtocol() && !s.isOpenAIWSStoreRecoveryAllowed(account) {
 		payload["store"] = false
 	}
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		prependCodexWSInstructionsItem(payload)
+	}
 	return payload
+}
+
+// Codex's WS request struct has no top-level instructions member. The official
+// CLI places base instructions in the first developer input item, so preserve
+// the same semantic boundary and metadata when an OpenAI-compatible client
+// sends the convenience field.
+func prependCodexWSInstructionsItem(payload map[string]any) {
+	instructions, ok := payload["instructions"].(string)
+	if !ok || strings.TrimSpace(instructions) == "" {
+		return
+	}
+	var item bytes.Buffer
+	item.WriteString(`{"type":"message","id":`)
+	item.WriteString(strconv.Quote(codexWSInstructionsItemID(instructions)))
+	item.WriteString(`,"role":"developer","content":[{"type":"input_text","text":`)
+	item.WriteString(strconv.Quote(instructions))
+	item.WriteString(`}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}}`)
+	raw := json.RawMessage(item.Bytes())
+	switch input := payload["input"].(type) {
+	case []any:
+		payload["input"] = append([]any{raw}, input...)
+	case []json.RawMessage:
+		payload["input"] = append([]json.RawMessage{raw}, input...)
+	case nil:
+		payload["input"] = []any{raw}
+	default:
+		return
+	}
+	delete(payload, "instructions")
+}
+
+func codexWSInstructionsItemID(instructions string) string {
+	sum := sha256.Sum256([]byte(instructions))
+	sum[6] = (sum[6] & 0x0f) | 0x50
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return "msg_" + fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func setOpenAIWSTurnMetadata(payload map[string]any, turnMetadata string) {
@@ -242,6 +283,26 @@ func setOpenAIWSTurnMetadata(payload map[string]any, turnMetadata string) {
 		payload["client_metadata"] = map[string]any{
 			openAIWSTurnMetadataHeader: metadata,
 		}
+	}
+}
+
+func setOpenAIWSTurnStateMetadata(payload map[string]any, turnState string) {
+	state := strings.TrimSpace(turnState)
+	if state == "" {
+		return
+	}
+	switch existing := payload["client_metadata"].(type) {
+	case map[string]any:
+		existing[openAIWSTurnStateHeader] = state
+	case map[string]string:
+		next := make(map[string]any, len(existing)+1)
+		for k, v := range existing {
+			next[k] = v
+		}
+		next[openAIWSTurnStateHeader] = state
+		payload["client_metadata"] = next
+	default:
+		payload["client_metadata"] = map[string]any{openAIWSTurnStateHeader: state}
 	}
 }
 

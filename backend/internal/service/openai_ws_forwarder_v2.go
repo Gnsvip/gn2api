@@ -136,6 +136,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			turnState = savedTurnState
 		}
 	}
+	setOpenAIWSTurnStateMetadata(payload, turnState)
 	preferredConnID := ""
 	if stateStore != nil && previousResponseID != "" {
 		if connID, ok := stateStore.GetResponseConn(previousResponseID); ok {
@@ -267,6 +268,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		lease.Release()
 	}()
 	connID := strings.TrimSpace(lease.ConnID())
+	if c != nil {
+		c.Set("openai_upstream_transport", "websocket")
+		c.Set("openai_upstream_ws_connected", true)
+	}
 	logOpenAIWSModeDebug(
 		"connected account_id=%d account_type=%s transport=%s conn_id=%s conn_reused=%v conn_idle_ms=%d conn_age_ms=%d upstream_pings=%d conn_pick_ms=%d queue_wait_ms=%d has_previous_response_id=%v",
 		account.ID,

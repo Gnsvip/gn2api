@@ -46,6 +46,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	// 请求体里的 client_metadata / prompt_cache_key，用改写后的值取键会让不同会话
 	// 落到同一个键，也会与 WS 接入路径按原始报文算出的键对不上。
 	wsExecutionScope, _ := resolveOpenAIWSExecutionScope(c, body, apiKeyID)
+	wsSessionScope := resolveOpenAIWSSessionScope(c, account, body)
+	if wsSessionScope.Ephemeral {
+		defer s.clearOpenAIWSSessionDisabled(wsSessionScope)
+	}
 	logCodexCLIOnlyDetection(ctx, c, account, apiKeyID, restrictionResult, body)
 	if restrictionResult.Enabled && !restrictionResult.Matched {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
@@ -109,10 +113,25 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
-	// 仅允许 WS 入站请求走 WS 上游，避免出现 HTTP -> WS 协议混用。
-	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c))
+	// OAuth HTTP clients can use the WS upstream without changing their client.
+	// API-key relays keep their existing HTTP contract.
+	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c), account)
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()
 	compactPath := isOpenAIResponsesCompactPath(c)
+	if compactPath {
+		wsDecision = openAIWSHTTPDecision("compact_http")
+	}
+	httpWSBridge := GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP && account.IsOpenAI() && account.IsOpenAIOAuthLike() && !compactPath && !passthroughEnabled
+	// A WS continuation cannot be replayed as stateless HTTP without its history.
+	if httpWSBridge && strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		if reason := s.openAIWSSessionDisabledReason(wsSessionScope); reason != "" {
+			wsDecision = openAIWSHTTPDecision("ws_session_disabled:" + reason)
+		}
+	}
+	// Explicit HTTP passthrough bypasses the WS forwarder; report the actual route.
+	if passthroughEnabled {
+		wsDecision = openAIWSHTTPDecision("account_http_passthrough")
+	}
 	if shouldFlattenOpenAIResponsesNamespaces(account, wsDecision.Transport, passthroughEnabled, compactPath) {
 		body, err = flattenOpenAIResponsesNamespaces(c, body)
 		if err != nil {
@@ -255,6 +274,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		return nil, errors.New("openai ws v1 is temporarily unsupported; use ws v2")
 	}
 	if passthroughEnabled {
+		c.Set("openai_upstream_transport", "http")
 		attemptImageIntentInvalidated := false
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			strippedBody, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(body)
@@ -782,7 +802,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	SetOpsUpstreamModel(c, upstreamModel)
 
-	// 命中 WS 时仅走 WebSocket Mode；不再自动回退 HTTP。
+	// HTTP 入站优先使用 WS；仅在尚未输出且无需 WS 续链时允许安全回退 HTTP。
 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
 		// WS 分支需要结构化 payload 与重连恢复，命中后再触发 full-map decode。
 		wsReqBody, err := ensureReqBody()
@@ -1013,8 +1033,34 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			return wsResult, nil
 		}
-		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
-		return nil, wsErr
+		action := openAIWSSessionFallbackActionFor(openAIWSSessionFallbackReason(wsErr))
+		if !httpWSBridge || !action.fallbackHTTP || ctx.Err() != nil || c == nil || c.Writer.Written() ||
+			openAIWSPayloadString(wsReqBody, "previous_response_id") != "" {
+			s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
+			return nil, wsErr
+		}
+		// Retry only before any downstream response has been committed. Never
+		// replay a partially delivered generation or an authentication/policy error.
+		// Preserve repairs performed by the WS retry loop (for example rejected
+		// encrypted history) instead of resurrecting the original request body.
+		httpFallbackBody := make(map[string]any, len(wsReqBody))
+		for key, value := range wsReqBody {
+			httpFallbackBody[key] = value
+		}
+		delete(httpFallbackBody, "type")
+		body, err = marshalOpenAIUpstreamJSON(httpFallbackBody)
+		if err != nil {
+			return nil, fmt.Errorf("serialize HTTP fallback body: %w", err)
+		}
+		requestView = newOpenAIRequestView(body)
+		reqBody = httpFallbackBody
+		if action.markDisable {
+			s.markOpenAIWSSessionDisabled(wsSessionScope, action.reason)
+		}
+		wsDecision = openAIWSHTTPDecision("ws_session_fallback:" + action.reason)
+		c.Set("openai_ws_transport_decision", string(wsDecision.Transport))
+		c.Set("openai_ws_transport_reason", wsDecision.Reason)
+		logOpenAIWSModeInfo("http_bridge_fallback account_id=%d reason=%s", account.ID, normalizeOpenAIWSLogValue(action.reason))
 	}
 
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, upstreamModel, billingModel, originalModel)
@@ -1060,6 +1106,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		// Send request
+		if c != nil {
+			c.Set("openai_upstream_transport", "http")
+			c.Set("openai_upstream_ws_connected", false)
+		}
 		upstreamStart := time.Now()
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())

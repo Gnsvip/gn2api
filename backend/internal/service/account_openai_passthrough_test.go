@@ -158,7 +158,7 @@ func TestAccount_IsOpenAIResponsesWebSocketV2Enabled(t *testing.T) {
 		require.True(t, account.IsOpenAIResponsesWebSocketV2Enabled())
 	})
 
-	t.Run("OAuth账号不会读取API Key专用开关", func(t *testing.T) {
+	t.Run("OAuth账号不会读取API Key专用开关且默认开启", func(t *testing.T) {
 		account := &Account{
 			Platform: PlatformOpenAI,
 			Type:     AccountTypeOAuth,
@@ -166,7 +166,7 @@ func TestAccount_IsOpenAIResponsesWebSocketV2Enabled(t *testing.T) {
 				"openai_apikey_responses_websockets_v2_enabled": true,
 			},
 		}
-		require.False(t, account.IsOpenAIResponsesWebSocketV2Enabled())
+		require.True(t, account.IsOpenAIResponsesWebSocketV2Enabled())
 	})
 
 	t.Run("分类型新键优先于兼容键", func(t *testing.T) {
