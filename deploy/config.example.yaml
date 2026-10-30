@@ -230,6 +230,12 @@ security:
 # 网关配置
 # =============================================================================
 gateway:
+  # Codex 专用出站默认开启，符合条件的 OpenAI OAuth 账号自动使用。
+  # 无需账号白名单；旧 account_ids 配置不再限制账号范围。
+  # 仅覆盖已验证的版本、出站身份和上游地址，HTTP/WS 仍按原配置选择。
+  # 设为 false 并重启程序可恢复原传输方式。
+  codex_egress:
+    enabled: true
   # Minimum max_output_tokens when converting Chat Completions or Anthropic requests to Responses (minimum 16, default 128)
   # Chat Completions 或 Anthropic 请求转换为 Responses 时的最小 max_output_tokens（最小 16，默认 128）
   min_output_tokens: 128

@@ -38,12 +38,33 @@ func TestLoadDefaultMinOutputTokens(t *testing.T) {
 	require.Equal(t, 128, cfg.Gateway.MinOutputTokens)
 }
 
-func TestCodexEgressDefaultsDisabled(t *testing.T) {
-	resetViperWithJWTSecret(t)
-	cfg, err := Load()
-	require.NoError(t, err)
-	require.False(t, cfg.Gateway.CodexEgress.Enabled)
-	require.Empty(t, cfg.Gateway.CodexEgress.AccountIDs)
+func TestCodexEgressConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{"enabled by default", "{}", "", true},
+		{"explicitly enabled", "gateway:\n  codex_egress:\n    enabled: true\n", "", true},
+		{"explicitly disabled", "gateway:\n  codex_egress:\n    enabled: false\n", "", false},
+		{"legacy allowlist ignored", "gateway:\n  codex_egress:\n    account_ids: [41]\n", "", true},
+		{"legacy empty allowlist ignored", "gateway:\n  codex_egress:\n    account_ids: []\n", "", true},
+		{"legacy disabled respected", "gateway:\n  codex_egress:\n    enabled: false\n    account_ids: [41]\n", "", false},
+		{"disabled by environment", "{}", "false", false},
+		{"environment overrides file", "gateway:\n  codex_egress:\n    enabled: false\n", "true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			t.Setenv("GATEWAY_CODEX_EGRESS_ENABLED", tc.env)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(tc.yaml), 0o600))
+			t.Setenv("CONFIG_FILE", path)
+			cfg, err := Load()
+			require.NoError(t, err)
+			require.Equal(t, tc.want, cfg.Gateway.CodexEgress.Enabled)
+		})
+	}
 }
 
 func TestLoadMinOutputTokensFromEnv(t *testing.T) {

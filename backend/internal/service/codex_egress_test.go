@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/klauspost/compress/zstd"
+	"github.com/spf13/viper"
 )
 
 type codexEgressUpstreamStub struct {
@@ -43,7 +45,6 @@ func (u *codexEgressUpstreamStub) DoWithTLS(request *http.Request, _ string, _ i
 func codexEgressFixture() (*config.Config, *Account, *http.Request) {
 	cfg := &config.Config{}
 	cfg.Gateway.CodexEgress.Enabled = true
-	cfg.Gateway.CodexEgress.AccountIDs = []int64{41}
 	account := &Account{ID: 41, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 3}
 	request, _ := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", bytes.NewReader([]byte(`{"model":"gpt-6.1","input":[]}`)))
 	request.GetBody = func() (io.ReadCloser, error) {
@@ -55,7 +56,7 @@ func codexEgressFixture() (*config.Config, *Account, *http.Request) {
 	return cfg, account, request
 }
 
-func TestCodexEgressRequiresOptInAndExactAllowlist(t *testing.T) {
+func TestCodexEgressRequiresEligibleAccountAndCapturedIdentity(t *testing.T) {
 	cfg, account, request := codexEgressFixture()
 	if !codexEgressEligible(cfg, account, request.URL, request.Header) {
 		t.Fatal("expected captured Codex profile to be eligible")
@@ -65,8 +66,9 @@ func TestCodexEgressRequiresOptInAndExactAllowlist(t *testing.T) {
 		mutate func(*config.Config, *Account, *http.Request)
 	}{
 		{"disabled", func(c *config.Config, _ *Account, _ *http.Request) { c.Gateway.CodexEgress.Enabled = false }},
-		{"account not allowlisted", func(c *config.Config, a *Account, _ *http.Request) { a.ID = 42 }},
+		{"invalid account", func(_ *config.Config, a *Account, _ *http.Request) { a.ID = 0 }},
 		{"non-openai platform", func(_ *config.Config, a *Account, _ *http.Request) { a.Platform = PlatformAnthropic }},
+		{"API key", func(_ *config.Config, a *Account, _ *http.Request) { a.Type = AccountTypeAPIKey }},
 		{"setup token", func(_ *config.Config, a *Account, _ *http.Request) { a.Type = AccountTypeSetupToken }},
 		{"newer unverified version", func(_ *config.Config, _ *Account, r *http.Request) {
 			r.Header.Set("Version", "0.167.0")
@@ -99,7 +101,50 @@ func TestCodexEgressRequiresOptInAndExactAllowlist(t *testing.T) {
 			c, a, r := codexEgressFixture()
 			tc.mutate(c, a, r)
 			if codexEgressEligible(c, a, r.URL, r.Header) {
-				t.Fatal("unexpectedly selected experimental egress")
+				t.Fatal("unexpectedly selected Codex egress")
+			}
+		})
+	}
+}
+
+// Exercise actual configuration loading and HTTP selection for existing and new
+// accounts. Legacy account_ids must not restrict the default-on transport.
+func TestCodexEgressDefaultHTTPRouteForAllEligibleAccounts(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_allowlist=%t", legacy), func(t *testing.T) {
+			viper.Reset()
+			t.Cleanup(viper.Reset)
+			t.Setenv("JWT_SECRET", strings.Repeat("x", 32))
+			t.Setenv("GATEWAY_CODEX_EGRESS_ENABLED", "")
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			yaml := "{}"
+			if legacy {
+				yaml = "gateway:\n  codex_egress:\n    account_ids: [41]\n"
+			}
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CONFIG_FILE", path)
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, version := range []string{"0.163.0", "0.164.0", "0.166.0"} {
+				for _, id := range []int64{41, 42, 1001} {
+					t.Run(fmt.Sprintf("%s/account_%d", version, id), func(t *testing.T) {
+						_, account, request := codexEgressFixture()
+						account.ID = id
+						request.Header.Set("Version", version)
+						request.Header.Set("User-Agent", buildCodexCLIUserAgent(version))
+						upstream := &codexEgressUpstreamStub{}
+						if _, err := doCodexEgressHTTP(cfg, upstream, request, "", account); err != nil {
+							t.Fatal(err)
+						}
+						if upstream.doCalls != 0 || upstream.doWithTLSCalls != 1 {
+							t.Fatal("eligible account did not automatically select Codex HTTP transport")
+						}
+					})
+				}
 			}
 		})
 	}
@@ -198,7 +243,7 @@ func (d *codexEgressFallbackDialer) Dial(context.Context, string, http.Header, s
 
 // A rejecting local CONNECT proxy proves actual WS dialer selection and proxy
 // preservation without connecting to chatgpt.com or relaxing TLS verification.
-func TestCodexEgress166WebSocketRoute(t *testing.T) {
+func TestCodexEgressWebSocketRoute(t *testing.T) {
 	requests := make(chan string, 4)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.Host
@@ -206,22 +251,22 @@ func TestCodexEgress166WebSocketRoute(t *testing.T) {
 	}))
 	defer proxy.Close()
 	for _, tc := range []struct {
-		version string
-		enabled bool
-		allowed bool
-		wire    bool
+		version   string
+		enabled   bool
+		accountID int64
+		wire      bool
 	}{
-		{"0.166.0", true, true, true},
-		{"0.166.0", false, true, false},
-		{"0.166.0", true, false, false},
-		{"0.167.0", true, true, false},
-		{"0.166.0-alpha.5.1", true, true, false},
+		{"0.163.0", true, 41, true},
+		{"0.164.0", true, 42, true},
+		{"0.166.0", true, 1001, true},
+		{"0.166.0", false, 1001, false},
+		{"0.166.0", true, 0, false},
+		{"0.167.0", true, 1001, false},
+		{"0.166.0-alpha.5.1", true, 1001, false},
 	} {
 		cfg, account, r := codexEgressFixture()
 		cfg.Gateway.CodexEgress.Enabled = tc.enabled
-		if !tc.allowed {
-			cfg.Gateway.CodexEgress.AccountIDs = nil
-		}
+		account.ID = tc.accountID
 		r.Header.Set("Version", tc.version)
 		r.Header.Set("User-Agent", buildCodexCLIUserAgent(tc.version))
 		fallback := &codexEgressFallbackDialer{}

@@ -1029,11 +1029,10 @@ const (
 )
 
 // GatewayConfig API网关相关配置
-// GatewayCodexEgressConfig enables the experimental transport for explicit accounts.
-// Empty account_ids never means all accounts.
+// GatewayCodexEgressConfig controls the default-on transport for eligible OpenAI OAuth accounts.
+// Eligibility is checked per request; no account allowlist is required.
 type GatewayCodexEgressConfig struct {
-	Enabled    bool    `mapstructure:"enabled"`
-	AccountIDs []int64 `mapstructure:"account_ids"`
+	Enabled bool `mapstructure:"enabled"`
 }
 
 type GatewayConfig struct {
@@ -2505,8 +2504,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_compact_model", "gpt-5.5")
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
-	viper.SetDefault("gateway.codex_egress.enabled", false)
-	viper.SetDefault("gateway.codex_egress.account_ids", []int64{})
+	viper.SetDefault("gateway.codex_egress.enabled", true)
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
 	viper.SetDefault("gateway.openai_ws.ingress_mode_default", "ctx_pool")

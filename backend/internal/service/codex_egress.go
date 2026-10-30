@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -20,8 +19,7 @@ import (
 // Never rewrite global identity settings or silently pin the advertised version.
 func codexEgressEligible(cfg *config.Config, account *Account, target *url.URL, headers http.Header) bool {
 	if cfg == nil || !cfg.Gateway.CodexEgress.Enabled || account == nil || account.ID <= 0 ||
-		account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth ||
-		!slices.Contains(cfg.Gateway.CodexEgress.AccountIDs, account.ID) || target == nil {
+		account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth || target == nil {
 		return false
 	}
 	if (target.Scheme != "https" && target.Scheme != "wss") || target.User != nil ||
