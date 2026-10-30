@@ -38,6 +38,14 @@ func TestLoadDefaultMinOutputTokens(t *testing.T) {
 	require.Equal(t, 128, cfg.Gateway.MinOutputTokens)
 }
 
+func TestCodexEgressDefaultsDisabled(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.False(t, cfg.Gateway.CodexEgress.Enabled)
+	require.Empty(t, cfg.Gateway.CodexEgress.AccountIDs)
+}
+
 func TestLoadMinOutputTokensFromEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("GATEWAY_MIN_OUTPUT_TOKENS", "16")

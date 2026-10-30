@@ -15,7 +15,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 			return response, err
 		}
 	}
-	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	return doCodexEgressHTTP(s.cfg, s.httpUpstream, request, proxyURL, account)
 }
 
 // doOpenAIAccountTestUpstream 让 OpenAI OAuth 账号测试与真实转发使用同一插件路径。
@@ -31,6 +31,9 @@ func (s *AccountTestService) doOpenAIAccountTestUpstream(
 		if handled {
 			return response, err
 		}
+	}
+	if codexEgressEligible(s.cfg, account, request.URL, request.Header) {
+		return doCodexEgressHTTP(s.cfg, s.httpUpstream, request, proxyURL, account)
 	}
 	if useTLSFallback {
 		return s.httpUpstream.DoWithTLS(
