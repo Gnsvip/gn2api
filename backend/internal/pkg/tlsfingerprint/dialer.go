@@ -5,12 +5,18 @@ package tlsfingerprint
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
@@ -25,11 +31,41 @@ type Profile struct {
 	PointFormats        []uint16
 	EnableGREASE        bool
 	SignatureAlgorithms []uint16 // Empty uses defaultSignatureAlgorithms
-	ALPNProtocols       []string // Empty uses ["http/1.1"]
+	ALPNProtocols       []string // Empty uses ["http/1.1"]; extension 16 is only emitted when listed in Extensions
 	SupportedVersions   []uint16 // Empty uses [TLS1.3, TLS1.2]
 	KeyShareGroups      []uint16 // Empty uses [X25519]
 	PSKModes            []uint16 // Empty uses [psk_dhe_ke]
 	Extensions          []uint16 // Extension type IDs in order; empty uses default Node.js 24.x order
+	// ShuffleExtensions reorders Extensions per handshake using the rustls 0.23
+	// scheme (msgs/handshake.rs order_insensitive_extensions_in_random_order):
+	// a random u16 order_seed, extensions sorted ascending by
+	// low_quality_integer_hash(seed<<16 | ext_id). Official Codex's rustls
+	// stack emits ClientHello extensions in this per-connection random order;
+	// a fixed order is itself a distinguishing fingerprint.
+	ShuffleExtensions bool
+	// H2 marks profiles whose HTTP transport must run over the codexwire HTTP/2
+	// client (hyper/h2-faithful) instead of net/http.
+	H2 bool
+	// H1 marks profiles whose HTTP transport must run over the codexwire raw
+	// HTTP/1.1 client (hyper h1 header order, one connection per request)
+	// instead of net/http.
+	H1 bool
+	// ReuseHybridX25519 makes the standalone X25519 key share reuse the
+	// classical half of the X25519MLKEM768 share, as rustls does. uTLS (and
+	// OpenSSL) generate the two X25519 keys independently, which is passively
+	// distinguishable from a rustls client.
+	ReuseHybridX25519 bool
+	// ProxyConnectKeepAlive adds "Proxy-Connection: Keep-Alive" to the HTTP
+	// proxy CONNECT request, as the Codex CLI's tungstenite fork does on the
+	// WebSocket lane (src/proxy.rs build_http_connect_request). hyper-util
+	// (HTTP lane) does not send it.
+	ProxyConnectKeepAlive bool
+	// InsecureSkipVerify disables upstream certificate verification. Only used
+	// by tests against self-signed local servers; never set in built-in
+	// profiles.
+	InsecureSkipVerify bool
+	// CodexProxyConnect selects the captured proxy handshake only for new profiles.
+	CodexProxyConnect bool
 }
 
 // Dialer creates TLS connections with custom fingerprints.
@@ -168,7 +204,7 @@ func (d *SOCKS5ProxyDialer) DialTLSContext(ctx context.Context, network, addr st
 
 	// Step 2: Establish SOCKS5 tunnel to target
 	slog.Debug("tls_fingerprint_socks5_establishing_tunnel", "target", addr)
-	conn, err := socksDialer.Dial("tcp", addr)
+	conn, err := socksDialer.(proxy.ContextDialer).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_socks5_connect_failed", "error", err)
 		return nil, fmt.Errorf("SOCKS5 connect: %w", err)
@@ -198,31 +234,54 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 	}
 
 	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+	rawConn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		slog.Debug("tls_fingerprint_http_proxy_connect_failed", "error", err)
 		return nil, fmt.Errorf("connect to proxy: %w", err)
 	}
 	slog.Debug("tls_fingerprint_http_proxy_connected", "proxy_addr", proxyAddr)
-
-	// Step 2: Send CONNECT request to establish tunnel
-	req := &http.Request{
-		Method: "CONNECT",
-		URL:    &url.URL{Opaque: addr},
-		Host:   addr,
-		Header: make(http.Header),
+	conn := rawConn
+	var stopCancel func() bool
+	if d.profile != nil && d.profile.CodexProxyConnect {
+		stopCancel = context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+		defer func() {
+			if stopCancel != nil {
+				stopCancel()
+			}
+		}()
+	}
+	// An https:// proxy speaks TLS before CONNECT. Sending CONNECT (and the
+	// Proxy-Authorization credentials) in plaintext to it fails and leaks them.
+	if d.profile != nil && d.profile.CodexProxyConnect && strings.EqualFold(d.proxyURL.Scheme, "https") {
+		tlsConn := tls.Client(rawConn, &tls.Config{ServerName: d.proxyURL.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, fmt.Errorf("tls handshake with https proxy: %w", err)
+		}
+		conn = tlsConn
 	}
 
-	// Add proxy authentication if present
-	if d.proxyURL.User != nil {
-		username := d.proxyURL.User.Username()
-		password, _ := d.proxyURL.User.Password()
-		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-		req.Header.Set("Proxy-Authorization", "Basic "+auth)
-	}
+	// Step 2: Send CONNECT request to establish tunnel. Written by hand:
+	// http.Request.Write adds "User-Agent: Go-http-client/1.1", which no
+	// reqwest/hyper client sends (hyper-util tunnel: CONNECT, Host, optional
+	// Proxy-Authorization).
+	req := &http.Request{Method: "CONNECT", URL: &url.URL{Opaque: addr}, Host: addr, Header: make(http.Header)}
+	connectReq := buildProxyConnectRequest(addr, d.proxyURL, d.profile != nil && d.profile.ProxyConnectKeepAlive)
 
 	slog.Debug("tls_fingerprint_http_proxy_sending_connect", "target", addr)
-	if err := req.Write(conn); err != nil {
+	if d.profile == nil || !d.profile.CodexProxyConnect {
+		if d.proxyURL.User != nil {
+			password, _ := d.proxyURL.User.Password()
+			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(d.proxyURL.User.Username()+":"+password)))
+		}
+	}
+	var writeErr error
+	if d.profile != nil && d.profile.CodexProxyConnect {
+		_, writeErr = io.WriteString(conn, connectReq)
+	} else {
+		writeErr = req.Write(conn)
+	}
+	if err := writeErr; err != nil {
 		_ = conn.Close()
 		slog.Debug("tls_fingerprint_http_proxy_write_failed", "error", err)
 		return nil, fmt.Errorf("write CONNECT request: %w", err)
@@ -244,10 +303,33 @@ func (d *HTTPProxyDialer) DialTLSContext(ctx context.Context, network, addr stri
 		slog.Debug("tls_fingerprint_http_proxy_connect_failed_status", "status_code", resp.StatusCode, "status", resp.Status)
 		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
 	}
+	if stopCancel != nil && !stopCancel() && ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	stopCancel = nil
 	slog.Debug("tls_fingerprint_http_proxy_tunnel_established")
 
 	// Step 4: Perform TLS handshake on the tunnel with utls fingerprint
 	return performTLSHandshake(ctx, conn, d.profile, addr)
+}
+
+// buildProxyConnectRequest returns the CONNECT request bytes the Codex CLI
+// writes: request line, Host, [Proxy-Connection: Keep-Alive on the WS lane],
+// optional Proxy-Authorization.
+func buildProxyConnectRequest(addr string, proxyURL *url.URL, keepAlive bool) string {
+	var b strings.Builder
+	_, _ = b.WriteString("CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n")
+	if keepAlive {
+		_, _ = b.WriteString("Proxy-Connection: Keep-Alive\r\n")
+	}
+	if proxyURL != nil && proxyURL.User != nil {
+		username := proxyURL.User.Username()
+		password, _ := proxyURL.User.Password()
+		_, _ = b.WriteString("Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password)) + "\r\n")
+	}
+	_, _ = b.WriteString("\r\n")
+	return b.String()
 }
 
 // DialTLSContext establishes a TLS connection with the configured fingerprint.
@@ -276,11 +358,30 @@ func performTLSHandshake(ctx context.Context, conn net.Conn, profile *Profile, a
 	}
 
 	spec := buildClientHelloSpecFromProfile(profile)
-	tlsConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloCustom)
+	tlsConn := utls.UClient(conn, &utls.Config{ServerName: host, InsecureSkipVerify: profile != nil && profile.InsecureSkipVerify}, utls.HelloCustom)
 
+	var hybrid *hybridKeyShare
+	if profile != nil && profile.ReuseHybridX25519 {
+		var err error
+		if hybrid, err = prefillHybridKeyShares(spec); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
 	if err := tlsConn.ApplyPreset(spec); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("apply TLS preset: %w", err)
+	}
+	if hybrid != nil {
+		// uTLS only records private keys for shares it generated itself; the
+		// prefilled shares need their keys installed explicitly. Both the
+		// hybrid and the standalone X25519 share use the same X25519 key.
+		tlsConn.HandshakeState.State13.KeyShareKeys = &utls.KeySharePrivateKeys{
+			CurveID:    utls.X25519,
+			Ecdhe:      hybrid.x25519,
+			Mlkem:      hybrid.mlkem,
+			MlkemEcdhe: hybrid.x25519,
+		}
 	}
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -387,9 +488,12 @@ func buildClientHelloSpecFromProfile(profile *Profile) *utls.ClientHelloSpec {
 	}
 
 	// Determine extension order
-	extOrder := defaultExtensionOrder
+	extOrder := slices.Clone(defaultExtensionOrder)
 	if profile != nil && len(profile.Extensions) > 0 {
-		extOrder = profile.Extensions
+		extOrder = slices.Clone(profile.Extensions)
+	}
+	if profile != nil && profile.ShuffleExtensions {
+		shuffleExtensionOrderRustls(extOrder)
 	}
 
 	// Build extensions list from the ordered IDs.
@@ -463,4 +567,44 @@ func toUint8s(vals []uint16) []uint8 {
 		out[i] = uint8(v)
 	}
 	return out
+}
+
+// lowQualityIntegerHash reproduces rustls msgs/handshake.rs
+// low_quality_integer_hash (0.23.x): used to map (order_seed<<16 | ext_id) to a
+// sortable key so ClientHello extensions are emitted in a per-connection
+// pseudo-random order.
+func lowQualityIntegerHash(x uint32) uint32 {
+	x = x + 0x7ed55d16 + (x << 12)
+	x = (x ^ 0xc761c23c) ^ (x >> 19)
+	x = x + 0x165667b1 + (x << 5)
+	x = x + 0xd3a2646c + (x << 9)
+	x = (x ^ 0xb55a4f09) ^ (x >> 16)
+	return x
+}
+
+// shuffleExtensionOrderRustls reorders extIDs in place exactly like rustls
+// ClientExtensions::order_insensitive_extensions_in_random_order: draw a random
+// u16 order_seed, sort by low_quality_integer_hash(seed<<16 | id). PSK/ECH
+// ordering constraints don't apply — codex-lane profiles never send them.
+func shuffleExtensionOrderRustls(extIDs []uint16) {
+	if len(extIDs) < 2 {
+		return
+	}
+	var seedBuf [2]byte
+	if _, err := rand.Read(seedBuf[:]); err != nil {
+		return
+	}
+	seed := uint32(binary.BigEndian.Uint16(seedBuf[:]))
+	slices.SortFunc(extIDs, func(a, b uint16) int {
+		ka := lowQualityIntegerHash((seed << 16) | uint32(a))
+		kb := lowQualityIntegerHash((seed << 16) | uint32(b))
+		switch {
+		case ka < kb:
+			return -1
+		case ka > kb:
+			return 1
+		default:
+			return 0
+		}
+	})
 }

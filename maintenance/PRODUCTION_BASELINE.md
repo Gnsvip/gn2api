@@ -45,6 +45,17 @@ non-OpenAI routes. Do not copy the reference fork's price multipliers, platform
 removals, model retirements or full prompt/tool synthesis into this change.
 No database schema change is planned.
 
+The experimental `gateway.codex_egress` config has an off-by-default switch
+and explicit OpenAI OAuth account ID allowlist. It currently accepts only the
+captured 0.163.0/0.164.0 version range, the existing canonical `codex_cli_rs`
+Ubuntu identity (no identity header is rewritten), and the Responses path on
+`chatgpt.com:443`; every other request stays on the existing Go transport.
+The HTTP path uses a fresh HTTP/1.1 connection and zstd-compresses replayable
+Responses bodies. The WebSocket path uses a custom TLS ClientHello and raw
+upgrade/frame implementation. No HTTP/2 transport lane, model/prompt synthesis,
+automatic account selection or production rollout is included. Source fixtures and
+profiles were selectively adapted from the LGPL-3.0 `czc-v2026.10.30.2` tag.
+
 Use local mocks and isolated synthetic databases for validation. Do not mirror
 production inference requests or reuse active production credentials in tests.
 The reference captures cover Codex 0.163.0 and 0.164.0; they do not prove exact
