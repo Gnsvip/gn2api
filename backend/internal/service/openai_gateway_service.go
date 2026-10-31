@@ -271,6 +271,10 @@ type OpenAIForwardResult struct {
 	RequestedReasoningEffort *string
 	Stream                   bool
 	OpenAIWSMode             bool
+	// RouteDegraded is set only when Tibo route selection applied (Cookie WS
+	// accounts): true means every route was degraded and the request was served
+	// on the plain HTTP fallback; false means a healthy/unknown route served it.
+	RouteDegraded *bool
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
 	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
@@ -517,6 +521,18 @@ type OpenAIGatewayService struct {
 	// tiboRouteDisabled is test only: keep Cookie WS / failover fixtures on the
 	// legacy route when the Tibo route feature is absent from this fork.
 	tiboRouteDisabled bool
+	// openaiTiboRoutes: accountID → *openAITiboAccountState (openai_tibo_route.go).
+	openaiTiboRoutes       sync.Map
+	openaiTiboProbeSem     chan struct{}
+	openaiTiboProbeSemOnce sync.Once
+	// openaiTiboProbeWG tracks background Tibo probes (tests wait on it).
+	openaiTiboProbeWG     sync.WaitGroup
+	openaiTiboLoaded      atomic.Bool
+	openaiTiboEnrolledAt  atomic.Int64
+	openaiTiboStats       openAITiboStats
+	openaiTiboPins        sync.Map // accountID\x00scope → openAITiboPin
+	openaiTiboPinPrunedAt atomic.Int64
+	openaiTiboMismatchLog sync.Map
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

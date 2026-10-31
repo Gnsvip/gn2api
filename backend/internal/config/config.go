@@ -1114,6 +1114,8 @@ type GatewayConfig struct {
 	CodexFullSynthesis *bool `mapstructure:"codex_full_synthesis"`
 	// CodexWire: Codex CLI wire profile emulation (OAuth-only).
 	CodexWire GatewayCodexWireConfig `mapstructure:"codex_wire"`
+	// OpenAITiboRoute: Tibo 探针挑线路（后台探测、投票确认、调度分层）。
+	OpenAITiboRoute OpenAITiboRouteConfig `mapstructure:"openai_tibo_route"`
 	// DisableCodexIdentityEnforcement: 关闭「强制统一 Codex 出站身份」。上游 /backend-api/codex
 	// 在容量紧张时按客户端身份分优先级降载，被降载的请求会拿到 HTTP 200 + 流内
 	// server_is_overloaded，该次请求失败。默认强制统一出口：所有 OAuth 出站的
@@ -2543,6 +2545,25 @@ func setDefaults() {
 	viper.SetDefault("gateway.codex_wire.strict", false)
 	viper.SetDefault("gateway.codex_wire.map_order_jitter", true)
 	viper.SetDefault("gateway.codex_wire.stream_idle_timeout_seconds", 300)
+	// Tibo HTTP probing (openai_tibo_route.go): ~10m ± up to 5m per account.
+	// Default on: the admin astra health dots come from these probes.
+	viper.SetDefault("gateway.openai_tibo_route.enabled", true)
+	viper.SetDefault("gateway.openai_tibo_route.interval", 10*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.spread", 5*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.healthy_interval", 10*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.degraded_interval", 5*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.unknown_backoff", []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute})
+	viper.SetDefault("gateway.openai_tibo_route.jitter", 0.2)
+	viper.SetDefault("gateway.openai_tibo_route.confirm_samples", 3)
+	viper.SetDefault("gateway.openai_tibo_route.confirm_spacing", 20*time.Second)
+	viper.SetDefault("gateway.openai_tibo_route.min_degraded_dwell", 10*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.max_stale", 45*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.active_window", 30*time.Minute)
+	viper.SetDefault("gateway.openai_tibo_route.max_probes_per_hour", 20)
+	viper.SetDefault("gateway.openai_tibo_route.probe_concurrency", 4)
+	viper.SetDefault("gateway.openai_tibo_route.scheduler_prefer_healthy_route", false)
+	viper.SetDefault("gateway.openai_tibo_route.degraded_alert_ratio", 0.5)
+	viper.SetDefault("gateway.openai_tibo_route.degraded_alert_min_requests", 20)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
 	viper.SetDefault("gateway.disable_codex_originator_normalization", false)
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
@@ -3692,6 +3713,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.OpenAIWS.StickyResponseIDTTLSeconds <= 0 {
 		return fmt.Errorf("gateway.openai_ws.sticky_response_id_ttl_seconds must be positive")
+	}
+	if err := validateOpenAITiboRoute(c.Gateway.OpenAITiboRoute); err != nil {
+		return err
 	}
 	if c.Gateway.OpenAIWS.StickyPreviousResponseTTLSeconds < 0 {
 		return fmt.Errorf("gateway.openai_ws.sticky_previous_response_ttl_seconds must be non-negative")
