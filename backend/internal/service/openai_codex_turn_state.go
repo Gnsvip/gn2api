@@ -46,6 +46,7 @@ func openAICodexTurnStateSeed(c *gin.Context) string {
 // 可能残留的上一 failover attempt 的值——否则换号后旧账号的 blob 会粘到
 // 新账号的响应上，这正是本文件要防止的跨账号矛盾。
 func (s *OpenAIGatewayService) relayOpenAICodexTurnState(c *gin.Context, account *Account, upstream http.Header) {
+	s.observeOpenAICodexTicketResponseHeader(c, upstream)
 	if c == nil || c.Writer == nil {
 		return
 	}
@@ -116,9 +117,8 @@ func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context
 }
 
 // guardOpenAICodexTurnStateEcho 出站守卫：客户端回带的 turn-state 若已知由
-// 其他账号铸造则剥离，同账号或无溯源记录时保持原样。只剥离、不注入——
-// /responses 路径的客户端是真实 Codex，会按自身回合语义自行回带；服务端
-// 注入是 Claude 兼容桥（无法回带的客户端）的专属行为。
+// 其他账号铸造则剥离，同账号或无溯源记录时保持原样。292 门票注入已随
+// 46998185d 移除，剥离后不再补发门票。
 func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, account *Account, h http.Header) {
 	if s == nil || h == nil || account == nil {
 		return

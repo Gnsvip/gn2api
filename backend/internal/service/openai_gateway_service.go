@@ -41,7 +41,8 @@ const (
 	// codexCLIUserAgent 是编译期兜底 UA；运行时优先使用由后台版本号拼出的规范 UA。
 	// 版本段必须来自 codexCLIVersion：UA 与 version 头是同一个版本声明的两个出口，
 	// 各自硬编码会漂移成互相矛盾的身份。
-	codexCLIUserAgent = openai.CodexDefaultOriginator + "/" + codexCLIVersion + codexCLIUserAgentSuffix
+	codexCLIUserAgent = openai.CodexDefaultOriginator + "/" + codexCLIVersion + codexCLIUserAgentSuffix +
+		" (" + openai.CodexDefaultOriginator + "; " + codexCLIVersion + ")"
 	// codex_cli_only 拒绝时单个请求头日志长度上限（字符）
 	codexCLIOnlyHeaderValueMaxBytes = 256
 
@@ -512,6 +513,10 @@ type OpenAIGatewayService struct {
 	openaiCodexTurnStateOrigins sync.Map
 	openaiWSSessionDisabled     sync.Map // isolated OAuth HTTP-to-WS fallback state
 	openaiCodexTurnStateWrites  atomic.Uint64
+
+	// tiboRouteDisabled is test only: keep Cookie WS / failover fixtures on the
+	// legacy route when the Tibo route feature is absent from this fork.
+	tiboRouteDisabled bool
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

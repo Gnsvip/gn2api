@@ -148,6 +148,8 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	}
 	applyCodexAccountIdentityHeaders(headers, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
 	applyStagedCodexFingerprintHeaders(c, account, headers)
+	applyCodexFingerprintConvergenceHeaders(c, codexAccountIdentitySource(c, account), headers)
+	applyCodexDeviceWireProfile(c, account, headers, true)
 
 	if account != nil && account.UsesOpenAICodexProtocol() {
 		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, headers, account); err != nil {
@@ -180,6 +182,8 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	// 管理员显式配置传入（上面写进 headers 的值只在强制统一被关闭时才参与配对）。
 	if account != nil && account.UsesOpenAICodexProtocol() {
 		enforceCodexIdentityHeadersWithUA(headers, s.codexIdentityOverrideUA(account))
+		s.applyCodexSessionIdentity(c, account, nil, headers)
+		restoreOpenAICodexTicketIdentity(c, headers)
 	}
 
 	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）。
@@ -195,6 +199,12 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 		strings.TrimSpace(headers.Get(openAICodexRoutingHintHeader)) != "",
 		"soft_routing_hint",
 	)
+
+	// WS 握手线序收口：删除官方不发的下划线 session_id / installation-id /
+	// accept-language 等旧习惯头；OpenAI-Beta 与 x-client-request-id 保留在 WS 车道。
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		projectCodexOutboundHeaders(headers, true)
+	}
 
 	return headers, sessionResolution, nil
 }

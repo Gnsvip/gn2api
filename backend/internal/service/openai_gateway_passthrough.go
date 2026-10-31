@@ -718,10 +718,14 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	// 与请求体 client_metadata 共享同一份 IDs（与非透传路径相同的相对位置：
 	// 会话隔离之后、终态身份收口之前）。
 	applyStagedCodexFingerprintHeaders(c, account, req.Header)
+	applyCodexFingerprintConvergenceHeaders(c, codexAccountIdentitySource(c, account), req.Header)
+	applyCodexDeviceWireProfile(c, account, req.Header, false)
 	// 终态收口：透传路径的 OAuth 与非透传完全一致，同样强制统一出站身份
 	// （User-Agent / originator / version 同源自洽），客户端自报身份不会到达上游。
 	if account.UsesOpenAICodexProtocol() {
 		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
+		s.applyCodexSessionIdentity(c, account, body, req.Header)
+		restoreOpenAICodexTicketIdentity(c, req.Header)
 	}
 
 	if req.Header.Get("content-type") == "" {
@@ -740,6 +744,47 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	applyOpenAICodexBetaFeatures(c, account, req.Header)
 	setOpenAICodexRoutingHintFromBody(req.Header, account, body)
 	logOpenAIRoutingDiagnosticsFromBody(ctx, account, "http_passthrough", req.Header, body, "not_applicable")
+
+	legacyCompactRequest := isOpenAIResponsesCompactPath(c) && !isOpenAINativeCompactionV2(c)
+	body, err = applyCodexRequestMetadata(req, body, account, legacyCompactRequest)
+	if err != nil {
+		return nil, err
+	}
+	if !legacyCompactRequest {
+		body, err = applyCodexHTTPWireMetadata(req, body, account)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if isCodexOAuthAccount(account) && !legacyCompactRequest && codexRequestSynthesized(c) {
+		if reordered, changed := reorderCodexRequestTopLevelJSON(body); changed {
+			body = reordered
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		}
+	}
+	if isCodexOAuthAccount(account) && s.codexMapOrderJitterEnabled() && !legacyCompactRequest {
+		if reordered, changed := reorderCodexClientMetadataJSON(body); changed {
+			body = reordered
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		}
+	}
+	if account.UsesOpenAICodexProtocol() && !legacyCompactRequest {
+		projectCodexOutboundHeaders(req.Header, false)
+	}
 
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err

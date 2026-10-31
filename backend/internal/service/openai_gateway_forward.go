@@ -526,6 +526,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// so a failover to an API-key/SetupToken account re-enters with the
 		// original body.
 		var synthResult *codexSynthResult
+		var attemptFingerprintIDs *codexFingerprintIDs
 		officialCodexClient := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
 		if isCodexOAuthAccount(account) && s.codexFullSynthesisEnabled() && !isCompactRequest {
 			deviceProfile, _ := codexDeviceProfileForRequest(account)
@@ -533,7 +534,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			attemptFingerprintIDs = resolveCodexFingerprintIDsForDecodedBody(c, account, clientHeaders, decoded)
 			wireMode := codexWireProfileModeAuto
 			if s != nil && s.cfg != nil && strings.TrimSpace(s.cfg.Gateway.CodexWire.Profile) != "" {
 				wireMode = s.cfg.Gateway.CodexWire.Profile
@@ -549,9 +550,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				Strict:         s.cfg != nil && s.cfg.Gateway.CodexWire.Strict,
 				OfficialClient: officialCodexClient,
 			}
-			if fpIDs != nil {
-				synthOptions.TurnID = fpIDs.turnID
-				synthOptions.TurnStartedMs = fpIDs.turnStartedAtUnixMs
+			if attemptFingerprintIDs != nil {
+				synthOptions.TurnID = attemptFingerprintIDs.turnID
+				synthOptions.TurnStartedMs = attemptFingerprintIDs.turnStartedAtUnixMs
 			}
 			result, synthErr := synthesizeCodexOAuthRequest(decoded, account, upstreamModel, synthOptions)
 			if synthErr != nil {
@@ -621,11 +622,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// 指纹收敛：一次性解析收敛 ID，请求体和出站头共享同一份 IDs（保证 turn_id 等随机字段一致）。
 		// fingerprintIDs 在此处解析，后续 buildUpstreamRequest 中使用同一份。
 		if !isCompactRequest {
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
+			fpIDs := attemptFingerprintIDs
+			if fpIDs == nil {
+				var clientHeaders http.Header
+				if c != nil && c.Request != nil {
+					clientHeaders = c.Request.Header
+				}
+				fpIDs = resolveCodexFingerprintIDsForDecodedBody(c, account, clientHeaders, decoded)
 			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 			if fpIDs != nil {
 				if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
 					markDecodedModified()
@@ -1607,11 +1611,15 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 
 	// 指纹收敛：使用 Forward() 中预计算的收敛 ID 改写出站头，与请求体使用同一份 IDs。
 	applyStagedCodexFingerprintHeaders(c, account, req.Header)
+	applyCodexFingerprintConvergenceHeaders(c, codexAccountIdentitySource(c, account), req.Header)
+	applyCodexDeviceWireProfile(c, account, req.Header, false)
 
 	// 终态收口：强制统一 OAuth 出站身份（User-Agent / originator / version 同源自洽）。
 	// 客户端自报身份不参与构造，浏览器型 UA 也因此不会再到达上游（原浏览器 UA 兜底已被吸收）。
 	if account.UsesOpenAICodexProtocol() {
 		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
+		s.applyCodexSessionIdentity(c, account, body, req.Header)
+		restoreOpenAICodexTicketIdentity(c, req.Header)
 	}
 
 	// Ensure required headers exist
@@ -1631,6 +1639,62 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	applyOpenAICodexBetaFeatures(c, account, req.Header)
 	setOpenAICodexRoutingHintFromBody(req.Header, account, body)
 	logOpenAIRoutingDiagnosticsFromBody(ctx, account, "http", req.Header, body, "not_applicable")
+
+	legacyCompactRequest := isOpenAIResponsesCompactPath(c) && !isOpenAINativeCompactionV2(c)
+	body, err = applyCodexRequestMetadata(req, body, account, legacyCompactRequest)
+	if err != nil {
+		return nil, err
+	}
+	if !legacyCompactRequest {
+		body, err = applyCodexHTTPWireMetadata(req, body, account)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// HTTP 顶层字段按官方 ResponsesApiRequest 声明序输出；合成路径原本是 Go map
+	// 字母序，必须收口，否则上游可逐字节识别。
+	if isCodexOAuthAccount(account) && !legacyCompactRequest && codexRequestSynthesized(c) {
+		if reordered, changed := reorderCodexRequestTopLevelJSON(body); changed {
+			body = reordered
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		}
+	}
+	// client_metadata 是官方 Rust HashMap：按键序随机。HTTP body 与 WS 帧使用
+	// 同一份 seed（turn/session id），同一 turn 的重试保持同序。
+	if isCodexOAuthAccount(account) && s.codexMapOrderJitterEnabled() && !legacyCompactRequest {
+		if reordered, changed := reorderCodexClientMetadataJSON(body); changed {
+			body = reordered
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		}
+	}
+	// HTTP 出站线序收口：所有改写完成后删官方不发的头并把 session_id/conversation_id
+	// 的隔离值挪到官方 session-id/thread-id。legacy compact 与 messages 桥不参与收口。
+	if account.UsesOpenAICodexProtocol() &&
+		!isOpenAICompatMessagesBridgeContext(c) && !isOpenAICompatMessagesBridgeBody(body) &&
+		!legacyCompactRequest {
+		projectCodexOutboundHeaders(req.Header, false)
+	}
+	// messages 桥不过收口，但 session/full 收敛写下的下划线 session_id 是非官方线形。
+	if isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body) {
+		if ids := stagedCodexFingerprintIDs(c, account); ids != nil &&
+			(ids.mode == codexFingerprintSession || ids.mode == codexFingerprintFull) {
+			req.Header.Del("session_id")
+		}
+	}
 
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err

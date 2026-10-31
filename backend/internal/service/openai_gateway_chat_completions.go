@@ -279,7 +279,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			fpIDs := resolveCodexFingerprintIDsForDecodedBody(c, account, clientHeaders, reqBody)
 			synthOptions := codexSynthOptions{
 				ResponsesLite: false,
 				WireProfile:   wireProfile,

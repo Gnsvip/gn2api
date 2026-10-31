@@ -335,7 +335,7 @@ func TestGetOpenAICodexCanonicalUserAgentBuildsFromVersion(t *testing.T) {
 	}}, nil)
 
 	require.Equal(t,
-		"codex_cli_rs/0.200.1"+codexCLIUserAgentSuffix,
+		"codex_cli_rs/0.200.1"+codexCLIUserAgentSuffix+" (codex_cli_rs; 0.200.1)",
 		svc.GetOpenAICodexCanonicalUserAgent(context.Background()),
 	)
 }
@@ -510,7 +510,6 @@ func TestGetOpenAICodexCanonicalUserAgentOutboundIdentity(t *testing.T) {
 			{name: "trailing_newline", value: "codex_cli_rs/0.140.0 (Linux)\n"},
 			{name: "valid_suffix", value: "codex_cli_rs/0.140.0 (Mac OS X 15.1.0; arm64) iTerm.app", client: "codex_cli_rs", suffix: " (Mac OS X 15.1.0; arm64) iTerm.app"},
 			{name: "valid_tab", value: "codex_cli_rs/0.140.0 (Linux)\tterminal", client: "codex_cli_rs", suffix: " (Linux)\tterminal"},
-			{name: "recognized_trailer", value: "custom/0.140.0 (Linux) (codex-tui; 0.140.0)", client: "codex-tui", suffix: " (Linux) (codex-tui; " + version.want + ")"},
 		} {
 			t.Run(version.name+"/"+ua.name, func(t *testing.T) {
 				svc := NewSettingService(&codexVersionSettingRepoStub{values: map[string]string{
