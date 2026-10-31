@@ -16,7 +16,7 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261031-qa-1'
+VERSION = '20261031-review-1'
 FILES = ['service.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
          'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py']
 
@@ -59,7 +59,8 @@ def existing_state(db):
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     state = {}
     for table, order in (('monitors', 'account_id'), ('results', 'id'),
-                         ('prompt_monitors', 'account_id'), ('prompt_results', 'id')):
+                         ('prompt_monitors', 'account_id'), ('prompt_results', 'id'),
+                         ('prompt_artifacts', 'result_id, case_id')):
         if table in tables:
             columns = [r[1] for r in db.execute(f'PRAGMA table_info({table})')]
             state[table] = (columns, db.execute(f'SELECT * FROM {table} ORDER BY {order}').fetchall(), order)
@@ -112,7 +113,7 @@ def main():
         raise RuntimeError('finite nginx worker shutdown timeout requires review')
     report = dict(mode='read-only preflight', service_sha256=current_hash,
                   script_version=VERSION, gateway_compatible=True,
-                  changes=['independent extension files', 'additive SQLite columns', 'nginx script version and 128k body limit'])
+                  changes=['independent extension files', 'additive SQLite columns/artifact table', 'nginx script version and 128k body limit'])
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not args.apply:
         return

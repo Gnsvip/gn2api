@@ -38,12 +38,16 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 PROMPT_MAX_CHARS = 4000
 DEFAULT_PROMPT = "{{challenge}}"
 QA_MAX_CASES = 5
+MAX_ARTIFACT_BYTES = 512 * 1024
 DEFAULT_QA_CASES = [
     {"id": "candy", "name": "糖果形状题", "enabled": False,
      "prompt": "黑色袋子中有苹果味、桃子味、西瓜味三种糖果。圆形分别有 7、9、8 颗，五角星形分别有 7、6、4 颗。"
                "可以靠手感辨别并选择形状，但不能靠手感辨别口味。活动前决定取出的总数，最少取多少颗，"
                "才能保证同时有圆形苹果味和五角星桃子味，或者圆形桃子味和五角星苹果味？只回答最少颗数的阿拉伯数字，不要解释。",
      "expected_answer": "21"},
+    {"id": "pelican_bicycle", "name": "鹈鹕骑自行车动画", "enabled": False, "kind": "manual",
+     "prompt": "创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试，不需要调用任何skills",
+     "expected_answer": ""},
 ]
 PROBE_READ_TIMEOUT = 120
 CONFIDENCE = 0.80  # Conservative display threshold, not a guarantee of identity.
@@ -102,6 +106,10 @@ class Store:
                     checked_at REAL NOT NULL, model TEXT NOT NULL, result TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS prompt_results_account ON prompt_results(account_id, id);
+                CREATE TABLE IF NOT EXISTS prompt_artifacts (
+                    result_id INTEGER NOT NULL, case_id TEXT NOT NULL, html TEXT NOT NULL, prompt TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(result_id, case_id)
+                );
             """)
             # Migrate existing installations without losing settings or history.
             columns = {row[1] for row in db.execute("PRAGMA table_info(monitors)")}
@@ -293,8 +301,11 @@ class Store:
             now = time.time()
             result = dict(result)
             context = result.pop("_context", "")
+            artifacts = result.pop("_artifacts", {})
+            manual_round = job.get("test_mode") == "qa" and any(
+                case.get("enabled") and case.get("kind") == "manual" for case in json.loads(job["cases"]))
             streak = 0
-            if current["auto_pause_enabled"] and result.get("status") == "red" and context:
+            if current["auto_pause_enabled"] and result.get("status") == "red" and context and not manual_round:
                 streak = (current["failure_streak"] if current["failure_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
             mode = job.get("test_mode", "attribution")
@@ -303,15 +314,54 @@ class Store:
             if mode == "attribution":
                 result["bank_commit"] = BANK_COMMIT
             result["failure_streak"] = streak
-            db.execute("INSERT INTO prompt_results(account_id,checked_at,model,result) VALUES(?,?,?,?)",
-                       (job["account_id"], now, job["model"], json.dumps(result, ensure_ascii=False)))
+            inserted = db.execute("INSERT INTO prompt_results(account_id,checked_at,model,result) VALUES(?,?,?,?)",
+                                  (job["account_id"], now, job["model"], json.dumps(result, ensure_ascii=False)))
+            for case_id, artifact in artifacts.items():
+                db.execute("INSERT INTO prompt_artifacts(result_id,case_id,html,prompt) VALUES(?,?,?,?)",
+                           (inserted.lastrowid, case_id, artifact["html"], artifact["prompt"]))
             db.execute("DELETE FROM prompt_results WHERE account_id=? AND id NOT IN "
                        "(SELECT id FROM prompt_results WHERE account_id=? ORDER BY id DESC LIMIT ?)",
                        (job["account_id"], job["account_id"], MAX_HISTORY))
+            db.execute("DELETE FROM prompt_artifacts WHERE result_id NOT IN (SELECT id FROM prompt_results)")
             db.execute("""UPDATE prompt_monitors SET running=0,message=?,failure_streak=?,failure_context=?,
                        pause_status=?,pause_retry_at=0 WHERE account_id=?""",
                        (result.get("message", ""), streak, context if streak else "",
                         "pending" if pending else "", job["account_id"]))
+
+    def artifact(self, account_id, result_id, case_id):
+        with self.db() as db:
+            row = db.execute("""SELECT a.html,a.prompt FROM prompt_artifacts a
+                JOIN prompt_results r ON r.id=a.result_id
+                WHERE r.account_id=? AND a.result_id=? AND a.case_id=?""",
+                (account_id, result_id, case_id)).fetchone()
+            return dict(row) if row else None
+
+    def review_artifact(self, account_id, result_id, case_id, status):
+        # Human review only edits this result. It never changes scheduling or red streaks.
+        with self.action_lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT r.result FROM prompt_results r
+                JOIN prompt_artifacts a ON a.result_id=r.id
+                WHERE r.account_id=? AND r.id=? AND a.case_id=?""",
+                (account_id, result_id, case_id)).fetchone()
+            if not row:
+                return False
+            result = json.loads(row[0])
+            case = next((item for item in result.get("cases", []) if item["id"] == case_id and item.get("kind") == "manual"), None)
+            if not case:
+                return False
+            reviewed_at = time.time()
+            case.update(status=status, review_status="reviewed", reviewed_at=reviewed_at, review_source="admin_manual",
+                        message={"green": "人工确认：符合要求", "yellow": "人工标记：待确认", "red": "人工确认：不符合要求"}[status])
+            case["reviews"] = (case.get("reviews", []) + [{"status": status, "at": reviewed_at}])[-10:]
+            if result.get("round_complete"):
+                result["status"] = qa_status(result["cases"])
+                result["message"] = {"green": "所选题目均通过（含人工评分）", "yellow": "含待确认结果（人工评分已保存）",
+                                     "red": "有题目未通过（含人工评分）"}[result["status"]]
+            result["manual_reviewed"] = True
+            db.execute("UPDATE prompt_results SET result=? WHERE id=? AND account_id=?",
+                       (json.dumps(result, ensure_ascii=False), result_id, account_id))
+            return True
 
     def apply_pending_pause(self, accounts, controller):
         # Serialize with configuration writes: a cancelled generation must never send a pause.
@@ -389,7 +439,7 @@ class Store:
                               (account_id, MAX_HISTORY)).fetchall()
         prompt = self.get_prompt(account_id)
         with self.db() as db:
-            prompt_rows = db.execute("SELECT result FROM prompt_results WHERE account_id=? ORDER BY id DESC LIMIT ?",
+            prompt_rows = db.execute("SELECT id,result FROM prompt_results WHERE account_id=? ORDER BY id DESC LIMIT ?",
                                      (account_id, MAX_HISTORY)).fetchall()
         prompt_public = {
             "enabled": bool(prompt and prompt["enabled"]),
@@ -409,7 +459,7 @@ class Store:
             "pause_status": prompt["pause_status"] if prompt else "",
             "paused_at": prompt["paused_at"] if prompt else None,
             "pause_message": prompt["pause_message"] if prompt else "",
-            "history": [json.loads(r[0]) for r in reversed(prompt_rows)],
+            "history": [{**json.loads(r[1]), "result_id": r[0]} for r in reversed(prompt_rows)],
         }
         return {
             "account_id": account_id, "enabled": bool(config and config["enabled"]),
@@ -518,13 +568,16 @@ def validate_qa_cases(cases, enabled):
         if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", identity) or identity in ids:
             raise ProbeError("题目编号无效或重复")
         ids.add(identity)
-        cleaned = {"id": identity, "enabled": case["enabled"]}
+        kind = case.get("kind", "exact")
+        if kind not in ("exact", "manual"):
+            raise ProbeError("题目判断方式无效")
+        cleaned = {"id": identity, "enabled": case["enabled"], "kind": kind}
         for field, maximum, label in (("name", 80, "题目名称"), ("prompt", PROMPT_MAX_CHARS, "提示词"),
                                       ("expected_answer", 200, "预期答案")):
             value = case.get(field, "")
             if not isinstance(value, str) or len(value) > maximum:
                 raise ProbeError(f"{label}不能超过 {maximum} 个字符")
-            if case["enabled"] and not value.strip():
+            if case["enabled"] and not value.strip() and not (field == "expected_answer" and kind == "manual"):
                 raise ProbeError(f"启用的题目必须填写{label}")
             cleaned[field] = value
         normalized.append(cleaned)
@@ -535,6 +588,24 @@ def validate_qa_cases(cases, enabled):
 
 def normalized_answer(text):
     return unicodedata.normalize("NFKC", text).strip().casefold()
+
+
+def qa_status(cases):
+    colors = {item["status"] for item in cases}
+    return "yellow" if not cases or "yellow" in colors else "red" if "red" in colors else "green"
+
+
+def html_artifact(output):
+    # Keep the model's document as data; only unwrap a single complete Markdown fence.
+    text = output.strip()
+    fenced = re.fullmatch(r"```(?:html|svg|xml)?\s*\n(.*?)\n```", text, flags=re.S | re.I)
+    if fenced:
+        text = fenced.group(1).strip()
+    if not text:
+        raise ProbeError("模型未返回可预览的内容")
+    if len(text.encode("utf-8")) > MAX_ARTIFACT_BYTES:
+        raise ProbeError("生成内容超过 512 KiB 预览上限，本题待确认")
+    return text
 
 
 def validate_prompt_template(prompt):
@@ -932,7 +1003,7 @@ def run_qa_round(job, store, accounts, controller):
     started = time.monotonic()
     deadline = started + 240
     cancelled = lambda: not store.is_prompt_current(job)
-    requests_sent, results = 0, []
+    requests_sent, results, artifacts = 0, [], {}
     selected = []
     context = None
 
@@ -956,8 +1027,17 @@ def run_qa_round(job, store, accounts, controller):
         controller.check_prompt_support()
         for case in selected:
             item = {"id": case["id"], "name": case["name"], "expected_answer": case["expected_answer"],
-                    "status": "yellow", "requests": 0}
+                    "status": "yellow", "requests": 0, "kind": case["kind"]}
             results.append(item)
+            if case["kind"] == "manual":
+                check_account()
+                requests_sent += 1
+                item["requests"] = 1
+                output = controller.prompt(job["account_id"], job["model"], case["prompt"], cancelled, deadline)
+                check_account()
+                artifacts[case["id"]] = {"html": html_artifact(output), "prompt": case["prompt"]}
+                item.update(review_status="pending", artifact_available=True, message="已生成作品，待人工预览评分")
+                continue
             answers = []
             for attempt in range(2):
                 check_account()
@@ -981,15 +1061,15 @@ def run_qa_round(job, store, accounts, controller):
                                 message="两次均返回同一非预期答案" if confirmed else "两次非预期答案不同，待确认")
             # No replacement questions: each selected question runs once, with at most one confirmation.
         check_account()
-        colors = {item["status"] for item in results}
-        status = "yellow" if "yellow" in colors else "red" if "red" in colors else "green"
+        status = qa_status(results)
         result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目复测仍未通过",
-                                                "yellow": "本轮有不稳定结果，待确认"}[status], "_context": context.hex()}
+                                                "yellow": "本轮含待确认结果"}[status], "_context": context.hex(), "round_complete": True}
     except ProbeError as exc:
-        result = {"status": "yellow", "message": str(exc)}
+        result = {"status": "yellow", "message": str(exc), "round_complete": False}
         if results and results[-1]["status"] == "yellow":
             results[-1]["message"] = str(exc)
-    result.update(test_mode="qa", requests=requests_sent, request_limit=len(selected) * 2,
+    result.update(test_mode="qa", requests=requests_sent, request_limit=sum(1 if case["kind"] == "manual" else 2 for case in selected),
+                  _artifacts=artifacts,
                   cases=results, selected_cases=len(selected), latency_ms=int((time.monotonic() - started) * 1000))
     return result
 
@@ -1334,6 +1414,25 @@ def create_app(store, accounts, authenticate):
                 return jsonify(error="请选择此账号支持的模型"), 400
         store.configure_prompt(account_id, body["enabled"], model.strip(), prompt,
                                auto_pause, threshold, interval_minutes, challenge_count, test_mode, cases)
+        return jsonify(account=render(account_id, meta))
+
+    @app.get("/accounts/<int:account_id>/prompt-test/results/<int:result_id>/artifacts/<case_id>")
+    def get_artifact(account_id, result_id, case_id):
+        artifact = store.artifact(account_id, result_id, case_id)
+        if artifact is None:
+            return jsonify(error="作品不存在或已随历史记录清理"), 404
+        return jsonify(artifact)
+
+    @app.put("/accounts/<int:account_id>/prompt-test/results/<int:result_id>/reviews/<case_id>")
+    def review_artifact(account_id, result_id, case_id):
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("status") not in ("green", "yellow", "red"):
+            return jsonify(error="请选择绿、黄或红作为人工评分"), 400
+        meta = accounts.metadata([account_id]).get(account_id)
+        if not meta:
+            return jsonify(error="账号不存在"), 404
+        if not store.review_artifact(account_id, result_id, case_id, body["status"]):
+            return jsonify(error="可评分作品不存在或已随历史记录清理"), 404
         return jsonify(account=render(account_id, meta))
 
     return app

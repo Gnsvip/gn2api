@@ -50,6 +50,7 @@
     .mt-prompt-label{display:block;margin-top:14px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}.mt-prompt-badge[data-enabled=true]{background:#f5f3ff;color:#6d28d9}
     .mt-case{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:9px}.mt-case>summary{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px}.mt-case>summary span{flex:1;overflow-wrap:anywhere}.mt-case input[type=checkbox],.mt-qa-enabled input{accent-color:#059669}
     .mt-case input[type=text]{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;margin-top:5px}.mt-case-tools{display:flex;gap:14px;flex-wrap:wrap}.mt-qa-enabled{display:block;margin-top:14px}
+    .mt-preview-dialog{width:min(960px,calc(100vw - 24px))}.mt-preview-dialog iframe{display:block;width:100%;height:55vh;min-height:240px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.mt-preview-dialog .mt-actions{flex-wrap:wrap}.mt-preview-dialog .mt-header h3{overflow-wrap:anywhere}.mt-preview-dialog textarea{min-height:180px;font:12px/1.5 monospace}.mt-preview-link{display:block;margin:0 0 12px 17px;color:#7c3aed}.mt-actions .mt-review-green{border-color:#059669;color:#047857}.mt-actions .mt-review-yellow{border-color:#ca8a04;color:#a16207}.mt-actions .mt-review-red{border-color:#dc2626;color:#dc2626}
   `;
   document.head.append(style);
   const onPage = () => /^\/admin\/accounts\/?$/.test(location.pathname);
@@ -69,7 +70,10 @@
   const description = result => result.test_mode === 'qa' ? [
     date(result.checked_at), `问答测试 · 请求模型：${result.expected}`,
     `本轮请求：${result.requests || 0} 次`, result.message,
-    ...(result.cases || []).map(item => `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer}\n实际回答：${item.answer_preview || '未取得完整回答'}${item.answer_truncated ? '…（已截断）' : ''}`),
+    ...(result.cases || []).map(item => item.kind === 'manual'
+      ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
+      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer}\n实际回答：${item.answer_preview || '未取得完整回答'}${item.answer_truncated ? '…（已截断）' : ''}`),
+    result.manual_reviewed && '人工评分只更新历史记录，不追溯触发自动停调度',
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
     date(result.checked_at), `预期：${result.expected}`, result.sent_model && `发送模型：${result.sent_model}`,
@@ -424,14 +428,70 @@
     }
   }
 
+  async function openArtifactPreview(id, result, item, onReview) {
+    const dialog = el('dialog', 'mt-dialog mt-preview-dialog');
+    const header = el('div', 'mt-header'); header.append(el('h3', '', item.name + ' · 人工预览'));
+    const body = el('div', 'mt-body');
+    const status = el('p', 'mt-note', '正在读取作品…');
+    const metadata = el('p', 'mt-note', `请求模型：${result.expected} · ${date(result.checked_at)}`);
+    const note = el('p', 'mt-note', '查看是否符合提示词后再标记颜色。预览支持内联 HTML、SVG、CSS 和 JavaScript，外部资源不加载。评分不会追溯停止账号调度。');
+    const frame = el('iframe'); frame.title = item.name + '作品预览';
+    // Generated code gets an opaque origin and no access to the administration page.
+    frame.setAttribute('sandbox', 'allow-scripts');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('allow', "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-read 'none'; clipboard-write 'none'");
+    const source = el('details', 'mt-help'); source.append(el('summary', '', '查看生成的 HTML'));
+    const code = el('textarea'); code.readOnly = true; code.setAttribute('aria-label', '生成的 HTML 源码'); source.append(code);
+    const promptDetails = el('details', 'mt-help'); promptDetails.append(el('summary', '', '本次使用的提示词'));
+    const originalPrompt = el('p'); promptDetails.append(originalPrompt);
+    const error = el('p', 'mt-error');
+    const actions = el('div', 'mt-actions');
+    const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
+    actions.append(close);
+    const reviewButtons = [];
+    const base = '/accounts/' + id + '/prompt-test/results/' + result.result_id;
+    const casePath = encodeURIComponent(item.id);
+    for (const [color, title] of [['green', '绿 · 符合要求'], ['yellow', '黄 · 待确认'], ['red', '红 · 不符合']]) {
+      const button = el('button', 'mt-review-' + color, title); button.type = 'button'; button.disabled = true;
+      button.addEventListener('click', async () => {
+        reviewButtons.forEach(node => { node.disabled = true; }); error.textContent = '';
+        try {
+          const data = await api(base + '/reviews/' + casePath, { method: 'PUT', body: JSON.stringify({ status: color }) });
+          states.set(id, data.account);
+          const updated = data.account.prompt_test.history.find(entry => entry.result_id === result.result_id);
+          const reviewed = updated?.cases.find(entry => entry.id === item.id);
+          status.textContent = reviewed?.message || '人工评分已保存';
+          if (updated) onReview(updated);
+          targets().filter(target => target.id === id).forEach(render);
+        } catch (failure) { if (dialog.open) error.textContent = failure.message; }
+        finally { if (dialog.open) reviewButtons.forEach(node => { node.disabled = false; }); }
+      });
+      reviewButtons.push(button); actions.append(button);
+    }
+    body.append(status, metadata, note, promptDetails, frame, source, error); dialog.append(header, body, actions);
+    dialog.addEventListener('close', () => { frame.srcdoc = ''; dialog.remove(); });
+    document.body.append(dialog); dialog.showModal();
+    try {
+      const data = await api(base + '/artifacts/' + casePath);
+      if (!dialog.open || !dialog.isConnected) return;
+      if (typeof data.html !== 'string') throw new Error('作品内容格式无效');
+      code.value = data.html;
+      originalPrompt.textContent = data.prompt || '';
+      const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+      frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + policy + '"><meta name="referrer" content="no-referrer"></head><body>' + data.html + '</body></html>';
+      status.textContent = item.message || '待人工确认';
+      reviewButtons.forEach(node => { node.disabled = false; });
+    } catch (failure) { if (dialog.open) error.textContent = failure.message; }
+  }
+
   function qaEditor(initial, presets, changed) {
     const root = el('div', 'mt-qa-editor');
     const list = el('div');
     const rows = [];
     const tools = el('div', 'mt-case-tools');
     const add = el('button', 'mt-link', '＋ 添加自定义题'); add.type = 'button';
-    const candy = el('button', 'mt-link', '＋ 添加糖果题'); candy.type = 'button';
-    const update = () => { add.disabled = candy.disabled = rows.length >= 5; changed(); };
+    const presetButtons = [];
+    const update = () => { add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; }); changed(); };
     function append(data) {
       if (rows.length >= 5) return;
       const card = el('details', 'mt-case'); card.open = !data.name;
@@ -441,15 +501,26 @@
       const remove = el('button', 'mt-link', '删除'); remove.type = 'button';
       summary.append(enabled, title, remove); card.append(summary);
       const fields = {};
+      const wrappers = {};
+      const kindLabel = el('label', 'mt-prompt-label', '判断方式');
+      const kind = el('select'); kind.setAttribute('aria-label', '题目判断方式');
+      for (const [value, title] of [['exact', '预期答案匹配'], ['manual', '人工预览 HTML / SVG']]) {
+        const option = el('option', '', title); option.value = value; kind.append(option);
+      }
+      kind.value = data.kind || 'exact'; kindLabel.append(kind); card.append(kindLabel);
       for (const [key, label, limit] of [['name', '题目名称', 80], ['prompt', '题目提示词', 4000], ['expected_answer', '预期答案', 200]]) {
         const wrapper = el('label', 'mt-prompt-label', label);
         const input = el(key === 'prompt' ? 'textarea' : 'input');
         if (key !== 'prompt') input.type = 'text';
         input.value = data[key] || ''; input.maxLength = limit; input.setAttribute('aria-label', label);
-        wrapper.append(input); card.append(wrapper); fields[key] = input;
+        wrapper.append(input); card.append(wrapper); fields[key] = input; wrappers[key] = wrapper;
       }
+      const manualNote = el('p', 'mt-note', '每轮生成一次，不自动复测。作品先记黄点，之后在最近结果中预览并人工评分；不按固定答案判断。');
+      card.append(manualNote);
+      const refreshKind = () => { wrappers.expected_answer.hidden = kind.value === 'manual'; manualNote.hidden = kind.value !== 'manual'; update(); };
+      kind.addEventListener('change', refreshKind);
       const identity = data.id || 'q-' + crypto.randomUUID();
-      const row = { card, get: () => ({ id: identity, enabled: enabled.checked,
+      const row = { card, get: () => ({ id: identity, enabled: enabled.checked, kind: kind.value,
         name: fields.name.value, prompt: fields.prompt.value, expected_answer: fields.expected_answer.value }) };
       rows.push(row); list.append(card);
       const rename = () => { title.textContent = fields.name.value || '未命名题目'; enabled.setAttribute('aria-label', '测试 ' + title.textContent); };
@@ -457,14 +528,18 @@
       enabled.addEventListener('click', event => event.stopPropagation());
       enabled.addEventListener('change', update);
       remove.addEventListener('click', event => { event.preventDefault(); rows.splice(rows.indexOf(row), 1); card.remove(); update(); });
-      update();
+      refreshKind();
     }
     add.addEventListener('click', () => append({ enabled: false }));
-    candy.disabled = !presets?.length;
-    candy.addEventListener('click', () => { if (presets?.[0]) append({ ...presets[0], id: undefined, enabled: false }); });
-    tools.append(add); if (presets?.length) tools.append(candy);
+    tools.append(add);
+    for (const preset of presets || []) {
+      const title = preset.id === 'candy' ? '糖果题' : preset.id === 'pelican_bicycle' ? '鹈鹕动画题' : preset.name;
+      const button = el('button', 'mt-link', '＋ 添加' + title); button.type = 'button';
+      button.addEventListener('click', () => append({ ...preset, id: undefined, enabled: false }));
+      presetButtons.push(button); tools.append(button);
+    }
     root.append(el('p', 'mt-note', '最多 5 道题。只测试勾选的题；关闭的题不发送请求。可修改每道题的提示词和预期答案。'), list, tools,
-      el('p', 'mt-note', '按完整答案匹配，忽略首尾空白、大小写和全角差异。建议要求只输出答案；回答中仅包含答案数字不算通过。'));
+      el('p', 'mt-note', '答案匹配题按完整答案比较，忽略首尾空白、大小写和全角差异。作品题选择人工预览，无需填写预期答案。'));
     initial.forEach(append);
     return { root, values: () => rows.map(row => row.get()) };
   }
@@ -483,7 +558,7 @@
     const body = el('div', 'mt-body');
     const modeLabel = el('label', 'mt-prompt-label', '测试方式');
     const mode = el('select'); mode.setAttribute('aria-label', '测试方式');
-    for (const [value, text] of [['qa', '问答测试（按预期答案）'], ['attribution', '数字归因模板（原算法）']]) {
+    for (const [value, text] of [['qa', '自定义题目（答案匹配 / 人工预览）'], ['attribution', '数字归因模板（原算法）']]) {
       const option = el('option', '', text); option.value = value; mode.append(option);
     }
     mode.value = promptState.test_mode || 'attribution'; modeLabel.append(mode);
@@ -515,10 +590,11 @@
     const estimate = el('p', 'mt-note');
     let editor;
     const refreshEstimate = () => {
-      const minutes = Number(interval.value), samples = mode.value === 'qa'
-        ? (editor?.values() || []).filter(item => item.enabled).length : Number(challenges.value);
+      const selected = (editor?.values() || []).filter(item => item.enabled);
+      const minutes = Number(interval.value), samples = mode.value === 'qa' ? selected.length : Number(challenges.value);
+      const maximum = mode.value === 'qa' ? selected.reduce((sum, item) => sum + (item.kind === 'manual' ? 1 : 2), 0) : samples * 2;
       estimate.textContent = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
-        ? `通常 ${samples} 次 / 轮，${mode.value === 'qa' ? '不符复测' : '补采或复测'}最多 ${samples * 2} 次 / 轮；每天通常约 ${Math.ceil(1440 / minutes) * samples} 次，最多约 ${Math.ceil(1440 / minutes) * samples * 2} 次，会消耗账号额度。` : '';
+        ? `通常 ${samples} 次 / 轮，${mode.value === 'qa' ? '含不符复测' : '补采或复测'}最多 ${maximum} 次 / 轮；每天通常约 ${Math.ceil(1440 / minutes) * samples} 次，最多约 ${Math.ceil(1440 / minutes) * maximum} 次，会消耗账号额度。` : '';
     };
     const initialCases = promptState.cases?.length || mode.value === 'qa' ? (promptState.cases || []) : (promptState.qa_presets || []);
     editor = qaEditor(initialCases, promptState.qa_presets, refreshEstimate);
@@ -537,6 +613,7 @@
     thresholdLabel.append(threshold, document.createTextNode('轮红点后停止'));
     policyFields.append(thresholdLabel, el('p', 'mt-note', `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`));
     policy.append(autoLabel, policyFields);
+    policy.append(el('p', 'mt-note', '包含人工预览题的轮次不累计自动停调度红点。后续人工评分只更新该条记录，不追溯触发停调度。'));
     if (promptState.pause_status === 'pending' || promptState.pause_status === 'failed') policy.append(el('p', 'mt-error', promptState.message));
     if (promptState.paused_at) policy.append(el('p', 'mt-note', `上次停调度：${date(promptState.paused_at)} · ${promptState.pause_message}`));
     const help = el('details', 'mt-help');
@@ -544,20 +621,36 @@
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
       el('p', '', '绿：高分归因与预期一致。黄：样本不足、区分度不足、请求失败或复测不稳定。红：两轮独立归因均高分指向同一个其他模型。候选库内分数不是真伪证明。'),
       el('p', '', '问答模式：绿表示所选题目全部符合预期；黄表示请求失败、未完成或复测不稳定；红表示至少一题两次返回同一非预期答案，且本轮没有黄色结果。问答颜色不证明模型身份。每道开启的题每轮发一次，不符时最多复测一次。'),
+      el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“预览并评分”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'));
     const history = el('ul', 'mt-history mt-prompt-history');
     const historyHead = el('div', 'mt-section-head'); historyHead.append(el('span', '', '最近测试结果'));
     const historyItems = [];
-    for (const result of [...(promptState.history || [])].reverse().slice(0, 10)) {
+    for (const initialResult of [...(promptState.history || [])].reverse().slice(0, 10)) {
+      let result = initialResult;
       const item = el('li');
-      const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
-      const dot = el('span', 'mt-dot mt-' + color);
+      const dot = el('span', 'mt-dot');
       const details = el('details', 'mt-result');
       const summary = el('summary');
-      summary.append(dot, el('time', '', shortDate(result.checked_at)), el('span', 'mt-result-title',
-        (result.test_mode === 'qa' ? '问答 · ' : '归因 · ') + (color === 'green' ? '与预期一致' : color === 'red' ? '复测仍不符' : '待确认')));
-      summary.title = result.message || '';
-      details.append(summary, el('pre', '', description(result)));
+      const resultTitle = el('span', 'mt-result-title');
+      const resultDescription = el('pre');
+      summary.append(dot, el('time', '', shortDate(result.checked_at)), resultTitle);
+      const refreshResult = () => {
+        const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
+        const manual = (result.cases || []).some(entry => entry.kind === 'manual');
+        dot.className = 'mt-dot mt-' + color;
+        resultTitle.textContent = (manual ? '含人工预览 · ' : result.test_mode === 'qa' ? '问答 · ' : '归因 · ')
+          + (color === 'green' ? '通过' : color === 'red' ? '未通过' : '待确认');
+        summary.title = result.message || ''; resultDescription.textContent = description(result);
+      };
+      refreshResult(); details.append(summary, resultDescription);
+      for (const entry of result.cases || []) {
+        if (entry.kind !== 'manual' || !entry.artifact_available || !result.result_id) continue;
+        const preview = el('button', 'mt-link mt-preview-link', entry.name + ' · 预览并评分'); preview.type = 'button';
+        preview.addEventListener('click', () => openArtifactPreview(id, result,
+          result.cases.find(current => current.id === entry.id), updated => { result = updated; refreshResult(); }));
+        details.append(preview);
+      }
       item.append(details); history.append(item); historyItems.push(item);
     }
     const empty = el('p', 'mt-note', historyItems.length ? '' : '暂无测试记录');
@@ -598,8 +691,8 @@
       if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续红点轮数请填写 1–100 的整数'; return; }
       const cases = editor.values();
       if (qa && qaEnabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
-      if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || !item.expected_answer.trim()))) {
-        error.textContent = '请填写已勾选题目的名称、提示词和预期答案'; return;
+      if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || (item.kind !== 'manual' && !item.expected_answer.trim())))) {
+        error.textContent = '请填写已勾选题目的名称和提示词；答案匹配题还需填写预期答案'; return;
       }
       const payload = { enabled: qa ? qaEnabled.checked : true, model: model.value || promptState.model || 'gpt-6-astra',
         prompt: prompt.value, challenge_count: Number(challenges.value),
