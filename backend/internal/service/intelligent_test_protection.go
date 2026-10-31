@@ -68,5 +68,5 @@ func applyIntelligentTestProtection(c *gin.Context, account *Account, headers ht
 	applyCodexFingerprintConvergenceHeaders(c, codexAccountIdentitySource(c, account), headers)
 	headers.Set("conversation_id", identity.sessionID)
 	headers.Set("thread-id", identity.threadID)
-	return nil
+	return checkAccountRequestIntegrity(c, account, nil, payload)
 }

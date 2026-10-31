@@ -715,6 +715,11 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			}
 		}
 		normalizedExtra = prepareCodexFingerprintExtraForUpdate(account, normalizedExtra)
+		// 账号保护（防降智）受管字段在普通编辑时不得被表单覆盖，与参考实现一致。
+		normalizedExtra, err = mergeAccountProtectionForSave(ctx, account, normalizedExtra)
+		if err != nil {
+			return nil, err
+		}
 		account.Extra = normalizedExtra
 		if account.Platform == PlatformAntigravity && wasOveragesEnabled && !account.IsOveragesEnabled() {
 			delete(account.Extra, "antigravity_credits_overages") // 清理旧版 overages 运行态
