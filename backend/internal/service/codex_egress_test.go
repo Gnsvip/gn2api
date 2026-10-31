@@ -51,7 +51,7 @@ func codexEgressFixture() (*config.Config, *Account, *http.Request) {
 		return io.NopCloser(bytes.NewReader([]byte(`{"model":"gpt-6.1","input":[]}`))), nil
 	}
 	request.Header.Set("Version", "0.164.0")
-	request.Header.Set("Originator", openai.CodexCLIOriginator)
+	request.Header.Set("Originator", openai.CodexDefaultOriginator)
 	request.Header.Set("User-Agent", buildCodexCLIUserAgent("0.164.0"))
 	return cfg, account, request
 }
@@ -79,7 +79,7 @@ func TestCodexEgressRequiresEligibleAccountAndCapturedIdentity(t *testing.T) {
 			r.Header.Set("User-Agent", buildCodexCLIUserAgent("0.166.0-alpha.5.1"))
 		}},
 		{"mismatched version", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Version", "0.166.0") }},
-		{"mismatched identity", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Originator", "codex-tui") }},
+		{"mismatched identity", func(_ *config.Config, _ *Account, r *http.Request) { r.Header.Set("Originator", "evil-codex") }},
 		{"mismatched exec identity", func(_ *config.Config, _ *Account, r *http.Request) {
 			r.Header.Set("Version", "0.166.0")
 			r.Header.Set("User-Agent", buildCodexCLIUserAgent("0.166.0"))

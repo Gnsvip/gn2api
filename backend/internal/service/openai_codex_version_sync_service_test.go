@@ -335,7 +335,7 @@ func TestGetOpenAICodexCanonicalUserAgentBuildsFromVersion(t *testing.T) {
 	}}, nil)
 
 	require.Equal(t,
-		"codex_cli_rs/0.200.1"+codexCLIUserAgentSuffix+" (codex_cli_rs; 0.200.1)",
+		"codex-tui/0.200.1"+codexCLIUserAgentSuffix+" (codex-tui; 0.200.1)",
 		svc.GetOpenAICodexCanonicalUserAgent(context.Background()),
 	)
 }
@@ -525,7 +525,6 @@ func TestGetOpenAICodexCanonicalUserAgentOutboundIdentity(t *testing.T) {
 					wantCanonicalUA = wantUA
 					wantOriginator = ua.client
 				}
-				wantOriginator, wantUA, _ = openai.NormalizeCodexClientIdentityToCLI(wantOriginator, wantUA)
 				SetCodexCanonicalUserAgentResolver(func() string {
 					return svc.GetOpenAICodexCanonicalUserAgent(context.Background())
 				})

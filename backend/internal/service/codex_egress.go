@@ -30,9 +30,8 @@ func codexEgressEligible(cfg *config.Config, account *Account, target *url.URL, 
 	}
 	version := headers.Get("Version")
 	originator := headers.Get("Originator")
-	// The 0.166.0 fixtures were recorded with `codex exec`. Keep the existing
-	// canonical CLI identity and accept this captured identity only for 0.166.0.
-	verifiedIdentity := originator == openai.CodexCLIOriginator || (version == "0.166.0" && originator == "codex_exec")
+	// 默认 TUI 身份与历史 CLI 身份均接受；0.166.0 的 fixture 用 `codex exec` 录制。
+	verifiedIdentity := originator == openai.CodexDefaultOriginator || originator == openai.CodexCLIOriginator || (version == "0.166.0" && originator == "codex_exec")
 	return (version == "0.163.0" || version == "0.164.0" || version == "0.166.0") &&
 		verifiedIdentity &&
 		strings.HasPrefix(headers.Get("User-Agent"), originator+"/") &&
