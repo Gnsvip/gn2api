@@ -61,11 +61,17 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0 or SOURCE == TARGET:
         raise RuntimeError('run as root from a separate extracted release directory')
+    manifest = json.loads((SOURCE / 'MANIFEST.json').read_text(encoding='utf-8'))
     for name in FILES:
         if not (SOURCE / name).is_file():
             raise RuntimeError('release missing: ' + name)
+        if digest(SOURCE / name) != manifest.get(name):
+            raise RuntimeError('release checksum mismatch: ' + name)
         if name.endswith('.py'):
             compile((SOURCE / name).read_text(encoding='utf-8'), name, 'exec')
+    for name in ('vendor/fingerprint.py', 'vendor/data/unified_bank.json'):
+        if digest(TARGET / name) != manifest.get(name):
+            raise RuntimeError('installed fingerprint implementation/bank differs; review before upgrade')
     original = NGINX.read_text(encoding='utf-8')
     updated = updated_nginx(original)
     current_hash = digest(TARGET / 'service.py')

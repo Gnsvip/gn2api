@@ -8,12 +8,12 @@
   "RELEASE_NOTES.md": "b906cf73ea40388dde975cc6da1425495dac87a34702258e63974e2ef717d35e",
   "requirements.txt": "6c3a3fe8bc14a838548c0c7a8c7118ca10c5d292b649e822de9bcba7c9427902",
   "activate_server.py": "5d87351f178a41b88ab007fe6ae1b58bb9ded9dfc5443364880b9a9a296ad6db",
-  "upgrade_prompt_test.py": "9b3eeca041a457c57d31e53320a04e06396ad42ee861da564de9c57b14bdccaa",
+  "upgrade_prompt_test.py": "9e1a47735c27bf6de26d604329575237a60a8c8933a540cd8b2c6a1b7c010601",
   "upgrade_auto_pause.py": "6b3fecdbaddf5c78a5237856bc4aae368ede53225666e40a3f67de0cf4764346",
   "vendor/fingerprint.py": "387fe5c44cc5f859995432267b0d3b462fc26e82419fc22e3ee7f36cc2502d98",
   "vendor/LICENSE": "238afb57e498990742f84b9ce6167b4e256ac06104a9938ce953bc41c14bea51",
   "vendor/README.md": "f01130b5d4d842785f1632f1b1eba3b22ae32a4b4f89eb038003f73c5c08b0fc",
   "vendor/data/unified_bank.json": "f267d0513aa06981d024ec5394746fceddf44e4e8a75fa6bf8304255f4b32d6d",
-  ".gitignore": "5037d964eeee1a93082ca44bb06dbca9a312ce4ab087575b4bbe3a9810fa597b",
-  ".gitattributes": "d711b6ba64c7208f3059111e2a74a2453348584bef1fec237198ad08befe28b9"
+  ".gitignore": "8a0621c9be0a543a8aebdda9c8f312c8ff328a89380da3d0ba35b907b2204225",
+  ".gitattributes": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c"
 }
