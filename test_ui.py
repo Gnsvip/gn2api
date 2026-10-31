@@ -4,6 +4,9 @@ import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+DEFAULT_QA_CASES = [dict(id='candy', name='糖果形状题', enabled=False,
+                        prompt='圆形苹果/桃子/西瓜 7/9/8，五角星 7/6/4。可按形状挑选，最少取几颗保证异形苹果桃子配对？只回答数字。',
+                        expected_answer='21')]
 
 ROOT = Path(__file__).resolve().parent
 NOW = time.time()
@@ -14,6 +17,8 @@ def state(id, enabled=False, count=0):
                 mismatch_streak=0, pause_status='', paused_at=None, pause_message='',
                 interval_minutes=10, interval=600, challenge_count=3,
                 prompt_test=dict(enabled=False, available=True, reason='', model='gpt-6-sol',
+                                 test_mode='attribution', cases=[], qa_presets=DEFAULT_QA_CASES,
+                                 qa_available=True, qa_reason='', attribution_available=True, attribution_reason='',
                                  prompt='{{challenge}}', challenge_count=3, running=False,
                                  interval_minutes=10, message='', auto_pause_enabled=False,
                                  auto_pause_threshold=3, failure_streak=0, pause_status='',
@@ -210,6 +215,53 @@ with sync_playwright() as p:
     page.get_by_role('button', name='关闭测试', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert writes[-1] == ('8', {'enabled': False})
+    # Optional question selection is saved independently from the timer and attribution.
+    attribution_before = json.dumps(states['8']['history'])
+    page.locator('[data-row-id="8"] .mt-prompt-button').click()
+    page.get_by_label('测试方式', exact=True).select_option('qa')
+    page.wait_for_function("document.querySelector('[aria-label=\"测试模型\"]').disabled === false")
+    assert page.get_by_label('测试提示词', exact=True).is_hidden()
+    assert not page.get_by_role('switch', name='启用定时问答测试', exact=True).is_checked()
+    assert not page.get_by_label('测试 糖果形状题', exact=True).is_checked()
+    candy_case = page.locator('.mt-case').first
+    candy_case.locator('summary span').click()
+    assert candy_case.get_by_label('预期答案', exact=True).input_value() == '21'
+    candy_case.locator('summary span').click()
+    page.get_by_role('button', name='＋ 添加自定义题', exact=True).click()
+    custom = page.locator('.mt-case').last
+    custom.get_by_label('题目名称', exact=True).fill('知识题')
+    custom.get_by_label('题目提示词', exact=True).fill('Tell me whether you know who Tibo is in OpenAI based on your knowledge without searching online. Only return True or False.')
+    custom.get_by_label('预期答案', exact=True).fill('True')
+    page.get_by_label('测试 知识题', exact=True).check()
+    page.get_by_role('switch', name='启用定时问答测试', exact=True).check()
+    page.get_by_label('测试模型', exact=True).select_option('gpt-6.1-sol')
+    assert '通常 1 次 / 轮' in page.locator('dialog').inner_text()
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.locator('dialog').wait_for(state='detached')
+    saved = writes[-1][1]
+    assert saved['test_mode'] == 'qa' and saved['enabled'] and saved['model'] == 'gpt-6.1-sol'
+    assert [item['enabled'] for item in saved['cases']] == [False, True]
+    assert saved['cases'][1]['prompt'].endswith('Only return True or False.')
+    assert json.dumps(states['8']['history']) == attribution_before
+    page.locator('[data-row-id="8"] .mt-prompt-button').click()
+    page.wait_for_function("document.querySelector('[aria-label=\"测试模型\"]').disabled === false")
+    assert page.get_by_label('测试方式', exact=True).input_value() == 'qa'
+    assert page.get_by_label('测试模型', exact=True).input_value() == 'gpt-6.1-sol'
+    assert not page.get_by_label('测试 糖果形状题', exact=True).is_checked()
+    assert page.get_by_label('测试 知识题', exact=True).is_checked()
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-settings.png')))
+    page.set_viewport_size({'width': 390, 'height': 844})
+    assert page.locator('.mt-body').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
+    footer = page.locator('.mt-actions').bounding_box()
+    assert footer['y'] >= 0 and footer['y'] + footer['height'] <= 844
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-mobile.png')))
+    page.get_by_label('测试 知识题', exact=True).uncheck()
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    assert '至少勾选一道题' in page.locator('.mt-save-error').inner_text()
+    page.get_by_role('switch', name='启用定时问答测试', exact=True).uncheck()
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.locator('dialog').wait_for(state='detached')
+    assert not writes[-1][1]['enabled'] and not any(item['enabled'] for item in writes[-1][1]['cases'])
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")
     assert errors == [], errors

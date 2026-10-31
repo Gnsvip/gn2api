@@ -16,9 +16,9 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261031-prompt-1'
+VERSION = '20261031-qa-1'
 FILES = ['service.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
-         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md']
+         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py']
 
 
 def digest(path):
@@ -31,7 +31,7 @@ def updated_nginx(text):
     if count != 1:
         raise RuntimeError('expected one existing ModelTrace script injection')
     def patch_location(match):
-        body, count = re.subn(r'client_max_body_size\s+[^;]+;', 'client_max_body_size 16k;', match[2])
+        body, count = re.subn(r'client_max_body_size\s+[^;]+;', 'client_max_body_size 128k;', match[2])
         if count != 1:
             raise RuntimeError('expected one ModelTrace API body limit')
         return match[1] + body + match[3]
@@ -52,6 +52,33 @@ def running_count(db):
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     return sum(db.execute(f'SELECT count(*) FROM {table} WHERE running=1').fetchone()[0]
                for table in ('monitors', 'prompt_monitors') if table in tables)
+
+
+def existing_state(db):
+    """Keep old columns and rows for all existing monitoring settings/history."""
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    state = {}
+    for table, order in (('monitors', 'account_id'), ('results', 'id'),
+                         ('prompt_monitors', 'account_id'), ('prompt_results', 'id')):
+        if table in tables:
+            columns = [r[1] for r in db.execute(f'PRAGMA table_info({table})')]
+            state[table] = (columns, db.execute(f'SELECT * FROM {table} ORDER BY {order}').fetchall(), order)
+    return state
+
+
+def state_preserved(db, previous):
+    for table, (columns, rows, order) in previous.items():
+        selection = ','.join('"' + column.replace('"', '""') + '"' for column in columns)
+        if db.execute(f'SELECT {selection} FROM {table} ORDER BY {order}').fetchall() != rows:
+            return False
+    return True
+
+
+def disable_qa_on_rollback(db):
+    columns = {row[1] for row in db.execute('PRAGMA table_info(prompt_monitors)')}
+    if 'test_mode' in columns:
+        # The previous service interprets every prompt job as a numeric challenge.
+        db.execute("UPDATE prompt_monitors SET enabled=0,running=0,generation=generation+1 WHERE test_mode='qa'")
 
 
 def main():
@@ -85,7 +112,7 @@ def main():
         raise RuntimeError('finite nginx worker shutdown timeout requires review')
     report = dict(mode='read-only preflight', service_sha256=current_hash,
                   script_version=VERSION, gateway_compatible=True,
-                  changes=['independent extension files', 'additive SQLite tables', 'nginx script version and 16k body limit'])
+                  changes=['independent extension files', 'additive SQLite columns', 'nginx script version and 128k body limit'])
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not args.apply:
         return
@@ -116,16 +143,14 @@ def main():
             time.sleep(5)
         with sqlite3.connect(DB) as db, sqlite3.connect(backup / 'state.sqlite3') as dest:
             db.backup(dest)
-            old_state = db.execute('SELECT * FROM monitors ORDER BY account_id').fetchall()
-            old_history = db.execute('SELECT * FROM results ORDER BY id').fetchall()
+            old_state = existing_state(db)
         for name in FILES:
             replace_file(SOURCE / name, TARGET / name)
             (TARGET / name).chmod(0o644)
         run(['sudo', '-u', 'modeltrace_ovh', '/opt/modeltrace-ovh/venv/bin/python', '-c',
              "import sys; sys.path.insert(0, '/opt/modeltrace-ovh'); from service import Store; Store('/var/lib/modeltrace-ovh/state.sqlite3')"])
         with sqlite3.connect(DB) as db:
-            if db.execute('SELECT * FROM monitors ORDER BY account_id').fetchall() != old_state or \
-                    db.execute('SELECT * FROM results ORDER BY id').fetchall() != old_history:
+            if not state_preserved(db, old_state):
                 raise RuntimeError('existing attribution state changed during migration')
         run(['systemctl', 'start', 'modeltrace-ovh'])
         deadline = time.monotonic() + 25
@@ -157,7 +182,8 @@ def main():
             raise RuntimeError('unrelated protected file changed')
         report = dict(status='ok', backup=str(backup), script_version=VERSION,
                       service_sha256=digest(TARGET / 'service.py'), script_sha256=digest(JS),
-                      old_attribution_preserved=True, protected_services_not_restarted=True)
+                      old_attribution_preserved=True, old_prompt_tests_preserved=True,
+                      protected_services_not_restarted=True)
         (TARGET / 'prompt-test-upgrade.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(json.dumps(report), flush=True)
     except Exception:
@@ -171,7 +197,9 @@ def main():
                 replace_file(backup / 'nginx.conf', NGINX)
                 run(['nginx', '-t'])
                 run(['systemctl', 'reload', 'nginx'])
-            # Additive tables are harmless to the old service. Preserve later writes.
+            # Preserve later settings/history, but do not reinterpret QA jobs as attribution.
+            with sqlite3.connect(DB) as db:
+                disable_qa_on_rollback(db)
             run(['systemctl', 'start', 'modeltrace-ovh'])
             print('Independent extension files rolled back; database snapshot retained', flush=True)
         raise

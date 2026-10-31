@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,14 @@ MAX_HISTORY = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 PROMPT_MAX_CHARS = 4000
 DEFAULT_PROMPT = "{{challenge}}"
+QA_MAX_CASES = 5
+DEFAULT_QA_CASES = [
+    {"id": "candy", "name": "糖果形状题", "enabled": False,
+     "prompt": "黑色袋子中有苹果味、桃子味、西瓜味三种糖果。圆形分别有 7、9、8 颗，五角星形分别有 7、6、4 颗。"
+               "可以靠手感辨别并选择形状，但不能靠手感辨别口味。活动前决定取出的总数，最少取多少颗，"
+               "才能保证同时有圆形苹果味和五角星桃子味，或者圆形桃子味和五角星苹果味？只回答最少颗数的阿拉伯数字，不要解释。",
+     "expected_answer": "21"},
+]
 PROBE_READ_TIMEOUT = 120
 CONFIDENCE = 0.80  # Conservative display threshold, not a guarantee of identity.
 MARGIN = 0.25
@@ -111,6 +120,13 @@ class Store:
             }.items():
                 if name not in columns:
                     db.execute(f"ALTER TABLE monitors ADD COLUMN {name} {definition}")
+            prompt_columns = {row[1] for row in db.execute("PRAGMA table_info(prompt_monitors)")}
+            for name, definition in {
+                "test_mode": "TEXT NOT NULL DEFAULT 'attribution'",
+                "cases": "TEXT NOT NULL DEFAULT '[]'",
+            }.items():
+                if name not in prompt_columns:
+                    db.execute(f"ALTER TABLE prompt_monitors ADD COLUMN {name} {definition}")
 
     @contextmanager
     def db(self):
@@ -134,7 +150,7 @@ class Store:
 
     def configure_prompt(self, account_id, enabled, model, prompt,
                          auto_pause_enabled=None, auto_pause_threshold=None, interval_minutes=None,
-                         challenge_count=None):
+                         challenge_count=None, test_mode=None, cases=None):
         with self.action_lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM prompt_monitors WHERE account_id=?", (account_id,)).fetchone()
@@ -142,8 +158,11 @@ class Store:
             auto_pause_threshold = (old["auto_pause_threshold"] if old else 3) if auto_pause_threshold is None else auto_pause_threshold
             interval_minutes = (old["interval_minutes"] if old else 10) if interval_minutes is None else interval_minutes
             challenge_count = (old["challenge_count"] if old else 3) if challenge_count is None else challenge_count
+            test_mode = (old["test_mode"] if old else "attribution") if test_mode is None else test_mode
+            cases_json = (old["cases"] if old else "[]") if cases is None else json.dumps(cases, ensure_ascii=False, sort_keys=True)
             same = (old and bool(old["enabled"]) == enabled and old["model"] == model
                     and old["prompt"] == prompt and old["challenge_count"] == challenge_count
+                    and old["test_mode"] == test_mode and old["cases"] == cases_json
                     and bool(old["auto_pause_enabled"]) == auto_pause_enabled
                     and old["auto_pause_threshold"] == auto_pause_threshold)
             if same:
@@ -155,9 +174,10 @@ class Store:
             next_run = (old["next_run"] if old["interval_minutes"] == interval_minutes
                         else time.time() + interval_minutes * 60) if same_monitor else time.time() + random.uniform(1, 12)
             db.execute("""INSERT INTO prompt_monitors(account_id,enabled,model,prompt,next_run,updated_at,
-                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count)
-                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count,test_mode,cases)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
                 enabled=excluded.enabled, model=excluded.model, prompt=excluded.prompt,
+                test_mode=excluded.test_mode, cases=excluded.cases,
                 challenge_count=excluded.challenge_count, generation=generation+1,
                 next_run=excluded.next_run, updated_at=excluded.updated_at,
                 auto_pause_enabled=excluded.auto_pause_enabled,
@@ -166,7 +186,7 @@ class Store:
                 failure_streak=0,failure_context='',pause_status='',pause_retry_at=0,
                 paused_at=0,pause_message='',running=0,message=''""",
                 (account_id, int(enabled), model, prompt, next_run, time.time(),
-                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count))
+                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count, test_mode, cases_json))
 
     def configure(self, account_id, enabled, model, auto_pause_enabled=None, auto_pause_threshold=None,
                   interval_minutes=None, challenge_count=None):
@@ -277,8 +297,11 @@ class Store:
             if current["auto_pause_enabled"] and result.get("status") == "red" and context:
                 streak = (current["failure_streak"] if current["failure_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
-            result.update(checked_at=now, expected=job["model"], bank_commit=BANK_COMMIT,
-                          template_hash=hashlib.sha256(job["prompt"].encode()).hexdigest())
+            mode = job.get("test_mode", "attribution")
+            result.update(checked_at=now, expected=job["model"], test_mode=mode,
+                          template_hash=hashlib.sha256((job["cases"] if mode == "qa" else job["prompt"]).encode()).hexdigest())
+            if mode == "attribution":
+                result["bank_commit"] = BANK_COMMIT
             result["failure_streak"] = streak
             db.execute("INSERT INTO prompt_results(account_id,checked_at,model,result) VALUES(?,?,?,?)",
                        (job["account_id"], now, job["model"], json.dumps(result, ensure_ascii=False)))
@@ -346,7 +369,8 @@ class Store:
                     message='提示词测试停止调度未确认，将在 60 秒后重试；关闭开关可取消' WHERE account_id=?""",
                     (time.time() + 60, row["account_id"]))
                 return
-            message = f"连续 {row['failure_streak']} 轮提示词归因复测仍不符，已停止此账号调度；恢复需手动操作"
+            kind = "问答测试复测仍未通过" if row["test_mode"] == "qa" else "提示词归因复测仍不符"
+            message = f"连续 {row['failure_streak']} 轮{kind}，已停止此账号调度；恢复需手动操作"
             db.execute("""UPDATE prompt_monitors SET pause_status='paused',paused_at=?,pause_message=?,message=?,
                 enabled=0,running=0,generation=generation+1 WHERE account_id=?""",
                 (time.time(), message, message, row["account_id"]))
@@ -371,6 +395,9 @@ class Store:
             "enabled": bool(prompt and prompt["enabled"]),
             "model": prompt["model"] if prompt else "",
             "prompt": prompt["prompt"] if prompt else DEFAULT_PROMPT,
+            "test_mode": prompt["test_mode"] if prompt else "qa",
+            "cases": json.loads(prompt["cases"]) if prompt else DEFAULT_QA_CASES,
+            "qa_presets": DEFAULT_QA_CASES,
             "challenge_count": prompt["challenge_count"] if prompt else 3,
             "running": bool(prompt and prompt["running"]),
             "next_run": prompt["next_run"] if prompt and prompt["enabled"] else None,
@@ -462,7 +489,7 @@ def model_choices(meta):
         not mapping or any(re.fullmatch(re.escape(k).replace(r"\*", ".*"), name) for k in mapping))]
 
 
-def unavailable(meta):
+def unavailable(meta, *, require_bank=True):
     if meta["platform"] not in ("openai", "anthropic"):
         return "指纹库暂未支持此平台"
     if meta["type"] not in ("apikey", "oauth") or (meta["platform"] == "anthropic" and meta["type"] != "apikey"):
@@ -471,13 +498,43 @@ def unavailable(meta):
         return "此特殊认证账号暂未适配"
     if meta["status"] != "active" or not meta.get("schedulable"):
         return "账号当前未启用或不可调度"
-    if not model_choices(meta):
+    if require_bank and not model_choices(meta):
         return "账号模型尚未被指纹库收录"
     return ""
 
 
-def prompt_unavailable(meta):
-    return unavailable(meta)
+def prompt_unavailable(meta, test_mode="attribution"):
+    return unavailable(meta, require_bank=test_mode != "qa")
+
+
+def validate_qa_cases(cases, enabled):
+    if not isinstance(cases, list) or len(cases) > QA_MAX_CASES:
+        raise ProbeError(f"最多保存 {QA_MAX_CASES} 道问答题")
+    normalized, ids = [], set()
+    for case in cases:
+        if not isinstance(case, dict) or type(case.get("enabled")) is not bool:
+            raise ProbeError("每道题的启用开关无效")
+        identity = case.get("id")
+        if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", identity) or identity in ids:
+            raise ProbeError("题目编号无效或重复")
+        ids.add(identity)
+        cleaned = {"id": identity, "enabled": case["enabled"]}
+        for field, maximum, label in (("name", 80, "题目名称"), ("prompt", PROMPT_MAX_CHARS, "提示词"),
+                                      ("expected_answer", 200, "预期答案")):
+            value = case.get(field, "")
+            if not isinstance(value, str) or len(value) > maximum:
+                raise ProbeError(f"{label}不能超过 {maximum} 个字符")
+            if case["enabled"] and not value.strip():
+                raise ProbeError(f"启用的题目必须填写{label}")
+            cleaned[field] = value
+        normalized.append(cleaned)
+    if enabled and not any(case["enabled"] for case in normalized):
+        raise ProbeError("请至少勾选一道题，或关闭定时测试后保存")
+    return normalized
+
+
+def normalized_answer(text):
+    return unicodedata.normalize("NFKC", text).strip().casefold()
 
 
 def validate_prompt_template(prompt):
@@ -503,9 +560,10 @@ def epoch(value):
             return 0
 
 
-def ensure_available(account):
+def ensure_available(account, *, require_bank=True):
     c = account["credentials"]
-    reason = unavailable({**account, "mapping": c.get("model_mapping"), "auth_mode": c.get("auth_mode")})
+    reason = unavailable({**account, "mapping": c.get("model_mapping"), "auth_mode": c.get("auth_mode")},
+                         require_bank=require_bank)
     if reason:
         raise ProbeError(reason)
     for field in ("rate_limit_reset_at", "overload_until", "temp_unschedulable_until"):
@@ -839,6 +897,8 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
 
 
 def run_prompt_round(job, store, accounts, controller):
+    if job.get("test_mode") == "qa":
+        return run_qa_round(job, store, accounts, controller)
     cancelled = lambda: not store.is_prompt_current(job)
     started = time.monotonic()
     if cancelled():
@@ -865,6 +925,72 @@ def run_prompt_round(job, store, accounts, controller):
     result = run_round(job, store, accounts, "", gateway_probe,
                        cancelled=cancelled, prompt_template=job["prompt"])
     result["latency_ms"] = int((time.monotonic() - started) * 1000)
+    return result
+
+
+def run_qa_round(job, store, accounts, controller):
+    started = time.monotonic()
+    deadline = started + 240
+    cancelled = lambda: not store.is_prompt_current(job)
+    requests_sent, results = 0, []
+    selected = []
+    context = None
+
+    def check_account():
+        if cancelled():
+            raise Cancelled()
+        if deadline - time.monotonic() < 5:
+            raise ProbeError("本轮问答测试超时")
+        account = accounts.get(job["account_id"])
+        ensure_available(account, require_bank=False)
+        if context is not None and account_context(account) != context:
+            raise ProbeError("账号路由或配置已变化，本轮作废")
+        return account
+
+    try:
+        if cancelled():
+            raise Cancelled()
+        cases = validate_qa_cases(json.loads(job["cases"]), True)
+        selected = [case for case in cases if case["enabled"]]
+        context = account_context(check_account())
+        controller.check_prompt_support()
+        for case in selected:
+            item = {"id": case["id"], "name": case["name"], "expected_answer": case["expected_answer"],
+                    "status": "yellow", "requests": 0}
+            results.append(item)
+            answers = []
+            for attempt in range(2):
+                check_account()
+                requests_sent += 1
+                item["requests"] += 1
+                output = controller.prompt(job["account_id"], job["model"], case["prompt"], cancelled, deadline)
+                check_account()
+                answer = normalized_answer(output)
+                if not answer:
+                    raise ProbeError("模型未返回可判定的文字答案")
+                answers.append(answer)
+                item["answer_preview"] = output.strip()[:160]
+                item["answer_truncated"] = len(output.strip()) > 160
+                if answer == normalized_answer(case["expected_answer"]):
+                    item.update(status="green" if attempt == 0 else "yellow",
+                                message="答案符合预期" if attempt == 0 else "初测与复测不一致，待确认")
+                    break
+                if attempt == 1:
+                    confirmed = answers[0] == answers[1]
+                    item.update(status="red" if confirmed else "yellow",
+                                message="两次均返回同一非预期答案" if confirmed else "两次非预期答案不同，待确认")
+            # No replacement questions: each selected question runs once, with at most one confirmation.
+        check_account()
+        colors = {item["status"] for item in results}
+        status = "yellow" if "yellow" in colors else "red" if "red" in colors else "green"
+        result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目复测仍未通过",
+                                                "yellow": "本轮有不稳定结果，待确认"}[status], "_context": context.hex()}
+    except ProbeError as exc:
+        result = {"status": "yellow", "message": str(exc)}
+        if results and results[-1]["status"] == "yellow":
+            results[-1]["message"] = str(exc)
+    result.update(test_mode="qa", requests=requests_sent, request_limit=len(selected) * 2,
+                  cases=results, selected_cases=len(selected), latency_ms=int((time.monotonic() - started) * 1000))
     return result
 
 
@@ -1056,7 +1182,7 @@ class AdminAuth:
 
 def create_app(store, accounts, authenticate):
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
     allowed_origins = set(os.environ.get("MODELTRACE_ORIGINS", "https://aifxo.com,https://www.aifxo.com").split(","))
 
     @app.before_request
@@ -1097,8 +1223,13 @@ def create_app(store, accounts, authenticate):
         result.update(available=not unavailable(meta), reason=unavailable(meta), models=model_choices(meta),
                       mapping=meta.get("mapping") or {}, platform=meta["platform"],
                       schedulable=bool(meta.get("schedulable")))
-        result["prompt_test"]["available"] = not prompt_unavailable(meta)
-        result["prompt_test"]["reason"] = prompt_unavailable(meta)
+        prompt = result["prompt_test"]
+        prompt["available"] = not prompt_unavailable(meta, prompt["test_mode"])
+        prompt["reason"] = prompt_unavailable(meta, prompt["test_mode"])
+        prompt["qa_available"] = not prompt_unavailable(meta, "qa")
+        prompt["qa_reason"] = prompt_unavailable(meta, "qa")
+        prompt["attribution_available"] = not prompt_unavailable(meta)
+        prompt["attribution_reason"] = prompt_unavailable(meta)
         return result
 
     @app.get("/accounts")
@@ -1155,6 +1286,19 @@ def create_app(store, accounts, authenticate):
         if not meta:
             return jsonify(error="账号不存在"), 404
         previous = store.get_prompt(account_id)
+        test_mode = body.get("test_mode", previous["test_mode"] if previous else "attribution")
+        if test_mode not in ("attribution", "qa"):
+            return jsonify(error="请选择问答测试或数字归因模板"), 400
+        cases = body.get("cases", json.loads(previous["cases"]) if previous else [])
+        if test_mode == "qa":
+            try:
+                cases = validate_qa_cases(cases, body["enabled"])
+            except ProbeError as exc:
+                return jsonify(error=str(exc)), 400
+        elif previous:
+            cases = json.loads(previous["cases"])
+        else:
+            cases = []
         model = body.get("model", previous["model"] if previous else "gpt-6-astra")
         prompt = body.get("prompt", previous["prompt"] if previous else DEFAULT_PROMPT)
         auto_pause = body.get("auto_pause_enabled", bool(previous and previous["auto_pause_enabled"]))
@@ -1163,13 +1307,15 @@ def create_app(store, accounts, authenticate):
         challenge_count = body.get("challenge_count", previous["challenge_count"] if previous else 3)
         if not isinstance(model, str) or not model.strip() or len(model) > 160:
             return jsonify(error="测试模型无效"), 400
-        if body["enabled"]:
+        if body["enabled"] and test_mode == "attribution":
             try:
                 validate_prompt_template(prompt)
             except ProbeError as exc:
                 return jsonify(error=str(exc)), 400
         elif previous:
             prompt = previous["prompt"]
+        elif test_mode == "qa":
+            prompt = DEFAULT_PROMPT
         if type(challenge_count) is not int or challenge_count not in (1, 2, 3):
             return jsonify(error="挑战次数请选择 1、2 或 3 次"), 400
         if type(auto_pause) is not bool or type(threshold) is not int or not 1 <= threshold <= 100:
@@ -1177,12 +1323,17 @@ def create_app(store, accounts, authenticate):
         if type(interval_minutes) is not int or not 1 <= interval_minutes <= 1440:
             return jsonify(error="测试间隔请填写 1–1440 分钟的整数"), 400
         if body["enabled"]:
-            if prompt_unavailable(meta):
-                return jsonify(error=prompt_unavailable(meta)), 400
-            if model.strip() not in model_choices(meta):
+            if prompt_unavailable(meta, test_mode):
+                return jsonify(error=prompt_unavailable(meta, test_mode)), 400
+            if test_mode == "attribution" and model.strip() not in model_choices(meta):
                 return jsonify(error="请选择指纹库已收录且账号支持的模型"), 400
+            mapping = meta.get("mapping") or {}
+            if test_mode == "qa" and mapping and not any(
+                re.fullmatch(re.escape(key).replace(r"\*", ".*"), model.strip()) for key in mapping
+            ):
+                return jsonify(error="请选择此账号支持的模型"), 400
         store.configure_prompt(account_id, body["enabled"], model.strip(), prompt,
-                               auto_pause, threshold, interval_minutes, challenge_count)
+                               auto_pause, threshold, interval_minutes, challenge_count, test_mode, cases)
         return jsonify(account=render(account_id, meta))
 
     return app

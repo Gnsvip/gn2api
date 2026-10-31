@@ -48,6 +48,8 @@
     .mt-policy-fields{margin-top:12px}.mt-policy-fields .mt-note{margin:6px 0 0}.mt-interval{display:block;margin-top:16px}
     .mt-prompt-button{appearance:none;border:0;background:transparent;color:#7c3aed;font:11px system-ui;cursor:pointer;padding:0 2px}.mt-prompt-button:hover{color:#6d28d9}.mt-prompt-button:disabled{opacity:.45;cursor:not-allowed}
     .mt-prompt-label{display:block;margin-top:14px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}.mt-prompt-badge[data-enabled=true]{background:#f5f3ff;color:#6d28d9}
+    .mt-case{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:9px}.mt-case>summary{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px}.mt-case>summary span{flex:1;overflow-wrap:anywhere}.mt-case input[type=checkbox],.mt-qa-enabled input{accent-color:#059669}
+    .mt-case input[type=text]{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;margin-top:5px}.mt-case-tools{display:flex;gap:14px;flex-wrap:wrap}.mt-qa-enabled{display:block;margin-top:14px}
   `;
   document.head.append(style);
   const onPage = () => /^\/admin\/accounts\/?$/.test(location.pathname);
@@ -64,7 +66,12 @@
     if (text != null) node.textContent = text;
     return node;
   };
-  const description = result => [
+  const description = result => result.test_mode === 'qa' ? [
+    date(result.checked_at), `问答测试 · 请求模型：${result.expected}`,
+    `本轮请求：${result.requests || 0} 次`, result.message,
+    ...(result.cases || []).map(item => `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer}\n实际回答：${item.answer_preview || '未取得完整回答'}${item.answer_truncated ? '…（已截断）' : ''}`),
+    '按答案判断，不代表模型身份归因'
+  ].filter(Boolean).join('\n') : [
     date(result.checked_at), `预期：${result.expected}`, result.sent_model && `发送模型：${result.sent_model}`,
     result.prediction && `归因：${result.prediction}`,
     typeof result.probability === 'number' && `候选库内分数：${(result.probability * 100).toFixed(1)}%`,
@@ -153,7 +160,7 @@
     for (const result of promptHistory.slice(-10)) {
       const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
       const dot = el('button', 'mt-dot mt-' + color); dot.type = 'button';
-      dot.title = '提示词归因\n' + description(result); dot.setAttribute('aria-label', dot.title);
+      dot.title = (result.test_mode === 'qa' ? '问答测试\n' : '提示词归因\n') + description(result); dot.setAttribute('aria-label', dot.title);
       dot.addEventListener('click', () => openPromptSettings(target.id)); promptDots.append(dot);
     }
     const promptState = state?.prompt_test;
@@ -417,6 +424,51 @@
     }
   }
 
+  function qaEditor(initial, presets, changed) {
+    const root = el('div', 'mt-qa-editor');
+    const list = el('div');
+    const rows = [];
+    const tools = el('div', 'mt-case-tools');
+    const add = el('button', 'mt-link', '＋ 添加自定义题'); add.type = 'button';
+    const candy = el('button', 'mt-link', '＋ 添加糖果题'); candy.type = 'button';
+    const update = () => { add.disabled = candy.disabled = rows.length >= 5; changed(); };
+    function append(data) {
+      if (rows.length >= 5) return;
+      const card = el('details', 'mt-case'); card.open = !data.name;
+      const summary = el('summary');
+      const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!data.enabled;
+      const title = el('span', '', data.name || '未命名题目');
+      const remove = el('button', 'mt-link', '删除'); remove.type = 'button';
+      summary.append(enabled, title, remove); card.append(summary);
+      const fields = {};
+      for (const [key, label, limit] of [['name', '题目名称', 80], ['prompt', '题目提示词', 4000], ['expected_answer', '预期答案', 200]]) {
+        const wrapper = el('label', 'mt-prompt-label', label);
+        const input = el(key === 'prompt' ? 'textarea' : 'input');
+        if (key !== 'prompt') input.type = 'text';
+        input.value = data[key] || ''; input.maxLength = limit; input.setAttribute('aria-label', label);
+        wrapper.append(input); card.append(wrapper); fields[key] = input;
+      }
+      const identity = data.id || 'q-' + crypto.randomUUID();
+      const row = { card, get: () => ({ id: identity, enabled: enabled.checked,
+        name: fields.name.value, prompt: fields.prompt.value, expected_answer: fields.expected_answer.value }) };
+      rows.push(row); list.append(card);
+      const rename = () => { title.textContent = fields.name.value || '未命名题目'; enabled.setAttribute('aria-label', '测试 ' + title.textContent); };
+      rename(); fields.name.addEventListener('input', rename);
+      enabled.addEventListener('click', event => event.stopPropagation());
+      enabled.addEventListener('change', update);
+      remove.addEventListener('click', event => { event.preventDefault(); rows.splice(rows.indexOf(row), 1); card.remove(); update(); });
+      update();
+    }
+    add.addEventListener('click', () => append({ enabled: false }));
+    candy.disabled = !presets?.length;
+    candy.addEventListener('click', () => { if (presets?.[0]) append({ ...presets[0], id: undefined, enabled: false }); });
+    tools.append(add); if (presets?.length) tools.append(candy);
+    root.append(el('p', 'mt-note', '最多 5 道题。只测试勾选的题；关闭的题不发送请求。可修改每道题的提示词和预期答案。'), list, tools,
+      el('p', 'mt-note', '按完整答案匹配，忽略首尾空白、大小写和全角差异。建议要求只输出答案；回答中仅包含答案数字不算通过。'));
+    initial.forEach(append);
+    return { root, values: () => rows.map(row => row.get()) };
+  }
+
   function openPromptSettings(id) {
     const state = states.get(id);
     const promptState = state?.prompt_test;
@@ -429,9 +481,22 @@
     badge.dataset.enabled = String(!!promptState.enabled);
     header.append(title, badge);
     const body = el('div', 'mt-body');
+    const modeLabel = el('label', 'mt-prompt-label', '测试方式');
+    const mode = el('select'); mode.setAttribute('aria-label', '测试方式');
+    for (const [value, text] of [['qa', '问答测试（按预期答案）'], ['attribution', '数字归因模板（原算法）']]) {
+      const option = el('option', '', text); option.value = value; mode.append(option);
+    }
+    mode.value = promptState.test_mode || 'attribution'; modeLabel.append(mode);
+    const qaEnabledLabel = el('label', 'mt-qa-enabled');
+    const qaEnabled = el('input'); qaEnabled.type = 'checkbox';
+    qaEnabled.checked = mode.value === 'qa' && !!promptState.enabled;
+    qaEnabled.setAttribute('role', 'switch'); qaEnabled.setAttribute('aria-label', '启用定时问答测试');
+    qaEnabledLabel.append(qaEnabled, document.createTextNode('启用定时问答测试'));
     const modelLabel = el('label', 'mt-prompt-label', '测试模型');
     const model = el('select');
-    const choices = state.models || [];
+    let desiredModel = promptState.model || state.model;
+    model.addEventListener('change', () => { desiredModel = model.value; });
+    let choices = state.models || [], liveChoices = null, catalogReady = false;
     for (const name of choices) { const option = el('option', '', name); option.value = name; model.append(option); }
     model.value = preferredModel(choices, promptState.model || state.model);
     model.setAttribute('aria-label', '测试模型'); modelLabel.append(model);
@@ -448,11 +513,15 @@
     interval.value = String(promptState.interval_minutes || 10); interval.setAttribute('aria-label', '测试间隔（分钟）');
     intervalLabel.append(interval, document.createTextNode('分钟'));
     const estimate = el('p', 'mt-note');
+    let editor;
     const refreshEstimate = () => {
-      const minutes = Number(interval.value), samples = Number(challenges.value);
+      const minutes = Number(interval.value), samples = mode.value === 'qa'
+        ? (editor?.values() || []).filter(item => item.enabled).length : Number(challenges.value);
       estimate.textContent = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
-        ? `通常 ${samples} 次 / 轮，补采或复测最多 ${samples * 2} 次 / 轮；每天通常约 ${Math.ceil(1440 / minutes) * samples} 次，最多约 ${Math.ceil(1440 / minutes) * samples * 2} 次，会消耗账号额度。` : '';
+        ? `通常 ${samples} 次 / 轮，${mode.value === 'qa' ? '不符复测' : '补采或复测'}最多 ${samples * 2} 次 / 轮；每天通常约 ${Math.ceil(1440 / minutes) * samples} 次，最多约 ${Math.ceil(1440 / minutes) * samples * 2} 次，会消耗账号额度。` : '';
     };
+    const initialCases = promptState.cases?.length || mode.value === 'qa' ? (promptState.cases || []) : (promptState.qa_presets || []);
+    editor = qaEditor(initialCases, promptState.qa_presets, refreshEstimate);
     interval.addEventListener('input', refreshEstimate); challenges.addEventListener('change', refreshEstimate); refreshEstimate();
     const policy = el('div', 'mt-policy');
     const autoLabel = el('label');
@@ -474,6 +543,7 @@
     help.append(el('summary', '', '测试说明'),
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
       el('p', '', '绿：高分归因与预期一致。黄：样本不足、区分度不足、请求失败或复测不稳定。红：两轮独立归因均高分指向同一个其他模型。候选库内分数不是真伪证明。'),
+      el('p', '', '问答模式：绿表示所选题目全部符合预期；黄表示请求失败、未完成或复测不稳定；红表示至少一题两次返回同一非预期答案，且本轮没有黄色结果。问答颜色不证明模型身份。每道开启的题每轮发一次，不符时最多复测一次。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'));
     const history = el('ul', 'mt-history mt-prompt-history');
     const historyHead = el('div', 'mt-section-head'); historyHead.append(el('span', '', '最近测试结果'));
@@ -484,7 +554,8 @@
       const dot = el('span', 'mt-dot mt-' + color);
       const details = el('details', 'mt-result');
       const summary = el('summary');
-      summary.append(dot, el('time', '', shortDate(result.checked_at)), el('span', 'mt-result-title', color === 'green' ? '与预期一致' : color === 'red' ? '复测仍不符' : '待确认'));
+      summary.append(dot, el('time', '', shortDate(result.checked_at)), el('span', 'mt-result-title',
+        (result.test_mode === 'qa' ? '问答 · ' : '归因 · ') + (color === 'green' ? '与预期一致' : color === 'red' ? '复测仍不符' : '待确认')));
       summary.title = result.message || '';
       details.append(summary, el('pre', '', description(result)));
       item.append(details); history.append(item); historyItems.push(item);
@@ -494,25 +565,70 @@
     const actions = el('div', 'mt-actions');
     const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
     const saveButton = el('button', 'mt-primary', promptState.enabled ? '保存设置' : '开启测试'); saveButton.type = 'button';
-    saveButton.disabled = !promptState.available || !choices.length;
+    const availability = el('p', 'mt-error');
+    const catalogNote = el('p', 'mt-note', '正在读取账号可用模型…');
+    function refreshMode() {
+      const qa = mode.value === 'qa';
+      promptLabel.hidden = templateNote.hidden = challengeLabel.hidden = qa;
+      editor.root.hidden = qaEnabledLabel.hidden = !qa;
+      choices = liveChoices ? liveChoices.filter(name => qa || (state.models || []).includes(name)) : (state.models || []);
+      model.replaceChildren();
+      for (const name of choices) { const option = el('option', '', name); option.value = name; model.append(option); }
+      model.value = preferredModel(choices, desiredModel);
+      model.disabled = !catalogReady || !choices.length;
+      const available = (qa ? promptState.qa_available : promptState.attribution_available) ?? promptState.available;
+      availability.textContent = available ? '' : ((qa ? promptState.qa_reason : promptState.attribution_reason) || promptState.reason);
+      saveButton.textContent = qa ? '保存设置' : promptState.enabled ? '保存设置' : '开启测试';
+      saveButton.disabled = qa && !qaEnabled.checked ? false : (!available || !catalogReady || !choices.length);
+      refreshEstimate();
+    }
+    mode.addEventListener('change', () => {
+      auto.checked = mode.value === (promptState.test_mode || 'attribution') && !!promptState.auto_pause_enabled;
+      threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked;
+      error.textContent = ''; refreshMode();
+    });
+    qaEnabled.addEventListener('change', refreshMode);
     saveButton.addEventListener('click', () => {
       const minutes = Number(interval.value), count = Number(threshold.value);
-      if (!model.value.trim()) { error.textContent = '请填写测试模型'; return; }
-      if (!prompt.value.trim() || prompt.value.length > 4000) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
-      if (prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
+      const qa = mode.value === 'qa';
+      if ((!qa || qaEnabled.checked) && !model.value.trim()) { error.textContent = '请填写测试模型'; return; }
+      if (!qa && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
+      if (!qa && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
       if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '测试间隔请填写 1–1440 分钟的整数'; return; }
       if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续红点轮数请填写 1–100 的整数'; return; }
-      savePrompt(id, { enabled: true, model: model.value, prompt: prompt.value, challenge_count: Number(challenges.value),
-        auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes }, dialog, error);
+      const cases = editor.values();
+      if (qa && qaEnabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
+      if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || !item.expected_answer.trim()))) {
+        error.textContent = '请填写已勾选题目的名称、提示词和预期答案'; return;
+      }
+      const payload = { enabled: qa ? qaEnabled.checked : true, model: model.value || promptState.model || 'gpt-6-astra',
+        prompt: prompt.value, challenge_count: Number(challenges.value),
+        auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes };
+      if (qa || promptState.test_mode === 'qa') payload.test_mode = mode.value;
+      if (qa) payload.cases = cases;
+      savePrompt(id, payload, dialog, error);
     });
     const disable = el('button', '', '关闭测试'); disable.type = 'button'; disable.disabled = !promptState.enabled;
     disable.addEventListener('click', () => savePrompt(id, { enabled: false }, dialog, error));
     actions.append(close, disable, saveButton);
-    body.append(modelLabel, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
-      el('p', 'mt-error', promptState.available ? '' : promptState.reason), policy, historyHead, history, empty, help, error);
+    body.append(modeLabel, modelLabel, catalogNote, qaEnabledLabel, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
+      availability, policy, historyHead, history, empty, help, error);
     dialog.append(header, body, actions);
     dialog.addEventListener('close', () => dialog.remove());
     document.body.append(dialog); dialog.showModal();
+    refreshMode();
+    const currentToken = token();
+    fetch('/api/v1/admin/accounts/' + id + '/models', {
+      headers: { Authorization: 'Bearer ' + currentToken }, cache: 'no-store', signal: AbortSignal.timeout(15000)
+    }).then(async response => {
+      if (!response.ok) throw new Error('无法读取账号可用模型，请稍后重试');
+      const data = (await response.json()).data;
+      const entries = Array.isArray(data) ? data : data?.models || data?.data;
+      if (!Array.isArray(entries)) throw new Error('账号模型列表格式已变化');
+      if (!dialog.open || currentToken !== token()) return;
+      liveChoices = [...new Set(entries.map(item => typeof item === 'string' ? item : item.id).filter(name => typeof name === 'string' && name))];
+      catalogReady = true; catalogNote.textContent = liveChoices.length ? '' : '账号当前没有可用模型'; refreshMode();
+    }).catch(error => { if (dialog.open) catalogNote.textContent = error.name === 'TimeoutError' ? '读取模型列表超时，请关闭后重试' : error.message; });
   }
 
   const observer = new MutationObserver(records => {

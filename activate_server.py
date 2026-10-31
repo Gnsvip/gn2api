@@ -26,7 +26,7 @@ if __name__ == '__main__':
     assert not any('worker_shutdown_timeout' in x and not x.lstrip().startswith('#') for x in full.stdout.splitlines()), 'Inspect worker shutdown timeout first'
     old_tag = '<script id="aifxo-hide-footer-links" src="/custom/hide-footer-links.js?v=20260722-home-footer"></script></body>'
     assert original.count(old_tag) == 1
-    new_tag = old_tag.replace('</body>', '<script defer src="/custom/modeltrace.js?v=20261031-prompt-1"></script></body>')
+    new_tag = old_tag.replace('</body>', '<script defer src="/custom/modeltrace.js?v=20261031-qa-1"></script></body>')
     block = '''    # Independent opt-in ModelTrace extension; preserve during nginx redeploys.
     location = /custom/modeltrace.js {
         alias /opt/sub2api-custom/modeltrace.js;
@@ -42,7 +42,7 @@ if __name__ == '__main__':
         proxy_set_header Connection "";
         proxy_connect_timeout 2s;
         proxy_read_timeout 15s;
-        client_max_body_size 16k;
+        client_max_body_size 128k;
         access_log off;
     }
 
