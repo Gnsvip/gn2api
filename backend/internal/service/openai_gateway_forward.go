@@ -520,6 +520,55 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			strings.TrimSpace(gjson.GetBytes(body, "text.format.type").String()),
 			"json_object",
 		)
+		// Codex OAuth scope: generic/compatible clients are rebuilt into the
+		// full Codex CLI request shape so third-party requests are recognised
+		// upstream as the official client. The guard is the per-attempt account,
+		// so a failover to an API-key/SetupToken account re-enters with the
+		// original body.
+		var synthResult *codexSynthResult
+		officialCodexClient := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
+		if isCodexOAuthAccount(account) && s.codexFullSynthesisEnabled() && !isCompactRequest {
+			deviceProfile, _ := codexDeviceProfileForRequest(account)
+			var clientHeaders http.Header
+			if c != nil && c.Request != nil {
+				clientHeaders = c.Request.Header
+			}
+			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			wireMode := codexWireProfileModeAuto
+			if s != nil && s.cfg != nil && strings.TrimSpace(s.cfg.Gateway.CodexWire.Profile) != "" {
+				wireMode = s.cfg.Gateway.CodexWire.Profile
+			}
+			wireProfile, _ := resolveCodexWireProfile(CodexCanonicalClientVersion(), wireMode)
+			synthOptions := codexSynthOptions{
+				ResponsesLite:  responsesLite,
+				IsCompact:      isCompactRequest,
+				WireProfile:    wireProfile,
+				WireVersion:    CodexCanonicalClientVersion(),
+				Device:         deviceProfile,
+				Now:            time.Now(),
+				Strict:         s.cfg != nil && s.cfg.Gateway.CodexWire.Strict,
+				OfficialClient: officialCodexClient,
+			}
+			if fpIDs != nil {
+				synthOptions.TurnID = fpIDs.turnID
+				synthOptions.TurnStartedMs = fpIDs.turnStartedAtUnixMs
+			}
+			result, synthErr := synthesizeCodexOAuthRequest(decoded, account, upstreamModel, synthOptions)
+			if synthErr != nil {
+				setOpsUpstreamError(c, http.StatusBadRequest, synthErr.Error(), "")
+				MarkResponseCommitted(c)
+				c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+					"type": "invalid_request_error", "message": synthErr.Error(), "param": "input",
+				}})
+				return nil, synthErr
+			}
+			if result.Modified {
+				synthResult = &result
+				markDecodedModified()
+				markCodexSynthesized(c)
+			}
+		}
+		synthesized := synthResult != nil && synthResult.Modified
 		codexResult := codexTransformResult{}
 		if compatMessagesBridge {
 			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
@@ -530,12 +579,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				OmitPromotedSystemMessagesFromInput: omitPromotedSystemMessages,
 				ResponsesLite:                       responsesLite,
 			})
-			ensureCodexOAuthInstructionsField(decoded)
+			if !synthesized {
+				ensureCodexOAuthInstructionsField(decoded)
+			}
 			markDecodedModified()
 		} else {
 			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
 				IsCodexCLI:                          isCodexCLI,
 				IsCompact:                           isCompactRequest,
+				SkipDefaultInstructions:             synthesized || codexInputMapCarriesBaseInstructions(decoded),
 				OmitPromotedSystemMessagesFromInput: omitPromotedSystemMessages,
 				ResponsesLite:                       responsesLite,
 			})
@@ -544,7 +596,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"type": "invalid_request_error", "message": codexResult.Error.Error()}})
 			return nil, codexResult.Error
 		}
-		setCodexToolNameReverse(c, codexResult.ToolNameReverse)
+		reverse := codexResult.ToolNameReverse
+		if synthResult != nil && len(synthResult.ToolNameReverse) > 0 {
+			reverse = mergeCodexToolNameReverseMaps(synthResult.ToolNameReverse, reverse)
+		}
+		setCodexToolNameReverse(c, reverse)
 		if codexResult.Modified {
 			markDecodedModified()
 		}

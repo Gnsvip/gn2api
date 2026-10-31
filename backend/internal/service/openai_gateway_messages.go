@@ -223,6 +223,43 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		if err := json.Unmarshal(responsesBody, &reqBody); err != nil {
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
 		}
+		// Codex OAuth scope: rebuild generic/compatible messages requests into
+		// the full Codex CLI shape so upstream recognises them as official.
+		var synthResult *codexSynthResult
+		if isCodexOAuthAccount(account) && s.codexFullSynthesisEnabled() {
+			deviceProfile, _ := codexDeviceProfileForRequest(account)
+			wireMode := codexWireProfileModeAuto
+			if s != nil && s.cfg != nil && strings.TrimSpace(s.cfg.Gateway.CodexWire.Profile) != "" {
+				wireMode = s.cfg.Gateway.CodexWire.Profile
+			}
+			wireProfile, _ := resolveCodexWireProfile(CodexCanonicalClientVersion(), wireMode)
+			var clientHeaders http.Header
+			if c != nil && c.Request != nil {
+				clientHeaders = c.Request.Header
+			}
+			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			synthOptions := codexSynthOptions{
+				ResponsesLite: false,
+				WireProfile:   wireProfile,
+				WireVersion:   CodexCanonicalClientVersion(),
+				Device:        deviceProfile,
+				Now:           time.Now(),
+				Strict:        s.cfg != nil && s.cfg.Gateway.CodexWire.Strict,
+			}
+			if fpIDs != nil {
+				synthOptions.TurnID = fpIDs.turnID
+				synthOptions.TurnStartedMs = fpIDs.turnStartedAtUnixMs
+			}
+			result, synthErr := synthesizeCodexOAuthRequest(reqBody, account, upstreamModel, synthOptions)
+			if synthErr != nil {
+				writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", synthErr.Error())
+				return nil, synthErr
+			}
+			if result.Modified {
+				synthResult = &result
+				markCodexSynthesized(c)
+			}
+		}
 		codexResult := applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{
 			SkipDefaultInstructions: true,
 			PreserveToolCallIDs:     true,
@@ -231,7 +268,11 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", codexResult.Error.Error())
 			return nil, codexResult.Error
 		}
-		setCodexToolNameReverse(c, codexResult.ToolNameReverse)
+		reverse := codexResult.ToolNameReverse
+		if synthResult != nil && len(synthResult.ToolNameReverse) > 0 {
+			reverse = mergeCodexToolNameReverseMaps(synthResult.ToolNameReverse, reverse)
+		}
+		setCodexToolNameReverse(c, reverse)
 		forcedTemplateText := ""
 		if s.cfg != nil {
 			forcedTemplateText = s.cfg.Gateway.ForcedCodexInstructionsTemplate

@@ -446,6 +446,26 @@ func codexToolsContainType(rawTools any, toolType string) bool {
 	return false
 }
 
+// openAIRequestBodyHasToolsMap reports whether the decoded body declares at
+// least one tool, either at top-level tools or inside an input additional_tools
+// carrier (Responses Lite).
+func openAIRequestBodyHasToolsMap(reqBody map[string]any) bool {
+	if tools, ok := reqBody["tools"].([]any); ok && len(tools) > 0 {
+		return true
+	}
+	input, _ := reqBody["input"].([]any)
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || item["type"] != "additional_tools" {
+			continue
+		}
+		if tools, ok := item["tools"].([]any); ok && len(tools) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func codexToolsContainFunctionName(rawTools any, name string) bool {
 	tools, ok := rawTools.([]any)
 	if !ok || strings.TrimSpace(name) == "" {

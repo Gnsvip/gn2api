@@ -77,6 +77,14 @@ var instructionsGPT52 string
 //go:embed instructions_gpt5_5.txt
 var instructionsGPT55 string
 
+// instructionsGPT55_0_163 is the base prompt captured from the official
+// codex-cli 0.163.0 golden (backend/internal/pkg/codexwire/testdata/golden).
+// It is used only by the stable-profile synthesizer; the catalog prompt stays
+// authoritative for the 0.164/main profile.
+//
+//go:embed instructions_gpt5_5_0_163.txt
+var instructionsGPT55_0_163 string
+
 // Source: openai/codex codex-rs/models-manager/models.json at 121f91fd5d9d.
 //
 //go:embed instructions_gpt6_astra.txt
@@ -87,6 +95,12 @@ var instructionsGPT6Astra string
 //
 //go:embed codex_gpt61_sol.json
 var CodexGPT61SolMetadata []byte
+
+// CodexStableGPT55Instructions returns the base prompt captured from the
+// official codex-cli 0.163.0 golden. Only the stable wire profile uses it.
+func CodexStableGPT55Instructions() string {
+	return strings.TrimSpace(instructionsGPT55_0_163)
+}
 
 // latestCodexInstructions 返回当前已知最新版本的 Codex base instructions，
 // 当前为 GPT-5.5；若 5.5 prompt 意外为空则回退到 DefaultInstructions 保证非空。

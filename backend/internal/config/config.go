@@ -1035,6 +1035,40 @@ type GatewayCodexEgressConfig struct {
 	Enabled bool `mapstructure:"enabled"`
 }
 
+// GatewayCodexWireConfig controls Codex CLI wire-profile emulation. Every key
+// here is read only for OpenAI OAuth accounts (isCodexOAuthAccount); SetupToken,
+// API-key, and non-OpenAI platform accounts ignore the whole section.
+type GatewayCodexWireConfig struct {
+	// Profile pins the wire profile: auto (default), stable, or main.
+	// auto follows the synced Codex version (>=0.164 uses main).
+	Profile string `mapstructure:"profile"`
+	// Strict rejects unknown/future versions instead of warning and using the
+	// newest known profile.
+	Strict bool `mapstructure:"strict"`
+	// MapOrderJitter shuffles client_metadata keys within the legal key set.
+	// Production viper defaults to true; a hand-built zero Config keeps the
+	// legacy fixed order.
+	MapOrderJitter *bool `mapstructure:"map_order_jitter"`
+	// StreamIdleTimeoutSeconds overrides the upstream SSE idle timeout for the
+	// OAuth Codex lane. Production viper defaults to 300; 0 (hand-built Config
+	// or an explicit yaml 0) falls back to gateway.stream_data_interval_timeout.
+	StreamIdleTimeoutSeconds int `mapstructure:"stream_idle_timeout_seconds"`
+}
+
+// CodexWireMapOrderJitterEnabled reports whether client_metadata key order is
+// jittered. A hand-built Config (tests/tools) keeps the legacy fixed order;
+// viper sets gateway.codex_wire.map_order_jitter=true in production.
+func (c GatewayConfig) CodexWireMapOrderJitterEnabled() bool {
+	return c.CodexWire.MapOrderJitter != nil && *c.CodexWire.MapOrderJitter
+}
+
+// CodexFullSynthesisEnabled reports whether generic clients on OAuth Codex
+// accounts are rebuilt into the full Codex request shape. A hand-built Config
+// keeps legacy behavior; viper sets gateway.codex_full_synthesis=true.
+func (c GatewayConfig) CodexFullSynthesisEnabled() bool {
+	return c.CodexFullSynthesis != nil && *c.CodexFullSynthesis
+}
+
 type GatewayConfig struct {
 	CodexEgress GatewayCodexEgressConfig `mapstructure:"codex_egress"`
 	// MinOutputTokens is the minimum max_output_tokens used when
@@ -1073,6 +1107,13 @@ type GatewayConfig struct {
 	// ForceCodexCLI: 强制将 OpenAI `/v1/responses` 请求按 Codex CLI 处理。
 	// 用于网关未透传/改写 User-Agent 时的兼容兜底（默认关闭，避免影响其他客户端）。
 	ForceCodexCLI bool `mapstructure:"force_codex_cli"`
+	// CodexFullSynthesis rebuilds non-native requests into the full Codex CLI
+	// request shape when the selected account is OpenAI OAuth. Production viper
+	// defaults to true; a hand-built zero Config keeps the legacy path.
+	// SetupToken/API-key/non-OpenAI accounts never read this switch.
+	CodexFullSynthesis *bool `mapstructure:"codex_full_synthesis"`
+	// CodexWire: Codex CLI wire profile emulation (OAuth-only).
+	CodexWire GatewayCodexWireConfig `mapstructure:"codex_wire"`
 	// DisableCodexIdentityEnforcement: 关闭「强制统一 Codex 出站身份」。上游 /backend-api/codex
 	// 在容量紧张时按客户端身份分优先级降载，被降载的请求会拿到 HTTP 200 + 流内
 	// server_is_overloaded，该次请求失败。默认强制统一出口：所有 OAuth 出站的
@@ -2497,6 +2538,11 @@ func setDefaults() {
 	viper.SetDefault("gateway.max_account_switches_gemini", 3)
 	viper.SetDefault("gateway.max_same_account_retries_gemini", 4)
 	viper.SetDefault("gateway.force_codex_cli", false)
+	viper.SetDefault("gateway.codex_full_synthesis", true)
+	viper.SetDefault("gateway.codex_wire.profile", "auto")
+	viper.SetDefault("gateway.codex_wire.strict", false)
+	viper.SetDefault("gateway.codex_wire.map_order_jitter", true)
+	viper.SetDefault("gateway.codex_wire.stream_idle_timeout_seconds", 300)
 	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
 	viper.SetDefault("gateway.disable_codex_originator_normalization", false)
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)

@@ -265,8 +265,50 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
 		}
 		isJSONObjectFormat := strings.EqualFold(strings.TrimSpace(gjson.GetBytes(responsesBody, "text.format.type").String()), "json_object")
+		// Codex OAuth scope: rebuild generic/compatible chat-completions requests
+		// into the full Codex CLI shape so upstream recognises them as official.
+		var synthResult *codexSynthResult
+		if isCodexOAuthAccount(account) && s.codexFullSynthesisEnabled() {
+			deviceProfile, _ := codexDeviceProfileForRequest(account)
+			wireMode := codexWireProfileModeAuto
+			if s != nil && s.cfg != nil && strings.TrimSpace(s.cfg.Gateway.CodexWire.Profile) != "" {
+				wireMode = s.cfg.Gateway.CodexWire.Profile
+			}
+			wireProfile, _ := resolveCodexWireProfile(CodexCanonicalClientVersion(), wireMode)
+			var clientHeaders http.Header
+			if c != nil && c.Request != nil {
+				clientHeaders = c.Request.Header
+			}
+			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			synthOptions := codexSynthOptions{
+				ResponsesLite: false,
+				WireProfile:   wireProfile,
+				WireVersion:   CodexCanonicalClientVersion(),
+				Device:        deviceProfile,
+				Now:           time.Now(),
+				Strict:        s.cfg != nil && s.cfg.Gateway.CodexWire.Strict,
+			}
+			if fpIDs != nil {
+				synthOptions.TurnID = fpIDs.turnID
+				synthOptions.TurnStartedMs = fpIDs.turnStartedAtUnixMs
+			}
+			result, synthErr := synthesizeCodexOAuthRequest(reqBody, account, upstreamModel, synthOptions)
+			if synthErr != nil {
+				if errors.Is(synthErr, ErrCodexSynthContextWindowExceeded) {
+					c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"type": "invalid_request_error", "code": "context_length_exceeded", "message": codexSynthContextLengthMessage, "param": "messages"}})
+					return nil, synthErr
+				}
+				c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"type": "invalid_request_error", "message": synthErr.Error()}})
+				return nil, synthErr
+			}
+			if result.Modified {
+				synthResult = &result
+				markCodexSynthesized(c)
+			}
+		}
+		synthesized := synthResult != nil && synthResult.Modified
 		codexResult := applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{
-			SkipDefaultInstructions:             !isResponsesShape,
+			SkipDefaultInstructions:             !isResponsesShape || synthesized,
 			OmitPromotedSystemMessagesFromInput: !isResponsesShape && !isJSONObjectFormat,
 		})
 		if codexResult.Error != nil {

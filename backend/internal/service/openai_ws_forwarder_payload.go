@@ -259,6 +259,40 @@ func codexWSInstructionsItemID(instructions string) string {
 	return "msg_" + fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
+// codexInputMapCarriesBaseInstructions reports whether a decoded body already
+// carries the official Codex base-instructions item (a developer message tagged
+// model.base_instructions).
+func codexInputMapCarriesBaseInstructions(reqBody map[string]any) bool {
+	input, ok := reqBody["input"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range input {
+		var item map[string]any
+		switch v := raw.(type) {
+		case map[string]any:
+			item = v
+		case json.RawMessage:
+			if err := json.Unmarshal(v, &item); err != nil {
+				continue
+			}
+		default:
+			continue
+		}
+		if item["role"] != "developer" {
+			continue
+		}
+		meta, _ := item["internal_chat_message_metadata_passthrough"].(map[string]any)
+		kinds, _ := meta["content_item_kinds"].([]any)
+		for _, k := range kinds {
+			if k == "model.base_instructions" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func setOpenAIWSTurnMetadata(payload map[string]any, turnMetadata string) {
 	if len(payload) == 0 {
 		return
