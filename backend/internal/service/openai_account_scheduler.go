@@ -1105,6 +1105,18 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		return append(primary, overflow...)
 	}
 
+	buildTieredSelectionOrder := func(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {
+		tiers := s.partitionOpenAITiboRouteTiers(req, pool)
+		if tiers == nil {
+			return buildSelectionOrder(pool)
+		}
+		selectionOrder := make([]openAIAccountCandidateScore, 0, len(pool))
+		for _, tier := range tiers {
+			selectionOrder = append(selectionOrder, buildSelectionOrder(tier)...)
+		}
+		return selectionOrder
+	}
+
 	if req.RequireCompact {
 		supported := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
 		unknown := make([]openAIAccountCandidateScore, 0, len(plan.candidates))
@@ -1117,15 +1129,43 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			}
 		}
 		selectionOrder := make([]openAIAccountCandidateScore, 0, len(plan.allCandidates))
-		selectionOrder = append(selectionOrder, buildSelectionOrder(supported)...)
-		selectionOrder = append(selectionOrder, buildSelectionOrder(unknown)...)
+		selectionOrder = append(selectionOrder, buildTieredSelectionOrder(supported)...)
+		selectionOrder = append(selectionOrder, buildTieredSelectionOrder(unknown)...)
 		if len(plan.staleSnapshotCompactRetry) > 0 && s.service.schedulerSnapshot != nil {
 			selectionOrder = append(selectionOrder, sortOpenAICompactRetryCandidates(plan.staleSnapshotCompactRetry)...)
 		}
 		return selectionOrder
 	}
 
-	return buildSelectionOrder(plan.candidates)
+	return buildTieredSelectionOrder(plan.candidates)
+}
+
+// partitionOpenAITiboRouteTiers splits candidates by Tibo route tier when
+// scheduler_prefer_healthy_route is on. It returns nil when tiering is off or
+// every candidate is in one tier (the existing order applies unchanged). The
+// previous-response account keeps the top tier so continuations stay put.
+func (s *defaultOpenAIAccountScheduler) partitionOpenAITiboRouteTiers(req OpenAIAccountScheduleRequest, pool []openAIAccountCandidateScore) [][]openAIAccountCandidateScore {
+	if s == nil || s.service == nil || len(pool) < 2 || !s.service.openAITiboRouteConfig().preferHealthy {
+		return nil
+	}
+	now := time.Now()
+	tiers := make([][]openAIAccountCandidateScore, 3)
+	populated := 0
+	for _, candidate := range pool {
+		tier := s.service.openAITiboSchedulerTier(candidate.account, req.RequestedModel, now)
+		if strings.TrimSpace(req.PreviousResponseID) != "" && req.StickyPreviousAccountID > 0 &&
+			candidate.account != nil && candidate.account.ID == req.StickyPreviousAccountID {
+			tier = 0
+		}
+		if len(tiers[tier]) == 0 {
+			populated++
+		}
+		tiers[tier] = append(tiers[tier], candidate)
+	}
+	if populated < 2 {
+		return nil
+	}
+	return tiers
 }
 
 func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []openAIAccountCandidateScore {

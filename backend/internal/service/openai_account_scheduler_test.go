@@ -3168,6 +3168,8 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_RequiredWSV2_NoAvailabl
 			Status:      StatusActive,
 			Schedulable: true,
 			Concurrency: 1,
+			// OAuth 现在默认启用 WSv2；显式关闭以构造“不支持 WSv2”的账号。
+			Extra: map[string]any{"openai_oauth_responses_websockets_v2_enabled": false},
 		},
 	}
 

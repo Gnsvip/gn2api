@@ -1,9 +1,11 @@
 package service
 
 import (
+	"context"
 	"maps"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -92,4 +94,58 @@ func MergeOpenAICodexTicketExtra(extra, current map[string]any) map[string]any {
 		}
 	}
 	return result
+}
+
+// StartOpenAICodexTicketHarvester starts the background Tibo probe loop. The
+// full x-codex-turn-state ticket harvesting lifecycle is not part of gn2api;
+// this loop only drives the Tibo health probing (openai_tibo_route*.go).
+func (s *OpenAIGatewayService) StartOpenAICodexTicketHarvester() {
+	if s == nil {
+		return
+	}
+	s.openaiCodexTicketLifecycleMu.Lock()
+	defer s.openaiCodexTicketLifecycleMu.Unlock()
+	if s.openaiCodexTicketStopped || s.openaiCodexTicketDone != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.openaiCodexTicketCancel = cancel
+	s.openaiCodexTicketDone = done
+	go func() {
+		defer close(done)
+		s.openAICodexTicketHarvestLoop(ctx)
+	}()
+}
+
+// StopOpenAICodexTicketHarvester stops the background Tibo probe loop.
+func (s *OpenAIGatewayService) StopOpenAICodexTicketHarvester() {
+	if s == nil {
+		return
+	}
+	s.openaiCodexTicketLifecycleMu.Lock()
+	s.openaiCodexTicketStopped = true
+	cancel, done := s.openaiCodexTicketCancel, s.openaiCodexTicketDone
+	s.openaiCodexTicketLifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (s *OpenAIGatewayService) openAICodexTicketHarvestLoop(ctx context.Context) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.probeOpenAITiboRoutes(ctx)
+			// 6s 与参考版默认 HarvestProbeIntervalSeconds 一致。
+			timer.Reset(6 * time.Second)
+		}
+	}
 }

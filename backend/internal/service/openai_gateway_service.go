@@ -533,6 +533,11 @@ type OpenAIGatewayService struct {
 	openaiTiboPins        sync.Map // accountID\x00scope → openAITiboPin
 	openaiTiboPinPrunedAt atomic.Int64
 	openaiTiboMismatchLog sync.Map
+
+	openaiCodexTicketLifecycleMu sync.Mutex
+	openaiCodexTicketCancel      context.CancelFunc
+	openaiCodexTicketDone        chan struct{}
+	openaiCodexTicketStopped     bool
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService
@@ -610,6 +615,7 @@ func NewOpenAIGatewayService(
 		openAITokenProvider.SetAccountRuntimeBlocker(svc)
 	}
 	svc.logOpenAIWSModeBootstrap()
+	svc.StartOpenAICodexTicketHarvester()
 	return svc
 }
 
