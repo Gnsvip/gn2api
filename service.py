@@ -50,7 +50,7 @@ DEFAULT_QA_CASES = [
      "expected_answer": ""},
     {"id": "tibo", "name": "Tibo 题", "enabled": False, "kind": "exact",
      "prompt": "Tell me whether you know who Tibo is in OpenAI based on your knowledge without searching online. Only return True or False.",
-     "expected_answer": ""},
+     "expected_answer": "True"},
 ]
 PROBE_READ_TIMEOUT = 120
 CONFIDENCE = 0.80  # Conservative display threshold, not a guarantee of identity.

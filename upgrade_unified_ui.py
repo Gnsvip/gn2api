@@ -15,7 +15,7 @@ SOURCE = Path(__file__).resolve().parent
 TARGET = Path('/opt/modeltrace-ovh')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261031-ui-1'
+VERSION = '20261031-tibo-true-1'
 FILES = ['modeltrace.js', 'README.md', 'RELEASE_NOTES.md', 'upgrade_unified_ui.py']
 
 

@@ -572,9 +572,14 @@
     const tools = el('div', 'mt-case-tools');
     const add = el('button', 'mt-link', '＋ 添加自定义题'); add.type = 'button';
     const presetButtons = [];
+    const tiboPreset = (presets || []).find(preset => preset.id === 'tibo');
     const update = () => { add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; }); changed(); };
     function append(data) {
       if (rows.length >= 5) return;
+      if ((data.kind || 'exact') === 'exact' && tiboPreset?.expected_answer
+          && data.prompt === tiboPreset.prompt && !(data.expected_answer || '').trim()) {
+        data = { ...data, expected_answer: tiboPreset.expected_answer };
+      }
       const card = el('details', 'mt-case'); card.open = !data.name;
       const summary = el('summary');
       const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!data.enabled;
