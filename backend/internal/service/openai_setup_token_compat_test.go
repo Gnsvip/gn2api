@@ -209,7 +209,7 @@ func TestOpenAISetupTokenMessagesUsesCodexBridgeAndTurnState(t *testing.T) {
 	require.Equal(t, "developer", gjson.GetBytes(upstream.bodies[0], "input.0.role").String())
 	require.Contains(t, gjson.GetBytes(upstream.bodies[0], "input.0.content.0.text").String(), openAICompatClaudeCodeTodoGuardMarker)
 	require.Equal(t, "message-00", gjson.GetBytes(upstream.bodies[0], "input.1.content.0.text").String())
-	require.False(t, gjson.GetBytes(upstream.bodies[0], "prompt_cache_key").Exists())
+	require.NotEmpty(t, gjson.GetBytes(upstream.bodies[0], "prompt_cache_key").String())
 	require.Equal(t, chatgptCodexURL, upstream.requests[0].URL.String())
 	require.Equal(t, "Bearer setup-token-value", upstream.requests[0].Header.Get("Authorization"))
 	require.Equal(t, "chatgpt-setup", upstream.requests[0].Header.Get("chatgpt-account-id"))

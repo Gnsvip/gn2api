@@ -62,6 +62,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return nil, err
 	}
+	restoreClientSession := stageCodexHTTPClientSession(c, account, body)
+	defer restoreClientSession()
+	s.codexWireProfileForRequest(c, account, body)
 
 	// 上游协议统一由 resolveUpstreamProtocol 判定（按模型分流时带上游模型目录）。Anthropic 分流必须先于
 	// ShouldUseResponsesAPI：Anthropic 协议账号经 probe 落标
@@ -303,9 +306,10 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		}
 		if codexResult.PromptCacheKey != "" {
 			promptCacheKey = codexResult.PromptCacheKey
+		} else if promptCacheKey != "" {
+			reqBody["prompt_cache_key"] = promptCacheKey
 		}
 		applyCodexAccountIdentityClientMetadataMap(reqBody, codexAccountIdentitySource(c, account), apiKeyID)
-		delete(reqBody, "prompt_cache_key")
 		if shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) {
 			compatTurnState = s.getOpenAICompatSessionTurnState(ctx, c, account, promptCacheKey)
 		}

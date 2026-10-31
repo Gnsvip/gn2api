@@ -237,8 +237,9 @@ func TestOpenAIGatewayService_OAuthMessagesBridgeDoesNotInjectDefaultInstruction
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"invalid_request_error","message":"bridge stop"}}`)),
 	}}
 	svc := &OpenAIGatewayService{
-		cfg:          &config.Config{},
-		httpUpstream: upstream,
+		tiboRouteDisabled: true,
+		cfg:               &config.Config{},
+		httpUpstream:      upstream,
 	}
 	account := &Account{
 		ID:          123,
@@ -259,11 +260,14 @@ func TestOpenAIGatewayService_OAuthMessagesBridgeDoesNotInjectDefaultInstruction
 	require.Nil(t, result)
 	require.NotNil(t, upstream.lastReq)
 	require.Equal(t, "", gjson.GetBytes(upstream.lastBody, "instructions").String())
-	require.False(t, gjson.GetBytes(upstream.lastBody, "prompt_cache_key").Exists())
-	require.NotEmpty(t, upstream.lastReq.Header.Get("Session_Id"))
+	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "prompt-cache", "anthropic-metadata-session-1"), gjson.GetBytes(upstream.lastBody, "prompt_cache_key").String())
+	// Session identity rides on the official session-id (UUIDv7); the
+	// underscored alias is a header the Codex CLI never sends over HTTP.
+	require.NotEmpty(t, upstream.lastReq.Header.Get("session-id"))
+	require.Empty(t, upstream.lastReq.Header.Get("Session_Id"))
 	require.Empty(t, upstream.lastReq.Header.Get("Conversation_Id"))
 	require.Empty(t, upstream.lastReq.Header.Get("OpenAI-Beta"))
-	require.Empty(t, upstream.lastReq.Header.Get("originator"))
+	require.Equal(t, openai.CodexDefaultOriginator, upstream.lastReq.Header.Get("originator"))
 }
 
 type openAIPassthroughFailoverRepo struct {
@@ -801,8 +805,9 @@ func TestOpenAIGatewayService_OAuthPassthrough_CompactUsesJSONAndKeepsNonStreami
 	upstream := &httpUpstreamRecorder{resp: resp}
 
 	svc := &OpenAIGatewayService{
-		cfg:          &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
-		httpUpstream: upstream,
+		tiboRouteDisabled: true,
+		cfg:               &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: false}},
+		httpUpstream:      upstream,
 	}
 
 	account := &Account{
@@ -835,7 +840,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_CompactUsesJSONAndKeepsNonStreami
 	require.Equal(t, "local-test-instructions", strings.TrimSpace(gjson.GetBytes(upstream.lastBody, "instructions").String()))
 	require.Equal(t, "application/json", upstream.lastReq.Header.Get("Accept"))
 	require.Equal(t, codexCLIVersion, upstream.lastReq.Header.Get("Version"))
-	require.NotEmpty(t, upstream.lastReq.Header.Get("Session_Id"))
+	require.NotEmpty(t, upstream.lastReq.Header.Get("Session-Id"))
 	require.Equal(t, "chatgpt.com", upstream.lastReq.Host)
 	require.Equal(t, "chatgpt-acc", upstream.lastReq.Header.Get("chatgpt-account-id"))
 	require.Contains(t, rec.Body.String(), `"id":"cmp_123"`)

@@ -89,6 +89,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return err
 	}
+	restoreClientSession := stageCodexHTTPClientSession(c, account, firstClientMessage)
+	defer restoreClientSession()
+	s.codexWireProfileForRequest(c, account, firstClientMessage)
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
