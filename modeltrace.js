@@ -5,8 +5,9 @@
   window.__aifxoModelTraceLoaded = true;
   const API = '/custom/modeltrace/api';
   const states = new Map();
-  let loading = false, lastPoll = 0, lastToken = '', lastError = '', reconcileTimer;
+  let loading = false, lastPoll = 0, lastToken = '', lastError = '', reconcileTimer, mutationRevision = 0;
   const pending = new Set();
+  const actionErrors = new Map();
   const style = document.createElement('style');
   style.textContent = `
     .mt-row{display:flex;align-items:center;gap:7px;min-height:22px;margin-bottom:5px;font-size:11px;line-height:18px;white-space:nowrap;color:#64748b}
@@ -17,7 +18,7 @@
     .mt-toggle:after{content:'';position:absolute;left:2px;top:2px;width:10px;height:10px;border-radius:50%;background:#fff;transition:transform .15s}
     .mt-toggle[aria-checked=true]{background:#10b981}.mt-toggle[aria-checked=true]:after{transform:translateX(11px)}
     .mt-toggle:disabled{opacity:.45;cursor:not-allowed}.mt-toggle:focus-visible,.mt-label:focus-visible,.mt-dot:focus-visible{outline:2px solid #3b82f6;outline-offset:3px}
-    .mt-dots{display:inline-flex;align-items:center;gap:4px;flex-wrap:nowrap}
+    .mt-dots{display:inline-flex;align-items:center;gap:4px;flex-wrap:nowrap}.mt-dots:empty{display:none}
     .mt-dot{width:8px;height:8px;border-radius:50%;background:#94a3b8;flex-shrink:0}
     .mt-green{background:#10b981}.mt-yellow{background:#eab308}.mt-red{background:#ef4444}
     .mt-dots[data-disabled=true]{opacity:.5}.mt-dots[data-stale=true]{opacity:.5}
@@ -29,9 +30,11 @@
     .mt-dialog h3{font-size:17px;font-weight:600;margin:0}.mt-dialog p{margin:8px 0}.mt-dialog p:empty{display:none}
     .mt-badge{font-size:11px;color:#64748b;background:#f1f5f9;border-radius:12px;padding:2px 9px;white-space:nowrap}.mt-badge[data-enabled=true]{background:#ecfdf5;color:#047857}
     .mt-body{padding:0 22px;overflow:auto;min-height:0}.mt-dialog label{font-size:13px}
+    .mt-tabs{display:flex;gap:6px;padding:0 22px 12px;flex-shrink:0}.mt-tab{flex:1;padding:8px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;cursor:pointer}.mt-tab[aria-selected=true]{background:#ecfdf5;color:#047857}.dark .mt-tab[aria-selected=true]{background:#064e3b;color:#a7f3d0}.mt-tab:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}.mt-tab:disabled{opacity:.5;cursor:wait}
+    .mt-settings-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}.mt-panel-status{margin:0 0 10px!important}.mt-save-error:not(.mt-error){color:#059669}
     .mt-dialog select{display:block;width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit}
     .mt-dialog select option{color:#334155;background:#fff}.mt-dialog .mt-note{font-size:12px;color:#64748b}.dark .mt-dialog .mt-note{color:#94a3b8}
-    .mt-actions{display:flex;justify-content:flex-end;gap:10px;padding:14px 22px;flex-shrink:0;border-top:1px solid #e2e8f066}.mt-actions button{padding:7px 16px;border-radius:7px;border:1px solid #cbd5e1;background:transparent;color:inherit;cursor:pointer;font:inherit}
+    .mt-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:14px 22px;flex-shrink:0;border-top:1px solid #e2e8f066}.mt-actions button{padding:7px 16px;border-radius:7px;border:1px solid #cbd5e1;background:transparent;color:inherit;cursor:pointer;font:inherit}
     .mt-actions button.mt-primary{background:#059669;border-color:#059669;color:white}.mt-actions button:disabled{opacity:.5;cursor:wait}
     .mt-section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;font-size:13px;font-weight:600}
     .mt-link{appearance:none;border:0;padding:2px 0;background:transparent;color:#64748b;font:12px system-ui;cursor:pointer}.mt-link:hover{color:#059669}
@@ -46,8 +49,7 @@
     .mt-policy input[type=checkbox]{margin-right:8px;accent-color:#059669;width:16px;height:16px;vertical-align:middle}
     .mt-policy input[type=number],.mt-interval input{box-sizing:border-box;width:68px;margin:0 8px;padding:5px 7px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:inherit}
     .mt-policy-fields{margin-top:12px}.mt-policy-fields .mt-note{margin:6px 0 0}.mt-interval{display:block;margin-top:16px}
-    .mt-prompt-button{appearance:none;border:0;background:transparent;color:#7c3aed;font:11px system-ui;cursor:pointer;padding:0 2px}.mt-prompt-button:hover{color:#6d28d9}.mt-prompt-button:disabled{opacity:.45;cursor:not-allowed}
-    .mt-prompt-label{display:block;margin-top:14px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}.mt-prompt-badge[data-enabled=true]{background:#f5f3ff;color:#6d28d9}
+    .mt-prompt-label{display:block;margin-top:14px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}
     .mt-case{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:9px}.mt-case>summary{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px}.mt-case>summary span{flex:1;overflow-wrap:anywhere}.mt-case input[type=checkbox],.mt-qa-enabled input{accent-color:#059669}
     .mt-case input[type=text]{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;margin-top:5px}.mt-case-tools{display:flex;gap:14px;flex-wrap:wrap}.mt-qa-enabled{display:block;margin-top:14px}
     .mt-preview-dialog{width:min(960px,calc(100vw - 24px))}.mt-preview-dialog iframe{display:block;width:100%;height:55vh;min-height:240px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.mt-preview-dialog .mt-actions{flex-wrap:wrap}.mt-preview-dialog .mt-header h3{overflow-wrap:anywhere}.mt-preview-dialog textarea{min-height:180px;font:12px/1.5 monospace}.mt-preview-link{display:block;margin:0 0 12px 17px;color:#7c3aed}.mt-actions .mt-review-green{border-color:#059669;color:#047857}.mt-actions .mt-review-yellow{border-color:#ca8a04;color:#a16207}.mt-actions .mt-review-red{border-color:#dc2626;color:#dc2626}
@@ -129,77 +131,69 @@
       row.addEventListener('click', event => event.stopPropagation());
       target.cell.prepend(row);
     }
-    const history = state?.history || [];
-    const currentHistory = history.filter(r => r.expected === state?.model);
-    const stale = state?.enabled && currentHistory.length > 0 && Date.now() / 1000 - currentHistory.at(-1).checked_at > Math.max((state.interval_minutes || 10) * 120, 300);
-    const signature = JSON.stringify([target.id, state, pending.has(target.id), lastError, !!stale]);
+    const promptState = state?.prompt_test;
+    const modes = [state, promptState].filter(Boolean);
+    const enabled = modes.some(mode => mode.enabled);
+    const stale = modes.some(mode => {
+      const latest = (mode.history || []).filter(result => result.expected === mode.model).at(-1);
+      return mode.enabled && latest && Date.now() / 1000 - latest.checked_at > Math.max((mode.interval_minutes || 10) * 120, 300);
+    });
+    const actionError = actionErrors.get(target.id);
+    const signature = JSON.stringify([target.id, state, pending.has(target.id), lastError, actionError, stale]);
     if (row.dataset.signature === signature) return;
     row.dataset.signature = signature;
     row.dataset.accountId = String(target.id);
     const toggle = el('button', 'mt-toggle');
     toggle.type = 'button';
     toggle.setAttribute('role', 'switch');
-    toggle.setAttribute('aria-label', `账号 ${target.id} 模型归因开关`);
-    toggle.setAttribute('aria-checked', String(!!state?.enabled));
-    toggle.disabled = !state || pending.has(target.id) || (!state.available && !state.enabled) || !!lastError;
-    toggle.title = state?.reason || `仅此账号：每 ${state?.interval_minutes || 10} 分钟检测一次`;
+    toggle.setAttribute('aria-label', `账号 ${target.id} 智商检测总开关`);
+    toggle.setAttribute('aria-checked', String(enabled));
+    toggle.disabled = !state || pending.has(target.id) || !!lastError;
+    toggle.title = enabled ? '点击关闭此账号的模型归因和自定义题目定时检测' : '打开设置，选择并保存要启用的检测';
     toggle.addEventListener('click', () => {
-      if (state.enabled) save(target.id, false, state.model);
-      else if (state.model && state.models.includes(state.model)) save(target.id, true, state.model);
-      else openSettings(target.id, true);
+      if (enabled) disableDetection(target.id);
+      else openSettings(target.id);
     });
-    const label = el('button', 'mt-label', '模型归因');
+    const label = el('button', 'mt-label', '智商检测');
     label.type = 'button';
-    label.title = (state?.model ? '当前模型：' + state.model + '\n' : '') + '查看模型设置和最近 10 次结果';
-    label.disabled = !state;
-    label.addEventListener('click', () => openSettings(target.id, false));
-    const promptButton = el('button', 'mt-prompt-button', '提示词测试');
-    promptButton.type = 'button';
-    promptButton.disabled = !state?.prompt_test || pending.has(target.id) || !!lastError;
-    promptButton.title = state?.prompt_test?.reason || '配置提示词模板、测试间隔和连续红点停调度';
-    promptButton.addEventListener('click', () => openPromptSettings(target.id));
-    const promptHistory = state?.prompt_test?.history || [];
-    const promptDots = el('span', 'mt-dots mt-prompt-dots');
-    promptDots.dataset.disabled = String(!state?.prompt_test?.enabled);
-    for (const result of promptHistory.slice(-10)) {
-      const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
-      const dot = el('button', 'mt-dot mt-' + color); dot.type = 'button';
-      dot.title = (result.test_mode === 'qa' ? '问答测试\n' : '提示词归因\n') + description(result); dot.setAttribute('aria-label', dot.title);
-      dot.addEventListener('click', () => openPromptSettings(target.id)); promptDots.append(dot);
-    }
-    const promptState = state?.prompt_test;
-    const promptNote = el('span', 'mt-state mt-prompt-state', promptState?.pause_status === 'paused' ? '已停调度'
-      : ['pending', 'failed'].includes(promptState?.pause_status) ? '停调度待确认'
-      : promptState?.running ? '测试中' : promptState?.enabled ? (promptState.auto_pause_enabled ? `连续红 ${promptState.failure_streak || 0}/${promptState.auto_pause_threshold}` : '已开启') : '已关闭');
-    promptNote.title = promptState?.message || '';
+    label.title = '设置模型归因、自定义题目及人工预览；圆点为两类检测合计最近 10 次结果';
+    label.disabled = !state || pending.has(target.id);
+    label.addEventListener('click', () => openSettings(target.id));
+    const history = [
+      ...(state?.history || []).map(result => ({ result, mode: state, tab: 'attribution', source: '模型归因' })),
+      ...(promptState?.history || []).map(result => ({ result, mode: promptState, tab: 'custom',
+        source: result.test_mode === 'qa' ? '自定义题目' : '自定义数字归因模板' }))
+    ].sort((a, b) => a.result.checked_at - b.result.checked_at).slice(-10);
     const dots = el('span', 'mt-dots');
-    dots.dataset.disabled = String(!state?.enabled);
-    dots.dataset.stale = String(!!stale);
-    for (const result of history.slice(-10)) {
+    dots.setAttribute('aria-label', '两类检测合计最近 10 次结果');
+    for (const { result, mode, tab, source } of history) {
       const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
       const dot = el('button', 'mt-dot mt-' + color);
       dot.type = 'button';
-      dot.title = description(result);
-      if (state?.model && result.expected !== state.model) {
+      dot.title = source + '\n' + description(result);
+      if (mode.model && result.expected !== mode.model) {
         dot.style.opacity = '.35';
         dot.title = '历史模型，非当前选择\n' + dot.title;
-      }
+      } else if (!mode.enabled) dot.style.opacity = '.5';
       dot.setAttribute('aria-label', dot.title);
-      dot.addEventListener('click', () => openSettings(target.id, false));
+      dot.disabled = pending.has(target.id);
+      dot.addEventListener('click', () => openSettings(target.id, tab));
       dots.append(dot);
     }
-    let text = !state ? (lastError ? '暂不可用' : '加载中') : !state.enabled ? '已关闭'
-      : state.running ? '检测中' : stale ? '结果已过期' : !currentHistory.length ? '等待检测' : '';
-    if (state && !state.available && !state.enabled) text = '暂不可测';
-    if (state?.auto_pause_enabled && state.enabled && !state.running) text = `连续不符 ${state.mismatch_streak || 0}/${state.auto_pause_threshold}`;
-    if (state?.pause_status === 'pending') text = '正在停止调度';
-    if (state?.pause_status === 'failed') text = '停调度未确认';
-    if (state?.pause_status === 'paused' && !state.schedulable) text = '已自动停调度';
-    if (lastError && state) text = '暂不可用';
+    let text = !state ? '加载中' : !enabled ? '已关闭'
+      : modes.some(mode => mode.running) ? '检测中' : stale ? '结果已过期' : '已开启';
+    if (modes.some(mode => mode.pause_status === 'pending')) text = '正在停调度';
+    if (modes.some(mode => mode.pause_status === 'failed')) text = '停调度未确认';
+    if (modes.some(mode => mode.pause_status === 'paused') && !state?.schedulable) text = '已停调度';
+    if (actionError) text = '操作未完成';
+    if (lastError) text = '暂不可用';
     const note = el('span', 'mt-state', text);
-    note.title = lastError || state?.message || state?.reason || '';
-    if (['paused', 'failed'].includes(state?.pause_status)) note.classList.add('mt-error');
-    row.replaceChildren(toggle, label, dots, note, promptButton, promptDots, promptNote);
+    note.title = lastError || actionError || [
+      state && '模型归因：' + (state.enabled ? '已开启' : '已关闭') + (state.message ? '\n' + state.message : ''),
+      promptState && '自定义题目 / 模板：' + (promptState.enabled ? '已开启' : '已关闭') + (promptState.message ? '\n' + promptState.message : '')
+    ].filter(Boolean).join('\n');
+    if (actionError || modes.some(mode => ['paused', 'failed'].includes(mode.pause_status))) note.classList.add('mt-error');
+    row.replaceChildren(toggle, label, dots, note);
   }
 
   function reconcile() {
@@ -210,7 +204,8 @@
     }
     const currentToken = token();
     if (lastToken !== currentToken) {
-      states.clear(); lastPoll = 0; lastError = ''; lastToken = currentToken;
+      states.clear(); actionErrors.clear(); lastPoll = 0; lastError = ''; lastToken = currentToken;
+      document.querySelectorAll('.mt-dialog').forEach(node => node.remove());
     }
     const rows = targets();
     rows.forEach(render);
@@ -223,8 +218,12 @@
     loading = true; lastPoll = Date.now();
     try {
       for (let start = 0; start < ids.length; start += 100) {
+        const revision = mutationRevision;
         const data = await api('/accounts?ids=' + ids.slice(start, start + 100).join(','));
-        for (const [id, state] of Object.entries(data.accounts)) states.set(Number(id), state);
+        if (revision !== mutationRevision) { lastPoll = 0; continue; }
+        for (const [id, state] of Object.entries(data.accounts)) {
+          if (!pending.has(Number(id))) states.set(Number(id), state);
+        }
       }
       lastError = '';
     } catch (error) {
@@ -235,37 +234,142 @@
     }
   }
 
-  async function save(id, enabled, model, dialog, policy = {}) {
+  async function disableDetection(id) {
     if (pending.has(id)) return;
-    pending.add(id); targets().filter(t => t.id === id).forEach(render);
-    const errorBox = dialog?.querySelector('.mt-save-error');
-    if (errorBox) errorBox.textContent = '';
-    if (dialog) dialog.querySelectorAll('button').forEach(b => b.disabled = true);
+    const state = states.get(id);
+    if (!state) return;
+    const jobs = [];
+    if (state.enabled) jobs.push(['模型归因', '/accounts/' + id]);
+    if (state.prompt_test?.enabled) jobs.push(['自定义题目 / 模板', '/accounts/' + id + '/prompt-test']);
+    pending.add(id); mutationRevision++; actionErrors.delete(id); targets().filter(t => t.id === id).forEach(render);
+    const errors = [];
     try {
-      const data = await api('/accounts/' + id, { method: 'PUT', body: JSON.stringify({ enabled, model, ...policy }) });
-      states.set(id, data.account); lastError = '';
-      if (dialog) dialog.close();
-    } catch (error) {
-      if (errorBox) errorBox.textContent = error.message;
-      else { lastError = error.message; lastPoll = 0; }
+      for (const [name, path] of jobs) {
+        try {
+          const data = await api(path, { method: 'PUT', body: JSON.stringify({ enabled: false }) });
+          states.set(id, data.account);
+        } catch (error) { errors.push(name + '关闭未确认：' + error.message); }
+      }
+      // A timeout can leave a successful write without a response. Read the actual state.
+      if (errors.length) {
+        try {
+          const data = await api('/accounts?ids=' + id);
+          if (data.accounts[id]) states.set(id, data.accounts[id]);
+        } catch (_) { /* Keep the last confirmed state and the explicit error. */ }
+        actionErrors.set(id, errors.join('\n') + '\n请打开智商检测查看各项开关。');
+      }
     } finally {
-      pending.delete(id);
-      if (dialog?.open) dialog.querySelectorAll('button').forEach(b => b.disabled = false);
+      pending.delete(id); mutationRevision++; lastPoll = 0;
       targets().filter(t => t.id === id).forEach(render);
     }
   }
 
-  function openSettings(id, enable) {
+  async function saveSettings(id, path, payload, dialog, errorBox, onSaved) {
+    if (pending.has(id)) return;
+    actionErrors.delete(id);
+    pending.add(id); mutationRevision++; targets().filter(t => t.id === id).forEach(render);
+    errorBox.textContent = ''; errorBox.classList.add('mt-error');
+    const controls = [...dialog.querySelectorAll('button,input,select,textarea')].map(node => [node, node.disabled]);
+    controls.forEach(([node]) => { node.disabled = true; });
+    dialog.setAttribute('aria-busy', 'true');
+    try {
+      const data = await api(path, { method: 'PUT', body: JSON.stringify(payload) });
+      states.set(id, data.account); lastError = '';
+      onSaved(data.account);
+      errorBox.classList.remove('mt-error'); errorBox.textContent = '当前页设置已保存';
+    } catch (error) {
+      errorBox.textContent = error.message;
+    } finally {
+      pending.delete(id); mutationRevision++; lastPoll = 0;
+      controls.forEach(([node, disabled]) => { node.disabled = disabled; });
+      dialog.removeAttribute('aria-busy');
+      dialog.dispatchEvent(new Event('mt-save-end'));
+      targets().filter(t => t.id === id).forEach(render);
+    }
+  }
+
+  function openSettings(id, activeTab) {
     const state = states.get(id);
     if (!state) return;
     document.querySelectorAll('.mt-dialog').forEach(node => node.remove());
     const dialog = el('dialog', 'mt-dialog');
-    const title = el('h3', '', `模型归因 · 账号 #${id}`);
+    const title = el('h3', '', `智商检测 · 账号 #${id}`); title.id = 'mt-settings-title';
+    dialog.setAttribute('aria-labelledby', title.id);
     const header = el('div', 'mt-header');
-    const badge = el('span', 'mt-badge', state.running ? '检测中' : state.enabled ? '已开启' : '已关闭');
-    badge.dataset.enabled = String(!!state.enabled);
+    const badge = el('span', 'mt-badge');
+    const refreshStatus = () => {
+      const current = states.get(id);
+      const enabled = !!(current?.enabled || current?.prompt_test?.enabled);
+      badge.textContent = current?.running || current?.prompt_test?.running ? '检测中' : enabled ? '已开启' : '已关闭';
+      badge.dataset.enabled = String(enabled);
+      for (const status of dialog.querySelectorAll('[data-mode-status]')) {
+        const mode = status.dataset.modeStatus === 'custom' ? current?.prompt_test : current;
+        status.textContent = '此项：' + (mode?.running ? '检测中' : mode?.enabled ? '已开启' : '已关闭')
+          + ' · 当前页单独保存，切换分页保留未保存内容';
+      }
+    };
     header.append(title, badge);
+    const tabs = el('div', 'mt-tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', '智商检测设置');
+    dialog.append(header, tabs);
+    let catalog;
+    const loadModels = () => catalog ||= (async () => {
+      const currentToken = token();
+      const response = await fetch('/api/v1/admin/accounts/' + id + '/models', {
+        headers: { Authorization: 'Bearer ' + currentToken }, cache: 'no-store', signal: AbortSignal.timeout(15000)
+      });
+      if (!response.ok) throw new Error('无法读取账号可用模型，请关闭后重试');
+      const data = (await response.json()).data;
+      const entries = Array.isArray(data) ? data : data?.models || data?.data;
+      if (!Array.isArray(entries)) throw new Error('账号模型列表格式已变化');
+      if (currentToken !== token()) throw new Error('登录状态已变化');
+      return [...new Set(entries.map(item => typeof item === 'string' ? item : item.id).filter(name => typeof name === 'string' && name))];
+    })();
+    const pages = [];
+    const selectTab = (key, focus = false) => {
+      for (const page of pages) {
+        const selected = page.key === key;
+        page.panel.hidden = !selected;
+        page.button.setAttribute('aria-selected', String(selected));
+        page.button.tabIndex = selected ? 0 : -1;
+        if (selected && focus) page.button.focus();
+      }
+    };
+    for (const [key, name, build] of [
+      ['attribution', '模型归因', buildAttributionPanel], ['custom', '自定义题目', buildPromptPanel]
+    ]) {
+      if (key === 'custom' && !state.prompt_test) continue;
+      const button = el('button', 'mt-tab', name); button.type = 'button'; button.id = 'mt-tab-' + key;
+      button.setAttribute('role', 'tab'); button.setAttribute('aria-controls', 'mt-panel-' + key);
+      const panel = el('section', 'mt-settings-panel'); panel.id = 'mt-panel-' + key;
+      panel.setAttribute('role', 'tabpanel'); panel.setAttribute('aria-labelledby', button.id);
+      button.addEventListener('click', () => selectTab(key));
+      button.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const index = pages.findIndex(page => page.key === key);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? pages.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + pages.length) % pages.length;
+        selectTab(pages[next].key, true);
+      });
+      pages.push({ key, button, panel }); tabs.append(button); dialog.append(panel);
+      build(id, dialog, panel, loadModels);
+    }
+    dialog.addEventListener('mt-save-end', refreshStatus);
+    dialog.addEventListener('close', () => dialog.remove());
+    activeTab ||= state.prompt_test?.enabled && !state.enabled ? 'custom' : 'attribution';
+    selectTab(pages.some(page => page.key === activeTab) ? activeTab : 'attribution'); refreshStatus();
+    document.body.append(dialog); dialog.showModal();
+  }
+
+  function buildAttributionPanel(id, dialog, panel, loadModels) {
+    let state = states.get(id);
     const body = el('div', 'mt-body');
+    const status = el('p', 'mt-note mt-panel-status'); status.dataset.modeStatus = 'attribution';
+    const enabledLabel = el('label', 'mt-qa-enabled');
+    const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!state.enabled;
+    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用定时模型归因');
+    enabledLabel.append(enabled, document.createTextNode('启用定时模型归因'));
+    let catalogReady = false;
     const label = el('label', '', '检测模型');
     const select = el('select');
     const catalogNote = el('p', 'mt-note', '正在读取此账号的可用模型…');
@@ -358,74 +462,51 @@
     const error = el('p', 'mt-error mt-save-error');
     const actions = el('div', 'mt-actions');
     const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
-    actions.append(close);
-    let submit;
-    {
-      submit = el('button', 'mt-primary', enable ? '开启检测' : '保存设置');
-      submit.type = 'button';
-      submit.disabled = !!enable;
-      submit.addEventListener('click', () => {
-        const count = Number(threshold.value);
-        if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续轮数请填写 1–100 的整数'; return; }
-        const minutes = Number(interval.value);
-        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '检测间隔请填写 1–1440 分钟的整数'; return; }
-        const challenges = Number(challengeCount.value);
-        if (![1, 2, 3].includes(challenges)) { error.textContent = '挑战次数请选择 1、2 或 3 次'; return; }
-        save(id, enable || state.enabled, state.available ? (select.value || state.model) : state.model, dialog,
-          { auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes, challenge_count: challenges });
-      });
-      actions.append(submit);
-    }
-    body.append(label, catalogNote, mapping, intervalLabel, challengeLabel, estimate, reason, policy, historyHead, list, empty, help, error);
-    dialog.append(header, body, actions);
-    dialog.addEventListener('close', () => dialog.remove());
-    dialog.addEventListener('click', e => { if (e.target === dialog) { const b = dialog.getBoundingClientRect(); if (e.clientX < b.left || e.clientX > b.right || e.clientY < b.top || e.clientY > b.bottom) dialog.close(); } });
-    document.body.append(dialog); dialog.showModal();
+    const submit = el('button', 'mt-primary', '保存当前页'); submit.type = 'button';
+    const disable = el('button', '', '关闭此项'); disable.type = 'button';
+    const saved = account => { state = account; enabled.checked = !!state.enabled; };
+    const refreshAvailability = () => {
+      select.disabled = !state.available || !catalogReady || !select.options.length;
+      submit.disabled = enabled.checked && select.disabled;
+      disable.disabled = !state.enabled;
+    };
+    enabled.addEventListener('change', refreshAvailability);
+    dialog.addEventListener('mt-save-end', refreshAvailability);
+    body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
+    disable.addEventListener('click', () => saveSettings(id, '/accounts/' + id, { enabled: false }, dialog, error, saved));
+    submit.addEventListener('click', () => {
+      error.classList.add('mt-error');
+      const count = Number(threshold.value);
+      if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续轮数请填写 1–100 的整数'; return; }
+      const minutes = Number(interval.value);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '检测间隔请填写 1–1440 分钟的整数'; return; }
+      const challenges = Number(challengeCount.value);
+      if (![1, 2, 3].includes(challenges)) { error.textContent = '挑战次数请选择 1、2 或 3 次'; return; }
+      saveSettings(id, '/accounts/' + id, {
+        enabled: enabled.checked, model: state.available ? (select.value || state.model) : state.model,
+        auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes, challenge_count: challenges
+      }, dialog, error, saved);
+    });
+    actions.append(close, disable, submit);
+    body.append(status, enabledLabel, label, catalogNote, mapping, intervalLabel, challengeLabel, estimate, reason, policy, historyHead, list, empty, help, error);
+    panel.append(body, actions); refreshAvailability();
     if (state.available) {
-      select.disabled = true;
-      const currentToken = token();
-      fetch('/api/v1/admin/accounts/' + id + '/models', {
-        headers: { Authorization: 'Bearer ' + currentToken }, cache: 'no-store', signal: AbortSignal.timeout(15000)
-      }).then(async response => {
-        if (!response.ok) throw new Error('无法读取账号可用模型，请稍后重试');
-        const data = (await response.json()).data;
-        const entries = Array.isArray(data) ? data : data?.models || data?.data;
-        if (!Array.isArray(entries)) throw new Error('账号模型列表格式已变化，请稍后重试');
-        if (currentToken !== token() || !dialog.open) return;
-        const live = new Set(entries.map(item => typeof item === 'string' ? item : item.id));
+      loadModels().then(models => {
+        if (!dialog.open) return;
+        const live = new Set(models);
         const choices = state.models.filter(model => live.has(model));
         select.replaceChildren();
         for (const model of choices) { const option = el('option', '', model); option.value = model; select.append(option); }
         select.value = preferredModel(choices, state.model);
         refreshMapping();
-        select.disabled = !choices.length;
-        if (submit) submit.disabled = !!enable && !choices.length;
+        catalogReady = true;
+        if (!pending.has(id)) refreshAvailability();
         catalogNote.textContent = choices.length ? '' : '此账号当前可用模型尚未被指纹库收录，暂不能开启。';
       }).catch(error => {
         if (!dialog.open) return;
         catalogNote.textContent = error.name === 'TimeoutError' ? '读取模型列表超时，请关闭后重试。' : error.message;
       });
     } else catalogNote.textContent = '';
-  }
-
-  async function savePrompt(id, payload, dialog, errorBox) {
-    if (pending.has(id)) return;
-    pending.add(id);
-    if (errorBox) errorBox.textContent = '';
-    const buttons = dialog ? [...dialog.querySelectorAll('button')].map(button => [button, button.disabled]) : [];
-    buttons.forEach(([button]) => { button.disabled = true; });
-    try {
-      const data = await api('/accounts/' + id + '/prompt-test', { method: 'PUT', body: JSON.stringify(payload) });
-      states.set(id, data.account); lastError = '';
-      if (dialog) dialog.close();
-    } catch (error) {
-      if (errorBox) errorBox.textContent = error.message;
-      else lastError = error.message;
-    } finally {
-      pending.delete(id);
-      if (dialog?.open) buttons.forEach(([button, disabled]) => { button.disabled = disabled; });
-      targets().filter(target => target.id === id).forEach(render);
-    }
   }
 
   async function openArtifactPreview(id, result, item, onReview) {
@@ -544,29 +625,21 @@
     return { root, values: () => rows.map(row => row.get()) };
   }
 
-  function openPromptSettings(id) {
+  function buildPromptPanel(id, dialog, panel, loadModels) {
     const state = states.get(id);
-    const promptState = state?.prompt_test;
-    if (!state || !promptState) return;
-    document.querySelectorAll('.mt-dialog').forEach(node => node.remove());
-    const dialog = el('dialog', 'mt-dialog');
-    const header = el('div', 'mt-header');
-    const title = el('h3', '', `自定义提示词测试 · 账号 #${id}`);
-    const badge = el('span', 'mt-badge mt-prompt-badge', promptState.running ? '测试中' : promptState.enabled ? '已开启' : '已关闭');
-    badge.dataset.enabled = String(!!promptState.enabled);
-    header.append(title, badge);
+    let promptState = state.prompt_test;
     const body = el('div', 'mt-body');
+    const status = el('p', 'mt-note mt-panel-status'); status.dataset.modeStatus = 'custom';
     const modeLabel = el('label', 'mt-prompt-label', '测试方式');
     const mode = el('select'); mode.setAttribute('aria-label', '测试方式');
     for (const [value, text] of [['qa', '自定义题目（答案匹配 / 人工预览）'], ['attribution', '数字归因模板（原算法）']]) {
       const option = el('option', '', text); option.value = value; mode.append(option);
     }
     mode.value = promptState.test_mode || 'attribution'; modeLabel.append(mode);
-    const qaEnabledLabel = el('label', 'mt-qa-enabled');
-    const qaEnabled = el('input'); qaEnabled.type = 'checkbox';
-    qaEnabled.checked = mode.value === 'qa' && !!promptState.enabled;
-    qaEnabled.setAttribute('role', 'switch'); qaEnabled.setAttribute('aria-label', '启用定时问答测试');
-    qaEnabledLabel.append(qaEnabled, document.createTextNode('启用定时问答测试'));
+    const enabledLabel = el('label', 'mt-qa-enabled');
+    const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!promptState.enabled;
+    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用此页定时测试');
+    enabledLabel.append(enabled, document.createTextNode('启用此页定时测试'));
     const modelLabel = el('label', 'mt-prompt-label', '测试模型');
     const model = el('select');
     let desiredModel = promptState.model || state.model;
@@ -657,13 +730,15 @@
     const error = el('p', 'mt-error mt-save-error');
     const actions = el('div', 'mt-actions');
     const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
-    const saveButton = el('button', 'mt-primary', promptState.enabled ? '保存设置' : '开启测试'); saveButton.type = 'button';
+    const saveButton = el('button', 'mt-primary', '保存当前页'); saveButton.type = 'button';
+    const disable = el('button', '', '关闭此项'); disable.type = 'button';
+    const saved = account => { promptState = account.prompt_test; enabled.checked = !!promptState.enabled; };
     const availability = el('p', 'mt-error');
     const catalogNote = el('p', 'mt-note', '正在读取账号可用模型…');
     function refreshMode() {
       const qa = mode.value === 'qa';
       promptLabel.hidden = templateNote.hidden = challengeLabel.hidden = qa;
-      editor.root.hidden = qaEnabledLabel.hidden = !qa;
+      editor.root.hidden = !qa;
       choices = liveChoices ? liveChoices.filter(name => qa || (state.models || []).includes(name)) : (state.models || []);
       model.replaceChildren();
       for (const name of choices) { const option = el('option', '', name); option.value = name; model.append(option); }
@@ -671,8 +746,8 @@
       model.disabled = !catalogReady || !choices.length;
       const available = (qa ? promptState.qa_available : promptState.attribution_available) ?? promptState.available;
       availability.textContent = available ? '' : ((qa ? promptState.qa_reason : promptState.attribution_reason) || promptState.reason);
-      saveButton.textContent = qa ? '保存设置' : promptState.enabled ? '保存设置' : '开启测试';
-      saveButton.disabled = qa && !qaEnabled.checked ? false : (!available || !catalogReady || !choices.length);
+      saveButton.disabled = enabled.checked && (!available || !catalogReady || !choices.length);
+      disable.disabled = !promptState.enabled;
       refreshEstimate();
     }
     mode.addEventListener('change', () => {
@@ -680,47 +755,42 @@
       threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked;
       error.textContent = ''; refreshMode();
     });
-    qaEnabled.addEventListener('change', refreshMode);
+    enabled.addEventListener('change', refreshMode);
+    dialog.addEventListener('mt-save-end', refreshMode);
+    body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
     saveButton.addEventListener('click', () => {
+      error.classList.add('mt-error');
       const minutes = Number(interval.value), count = Number(threshold.value);
       const qa = mode.value === 'qa';
-      if ((!qa || qaEnabled.checked) && !model.value.trim()) { error.textContent = '请填写测试模型'; return; }
-      if (!qa && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
-      if (!qa && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
+      if (enabled.checked && !model.value.trim()) { error.textContent = '请填写测试模型'; return; }
+      if (!qa && enabled.checked && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
+      if (!qa && enabled.checked && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
+      if (!qa && !enabled.checked && prompt.value !== promptState.prompt) { error.textContent = '修改数字归因模板需开启此页定时测试后保存；只关闭检测可点击“关闭此项”。'; return; }
       if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '测试间隔请填写 1–1440 分钟的整数'; return; }
       if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续红点轮数请填写 1–100 的整数'; return; }
       const cases = editor.values();
-      if (qa && qaEnabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
+      if (qa && enabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
       if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || (item.kind !== 'manual' && !item.expected_answer.trim())))) {
         error.textContent = '请填写已勾选题目的名称和提示词；答案匹配题还需填写预期答案'; return;
       }
-      const payload = { enabled: qa ? qaEnabled.checked : true, model: model.value || promptState.model || 'gpt-6-astra',
+      const payload = { enabled: enabled.checked, model: model.value || promptState.model || 'gpt-6-astra',
         prompt: prompt.value, challenge_count: Number(challenges.value),
         auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes };
-      if (qa || promptState.test_mode === 'qa') payload.test_mode = mode.value;
+      payload.test_mode = mode.value;
       if (qa) payload.cases = cases;
-      savePrompt(id, payload, dialog, error);
+      saveSettings(id, '/accounts/' + id + '/prompt-test', payload, dialog, error, saved);
     });
-    const disable = el('button', '', '关闭测试'); disable.type = 'button'; disable.disabled = !promptState.enabled;
-    disable.addEventListener('click', () => savePrompt(id, { enabled: false }, dialog, error));
+    disable.addEventListener('click', () => saveSettings(id, '/accounts/' + id + '/prompt-test', { enabled: false }, dialog, error, saved));
     actions.append(close, disable, saveButton);
-    body.append(modeLabel, modelLabel, catalogNote, qaEnabledLabel, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
+    body.append(status, enabledLabel, modeLabel, modelLabel, catalogNote, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
       availability, policy, historyHead, history, empty, help, error);
-    dialog.append(header, body, actions);
-    dialog.addEventListener('close', () => dialog.remove());
-    document.body.append(dialog); dialog.showModal();
+    panel.append(body, actions);
     refreshMode();
-    const currentToken = token();
-    fetch('/api/v1/admin/accounts/' + id + '/models', {
-      headers: { Authorization: 'Bearer ' + currentToken }, cache: 'no-store', signal: AbortSignal.timeout(15000)
-    }).then(async response => {
-      if (!response.ok) throw new Error('无法读取账号可用模型，请稍后重试');
-      const data = (await response.json()).data;
-      const entries = Array.isArray(data) ? data : data?.models || data?.data;
-      if (!Array.isArray(entries)) throw new Error('账号模型列表格式已变化');
-      if (!dialog.open || currentToken !== token()) return;
-      liveChoices = [...new Set(entries.map(item => typeof item === 'string' ? item : item.id).filter(name => typeof name === 'string' && name))];
-      catalogReady = true; catalogNote.textContent = liveChoices.length ? '' : '账号当前没有可用模型'; refreshMode();
+    loadModels().then(models => {
+      if (!dialog.open) return;
+      liveChoices = models; catalogReady = true;
+      catalogNote.textContent = liveChoices.length ? '' : '账号当前没有可用模型';
+      if (!pending.has(id)) refreshMode();
     }).catch(error => { if (dialog.open) catalogNote.textContent = error.name === 'TimeoutError' ? '读取模型列表超时，请关闭后重试' : error.message; });
   }
 
