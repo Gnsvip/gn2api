@@ -1,5 +1,13 @@
 # sub2api 独立模型归因扩展
 
+## 20261031-review-2：补齐 Tibo 预置题
+
+补上之前遗漏的「Tibo 题」，保留用户截图中的英文提示词：`Tell me whether you know who Tibo is in OpenAI based on your knowledge without searching online. Only return True or False.`
+
+Tibo 题默认关闭、按预期答案匹配。预期答案初始留空，由管理员填写 `True` 或 `False` 后再开启，不擅自定义通过答案。未保存题目的账号会看到三道默认关闭的预置题；已有题目设置的账号可点击「＋ 添加 Tibo 题」添加，不改变已有配置或开关。糖果题和鹈鹕题继续保留。
+
+本版按用户要求未运行测试、浏览器预览、真实模型调用或 skills。仅补齐预置题并发布，生产部署等待用户确认。
+
 ## 20261031-review-1：作品人工预览与评分
 
 每道自定义题现在可选择「预期答案匹配」或「人工预览 HTML / SVG」。新增「鹈鹕骑自行车动画」预置题，默认关闭；提示词保留用户原文，包括“不需要任何测试，不需要调用任何 skills”。已有题目没有判断方式字段时继续按预期答案匹配，不改变原设置。

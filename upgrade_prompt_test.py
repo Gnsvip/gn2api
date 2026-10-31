@@ -16,7 +16,7 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261031-review-1'
+VERSION = '20261031-review-2'
 FILES = ['service.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
          'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py']
 
