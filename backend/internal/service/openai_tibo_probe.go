@@ -16,7 +16,7 @@ var errOpenAITiboAccountUnavailable = errors.New("tibo account is unavailable")
 func openAITiboProbePayload() map[string]any {
 	return map[string]any{
 		"model": openAICodexTicketDefaultModel, "store": false,
-		"stream": true, "reasoning": map[string]any{"effort": "medium"},
+		"stream": true, "reasoning": map[string]any{"effort": "xhigh"},
 		"include": []string{"reasoning.encrypted_content"},
 		"input":   []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": openAITiboProbePrompt}}}},
 	}

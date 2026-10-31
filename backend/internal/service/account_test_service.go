@@ -2826,6 +2826,9 @@ func createOpenAITestPayload(modelID string, isOAuth bool, prompts ...string) ma
 		payload["store"] = false
 	}
 
+	// 智商检测/测试统一用极高推理，避免低推理档偷懒误判。
+	payload["reasoning"] = map[string]any{"effort": "xhigh"}
+
 	// All accounts require instructions for Responses API
 	payload["instructions"] = openai.DefaultInstructions
 
