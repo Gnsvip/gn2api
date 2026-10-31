@@ -907,6 +907,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth, prompt)
+	if isOAuth {
+		_ = prepareIntelligentTestProtection(c, credentialAccount, payload)
+	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -960,6 +963,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	credentialAccount.ApplyHeaderOverrides(req.Header)
+	if isOAuth {
+		_ = applyIntelligentTestProtection(c, credentialAccount, req.Header, payloadBytes)
+	}
 
 	// Get proxy URL
 	proxyURL := ""
