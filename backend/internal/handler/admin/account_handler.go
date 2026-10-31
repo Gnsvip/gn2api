@@ -1290,7 +1290,12 @@ type PreviewFromCRSRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
-// Test handles testing account connectivity with SSE streaming
+// TestCapabilities lets independent monitors detect support without paid probes.
+func (h *AccountHandler) TestCapabilities(c *gin.Context) {
+	response.Success(c, gin.H{"attribution_prompt_v1": true})
+}
+
+// Test handles testing account connectivity with SSE streaming.
 // POST /api/v1/admin/accounts/:id/test
 func (h *AccountHandler) Test(c *gin.Context) {
 	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -1314,7 +1319,7 @@ func (h *AccountHandler) Test(c *gin.Context) {
 		return
 	}
 
-	if h.rateLimitService != nil {
+	if !service.IsAttributionTestMode(req.Mode) && h.rateLimitService != nil {
 		if _, err := h.rateLimitService.RecoverAccountAfterSuccessfulTest(c.Request.Context(), accountID); err != nil {
 			_ = c.Error(err)
 		}

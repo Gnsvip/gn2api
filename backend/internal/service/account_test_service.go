@@ -313,7 +313,7 @@ func generateSessionString() (string, error) {
 }
 
 // createTestPayload creates a Claude Code style test request payload
-func createTestPayload(modelID string) (map[string]any, error) {
+func createTestPayload(modelID string, prompts ...string) (map[string]any, error) {
 	sessionID, err := generateSessionString()
 	if err != nil {
 		return nil, err
@@ -327,7 +327,7 @@ func createTestPayload(modelID string) (map[string]any, error) {
 				"content": []map[string]any{
 					{
 						"type": "text",
-						"text": "hi",
+						"text": accountTestPrompt(prompts),
 						"cache_control": map[string]string{
 							"type": "ephemeral",
 						},
@@ -369,6 +369,19 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.sendErrorAndEnd(c, "Account not found")
 	}
 	bindAccountTestPlatform(c, account)
+	if IsAttributionTestMode(mode) {
+		if !validAttributionPrompt(modelID, prompt) || account.IsSyntheticUITest() ||
+			account.IsCredentialShadow() || account.IsOpenAIAgentIdentity() ||
+			!((account.IsOpenAI() && (account.IsOAuth() || account.Type == AccountTypeAPIKey)) ||
+				(account.Platform == PlatformAnthropic && account.Type == AccountTypeAPIKey)) ||
+			isOpenAIImageModel(account.GetMappedModel(modelID)) {
+			return s.sendErrorAndEnd(c, "Unsupported attribution prompt, model or account type")
+		}
+		c.Set(attributionTestContextKey, true)
+		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 240*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(probeCtx)
+	}
 
 	// Synthetic UI load-test accounts exercise the real SSE parsing and modal
 	// interactions, but intentionally do not send their placeholder credentials
@@ -424,7 +437,7 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.testTypeSafeAccountConnection(c, account, prompt)
 	}
 
-	return s.testClaudeAccountConnection(c, account, modelID)
+	return s.testClaudeAccountConnection(c, account, modelID, prompt)
 }
 
 // testModelRoutedAccountConnection probes the native endpoint for the selected
@@ -501,7 +514,7 @@ func (s *AccountTestService) testCNProviderChatCompletionsConnection(c *gin.Cont
 }
 
 // testClaudeAccountConnection tests an Anthropic Claude account's connection
-func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account *Account, modelID string) error {
+func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account *Account, modelID string, prompts ...string) error {
 	ctx := c.Request.Context()
 
 	// Determine the model to use
@@ -560,9 +573,12 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	c.Writer.Flush()
 
 	// Create Claude Code style payload (same for all account types)
-	payload, err := createTestPayload(testModelID)
+	payload, err := createTestPayload(testModelID, prompts...)
 	if err != nil {
 		return s.sendErrorAndEnd(c, "Failed to create test payload")
+	}
+	if isAttributionProbe(c) {
+		payload["max_tokens"] = 2048
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
@@ -890,7 +906,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	if isOAuth {
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
-	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth)
+	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth, prompt)
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -2782,7 +2798,7 @@ func (s *AccountTestService) processGeminiStream(c *gin.Context, body io.Reader)
 }
 
 // createOpenAITestPayload creates a test payload for OpenAI Responses API
-func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
+func createOpenAITestPayload(modelID string, isOAuth bool, prompts ...string) map[string]any {
 	payload := map[string]any{
 		"model": modelID,
 		"input": []map[string]any{
@@ -2791,7 +2807,7 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 				"content": []map[string]any{
 					{
 						"type": "input_text",
-						"text": "hi",
+						"text": accountTestPrompt(prompts),
 					},
 				},
 			},
@@ -2836,6 +2852,9 @@ func (s *AccountTestService) processClaudeStream(c *gin.Context, body io.Reader)
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
+				if isAttributionProbe(c) {
+					return s.sendErrorAndEnd(c, "Attribution stream ended before message_stop")
+				}
 				s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 				return nil
 			}
@@ -2849,6 +2868,9 @@ func (s *AccountTestService) processClaudeStream(c *gin.Context, body io.Reader)
 
 		jsonStr := sseDataPrefix.ReplaceAllString(line, "")
 		if jsonStr == "[DONE]" {
+			if isAttributionProbe(c) {
+				return s.sendErrorAndEnd(c, "Attribution stream ended before message_stop")
+			}
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
 		}
@@ -2861,6 +2883,12 @@ func (s *AccountTestService) processClaudeStream(c *gin.Context, body io.Reader)
 		eventType, _ := data["type"].(string)
 
 		switch eventType {
+		case "message_delta":
+			if isAttributionProbe(c) {
+				if delta, ok := data["delta"].(map[string]any); ok && delta["stop_reason"] == "max_tokens" {
+					return s.sendErrorAndEnd(c, "Attribution response was truncated")
+				}
+			}
 		case "content_block_delta":
 			if delta, ok := data["delta"].(map[string]any); ok {
 				if text, ok := delta["text"].(string); ok {
@@ -2913,6 +2941,9 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 
 		jsonStr := sseDataPrefix.ReplaceAllString(line, "")
 		if jsonStr == "[DONE]" {
+			if isAttributionProbe(c) && !seenFinish {
+				return s.sendErrorAndEnd(c, "Attribution response missing stop finish reason")
+			}
 			s.sendEvent(c, TestEvent{Type: "status", Text: "已通过 /v1/chat/completions 验证"})
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
@@ -2952,6 +2983,9 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 				}
 			}
 			if finishReason, ok := choice["finish_reason"].(string); ok && finishReason != "" {
+				if isAttributionProbe(c) && finishReason != "stop" {
+					return s.sendErrorAndEnd(c, "Attribution response was truncated or did not finish normally")
+				}
 				seenFinish = true
 			}
 		}
@@ -3004,8 +3038,18 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 				s.sendEvent(c, TestEvent{Type: "content", Text: delta})
 			}
 		case "response.completed", "response.done":
+			if isAttributionProbe(c) {
+				responseData, ok := data["response"].(map[string]any)
+				if !ok || responseData["status"] != "completed" || responseData["error"] != nil {
+					return s.sendErrorAndEnd(c, "Attribution response did not complete normally")
+				}
+			}
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
+		case "response.incomplete":
+			if isAttributionProbe(c) {
+				return s.sendErrorAndEnd(c, "Attribution response was incomplete")
+			}
 		case "response.failed":
 			errorMsg := "OpenAI response failed"
 			if responseData, ok := data["response"].(map[string]any); ok {
