@@ -189,7 +189,7 @@ def test_probe_waits_for_buffered_headers_but_honors_remaining_budget(monkeypatc
         with pytest.raises(s.ProbeError) as exc:
             s.probe(*args)
         assert '超时' in str(exc.value) and 'private' not in str(exc.value)
-        assert ('240 秒预算' in str(exc.value)) == (remaining < 120)
+        assert isinstance(exc.value, s.RoundTimeout) == (remaining < 120)
     assert calls == [(8, expected_timeout)]  # A timeout must not retry the paid request.
 
 
@@ -303,7 +303,8 @@ def test_sample_replacement_preserves_successes_and_stops_when_three_ready(store
     assert [[o['text'] for o in outputs] for outputs in scored] == [
         [str(i) for i in range(1, len(calls) + 1) if i not in failed_calls]]
     assert len({id(c) for c in calls}) == len(calls)  # Each request uses a fresh challenge.
-    assert len(set(deadlines)) == 1  # Replacements cannot reset the round deadline.
+    assert len(set(deadlines)) == (2 if failed_calls else 1)
+    assert max(deadlines) - min(deadlines) == (480 if failed_calls else 0)
 
 
 def test_six_attempts_without_three_samples_stay_yellow_and_never_pause(store, monkeypatch):
@@ -387,7 +388,7 @@ def test_replacement_rechecks_account_cancellation_and_deadline(store, monkeypat
         elif change == 'route':
             accounts.account['credentials']['model_mapping'] = {model: 'gpt-5.4'}
         else:
-            monkeypatch.setattr(s.time, 'monotonic', lambda: monotonic() + 240)
+            monkeypatch.setattr(s.time, 'monotonic', lambda: monotonic() + 720)
         raise s.InsufficientSample('有效数字样本不足')
     job = claim(store)
     if change == 'disable':
@@ -855,10 +856,10 @@ class PromptControl(FakeControl):
         self.prompts = []
         self.support_checks = 0
 
-    def check_prompt_support(self):
+    def check_prompt_support(self, reasoning_effort='xhigh'):
         self.support_checks += 1
 
-    def prompt(self, account_id, model, prompt, cancelled, deadline):
+    def prompt(self, account_id, model, prompt, cancelled, deadline, *, reasoning_effort='xhigh'):
         self.prompts.append((account_id, model, prompt))
         if self.error:
             raise self.error
@@ -914,7 +915,9 @@ def test_prompt_full_length_chinese_payload_fits_limit(store):
     assert client.put('/accounts/7/prompt-test', data=json.dumps(body, ensure_ascii=False).encode(), content_type='application/json').status_code == 200
 
 
-def test_prompt_api_contract_and_stream_completion(tmp_path, monkeypatch):
+@pytest.mark.parametrize('effort', ['low', 'medium', 'high', 'xhigh'])
+def test_prompt_api_contract_and_stream_completion(tmp_path, monkeypatch, effort):
+    profile = s.comparison_profile(effort)
     key = tmp_path / 'key'; key.write_text('fixture-admin-key')
     calls = []
     class Stream(Response):
@@ -927,19 +930,19 @@ def test_prompt_api_contract_and_stream_completion(tmp_path, monkeypatch):
         def post(self, url, **kwargs):
             calls.append((url, kwargs))
             identity = kwargs['headers']['X-Client-Request-Id']
-            assert kwargs['headers']['X-Sub2API-Comparison-Profile'] == s.COMPARISON_PROFILE
+            assert kwargs['headers']['X-Sub2API-Comparison-Profile'] == profile
             return Stream([
-                {'type': 'test_request', 'data': {'client_request_id': identity, 'upstream_attempt_id': identity, 'profile': s.COMPARISON_PROFILE,
+                {'type': 'test_request', 'data': {'client_request_id': identity, 'upstream_attempt_id': identity, 'profile': profile,
                  'details': {'account_id': 7, 'transport': 'codex-http1-openssl36', 'body': {
-                     'model': 'gpt-6-sol', 'reasoning': {'effort': 'xhigh'}, 'instructions': s.COMPARISON_INSTRUCTIONS,
+                     'model': 'gpt-6-sol', 'reasoning': {'effort': effort}, 'instructions': s.COMPARISON_INSTRUCTIONS,
                      'tools': [], 'tool_choice': 'none', 'parallel_tool_calls': False, 'text': {'verbosity': 'medium'},
                      'input': [{'role': 'user', 'content': [{'type': 'input_text', 'text': '自定义测试'}]}]}}}},
                 {'type': 'test_response', 'data': {'client_request_id': identity, 'upstream_attempt_id': identity,
-                                                'profile': s.COMPARISON_PROFILE, 'details': {'http_status': 200}}},
+                                                'profile': profile, 'details': {'http_status': 200}}},
                 {'type': 'content', 'text': '123'}, {'type': 'test_complete', 'success': True}])
     monkeypatch.setattr(s.requests, 'Session', Session)
     control = s.SchedulingControl(key)
-    assert control.prompt(7, 'gpt-6-sol', '自定义测试') == '123'
+    assert control.prompt(7, 'gpt-6-sol', '自定义测试', reasoning_effort=effort) == '123'
     assert calls[0][0].endswith('/accounts/7/test')
     assert calls[0][1]['json'] == dict(model_id='gpt-6-sol', prompt='自定义测试', mode='attribution')
     assert calls[0][1]['allow_redirects'] is False
@@ -962,7 +965,7 @@ def test_prompt_missing_capability_does_not_post(tmp_path, monkeypatch):
 def test_prompt_incompatible_gateway_records_zero_requests(store):
     store.configure_prompt(7, True, 'gpt-6-sol', '{{challenge}}')
     control = PromptControl()
-    def unavailable():
+    def unavailable(reasoning_effort='xhigh'):
         raise s.ProbeError('接口未支持')
     control.check_prompt_support = unavailable
     result = s.run_prompt_round(prompt_claim(store), store, FakeAccounts(), control)

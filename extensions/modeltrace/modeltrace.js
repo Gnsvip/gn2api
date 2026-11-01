@@ -69,8 +69,37 @@
     if (text != null) node.textContent = text;
     return node;
   };
+  const effortField = (value, name) => {
+    const label = el('label', 'mt-prompt-label', name);
+    const select = el('select'); select.setAttribute('aria-label', name);
+    for (const [effort, title] of [['low', '低 · low'], ['medium', '中 · medium'], ['high', '高 · high'], ['xhigh', '最高 · xhigh']]) {
+      const option = el('option', '', title); option.value = effort; select.append(option);
+    }
+    select.value = value || 'xhigh'; label.append(select);
+    return { label, select };
+  };
+  const resultLabel = result => {
+    if (result.status === 'green') return result.test_mode === 'qa' ? '通过' : '与预期一致';
+    if (result.status === 'red') return result.test_mode === 'qa' ? '未通过' : '复测仍不符';
+    const titles = { round_timeout: '检测超时', upstream_error: '上游错误', insufficient_samples: '样本不足',
+      bank_unverified: '指纹库未校准', capability_unavailable: '接口不支持此档位' };
+    if (titles[result.outcome]) return titles[result.outcome];
+    // Old results retain their original evidence; only their display label changes.
+    if (/超时/.test(result.message || '')) return '检测超时';
+    if (result.bank_applicability === 'unverified') return '指纹库未校准';
+    if (/样本不足|有效回答.*上限/.test(result.message || '')) return '样本不足';
+    if (/输出超出限制/.test(result.message || '')) return '输出超限';
+    if (/测试失败|上游.*错误|上游.*报错/.test(result.message || '')) return '上游错误';
+    if (result.outcome === 'test_error') return '检测失败';
+    if (result.requests === 0) return '本轮跳过';
+    if ((result.cases || []).some(item => item.kind === 'manual' && item.status === 'yellow')) return '待人工评分';
+    if (result.test_mode === 'qa' && result.round_complete) return '回答不一致';
+    return '待确认';
+  };
   const description = result => result.test_mode === 'qa' ? [
     date(result.checked_at), `问答测试 · 请求模型：${result.expected}`,
+    `推理等级：${result.reasoning_effort || '旧记录未保存'}`,
+    result.budget_seconds && `本轮时间预算：${result.budget_seconds} 秒`,
     `本轮请求：${result.requests || 0} 次`, result.message,
     ...(result.cases || []).map(item => item.kind === 'manual'
       ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
@@ -79,6 +108,8 @@
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
     date(result.checked_at), `预期：${result.expected}`, result.sent_model && `发送模型：${result.sent_model}`,
+    `推理等级：${result.reasoning_effort || '旧记录未保存'}`,
+    result.budget_seconds && `本轮时间预算：${result.budget_seconds} 秒；实际耗时：${result.elapsed_seconds ?? '未知'} 秒`,
     result.prediction && `闭集候选：${result.prediction}`,
     typeof result.probability === 'number' && `候选库内分数：${(result.probability * 100).toFixed(1)}%`,
     typeof result.requests === 'number' && `本轮请求：${result.requests} 次`,
@@ -433,6 +464,9 @@
     select.value = preferredModel(state.models, state.model);
     select.disabled = !state.available;
     label.append(select);
+    const effort = effortField(state.reasoning_effort, '归因推理等级');
+    const budgetNote = el('p', 'mt-note', '初测最多 12 分钟；需要补采或复测时，整轮最多 20 分钟。若检测超过设置的间隔，完成后再等一个间隔，避免连续补跑。修改推理等级会取消旧轮次后续请求；已发出的请求可能已计费。');
+    const bankNote = el('p', 'mt-note', '当前指纹库未记录建库推理等级，尚未完成各档位校准。结果仅展示候选，不作为模型身份结论，也不触发归因自动停调度。');
     const mapping = el('p', 'mt-note');
     const refreshMapping = () => {
       const mapped = state.mapping[select.value];
@@ -461,7 +495,7 @@
     challengeCount.addEventListener('change', refreshEstimate);
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '检测说明'),
-      el('p', '', '绿色：与预期一致；黄色：待确认或检测失败；红色：复测仍不符。统计归因仅供参考。'),
+      el('p', '', '检测超时、上游错误、样本不足和指纹库未校准分别显示。指纹库校准前仅展示候选；绿色和红色历史记录不代表模型身份已获证明。'),
       el('p', '', '挑战次数可选 1、2、3，默认 3。1 次最省额度，2 次折中，3 次更稳定；较少样本更容易误判。样本不足只补缺少部分，归因不符则用同样份数独立复测。整轮最多为所选次数的 2 倍（3 次模式整轮最多 6 次请求）；无法凑齐所选份数或完成复测记黄点，不触发自动停调度。'),
       el('p', '', '自动停止只计连续红点，绿点或黄点清零。更改次数、策略或模型后重新计数。更改次数会取消旧轮次的后续请求和结果，下一轮仍按原计划执行；已发出的请求可能已计费。停止后当前业务请求继续，检测暂停，恢复调度需手动操作。'),
       el('p', '', '间隔支持 1–1440 分钟。仅改间隔不打断当前检测，下一轮从保存时重新计时。关闭页面仍会检测，繁忙时可能延后。'),
@@ -497,8 +531,7 @@
       const details = el('details', 'mt-result');
       const summary = el('summary');
       const when = el('time', '', shortDate(result.checked_at)); when.dateTime = new Date(result.checked_at * 1000).toISOString();
-      const text = result.status === 'green' ? '与预期一致' : result.status === 'red' ? '复测仍不符'
-        : result.requests === 0 ? '本轮跳过' : '待确认';
+      const text = resultLabel(result);
       summary.append(dot, when, el('span', 'mt-result-title', text));
       summary.title = result.message;
       details.append(summary, el('pre', '', description(result)));
@@ -538,11 +571,12 @@
       if (![1, 2, 3].includes(challenges)) { error.textContent = '挑战次数请选择 1、2 或 3 次'; return; }
       saveSettings(id, '/accounts/' + id, {
         enabled: enabled.checked, model: state.available ? (select.value || state.model) : state.model,
+        reasoning_effort: effort.select.value,
         auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes, challenge_count: challenges
       }, dialog, error, saved);
     });
     actions.append(close, disable, submit);
-    body.append(status, enabledLabel, label, catalogNote, mapping, intervalLabel, challengeLabel, estimate, reason, policy, historyHead, list, empty, help, error);
+    body.append(status, enabledLabel, label, catalogNote, mapping, effort.label, bankNote, intervalLabel, challengeLabel, estimate, budgetNote, reason, policy, historyHead, list, empty, help, error);
     panel.append(body, actions); refreshAvailability();
     if (state.available) {
       loadModels().then(models => {
@@ -707,6 +741,8 @@
     for (const name of choices) { const option = el('option', '', name); option.value = name; model.append(option); }
     model.value = preferredModel(choices, promptState.model || state.model);
     model.setAttribute('aria-label', '测试模型'); modelLabel.append(model);
+    const effort = effortField(promptState.reasoning_effort, '题目推理等级');
+    const budgetNote = el('p', 'mt-note', '初测最多 12 分钟，补采或复测时整轮最多 20 分钟。修改推理等级会取消旧轮次后续请求。数字归因仍需匹配对应档位的指纹库校准条件；问答按所设答案判断。');
     const promptLabel = el('label', 'mt-prompt-label', '测试提示词模板');
     const prompt = el('textarea'); prompt.maxLength = 4000; prompt.value = promptState.prompt || '{{challenge}}';
     prompt.setAttribute('aria-label', '测试提示词'); promptLabel.append(prompt);
@@ -772,7 +808,7 @@
         const manual = (result.cases || []).some(entry => entry.kind === 'manual');
         dot.className = 'mt-dot mt-' + color;
         resultTitle.textContent = (manual ? '含人工预览 · ' : result.test_mode === 'qa' ? '问答 · ' : '归因 · ')
-          + (color === 'green' ? '通过' : color === 'red' ? '未通过' : '待确认');
+          + resultLabel(result);
         summary.title = result.message || ''; resultDescription.textContent = description(result);
       };
       refreshResult(); details.append(summary, resultDescription);
@@ -834,6 +870,7 @@
         error.textContent = '请填写已勾选题目的名称和提示词；答案匹配题还需填写预期答案'; return;
       }
       const payload = { enabled: enabled.checked, model: model.value || promptState.model || 'gpt-6-astra',
+        reasoning_effort: effort.select.value,
         prompt: prompt.value, challenge_count: Number(challenges.value),
         auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes };
       payload.test_mode = mode.value;
@@ -842,7 +879,7 @@
     });
     disable.addEventListener('click', () => saveSettings(id, '/accounts/' + id + '/prompt-test', { enabled: false }, dialog, error, saved));
     actions.append(close, disable, saveButton);
-    body.append(status, enabledLabel, modeLabel, modelLabel, catalogNote, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
+    body.append(status, enabledLabel, modeLabel, modelLabel, catalogNote, effort.label, budgetNote, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
       availability, policy, historyHead, history, empty, help, error);
     panel.append(body, actions);
     refreshMode();

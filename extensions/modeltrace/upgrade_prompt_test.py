@@ -16,9 +16,9 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261101-comparison-1'
+VERSION = '20261101-effort-budget-1'
 FILES = ['service.py', 'attempts.py', 'test_attempts.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
-         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py']
+         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py', 'CALIBRATION.md']
 
 
 def digest(path):
@@ -107,15 +107,16 @@ def main():
     capabilities = get_json('http://127.0.0.1:8080/api/v1/admin/accounts/test-capabilities', key)
     supported = capabilities.get('data') or {}
     if (capabilities.get('code') != 0 or supported.get('comparison_audit_v1') is not True
-            or 'codex-http-xhigh-v1' not in supported.get('comparison_profiles', [])):
-        raise RuntimeError('install the GN2API fixed-comparison audit interface first')
+            or not all(f'codex-http-{effort}-v1' in supported.get('comparison_profiles', [])
+                       for effort in ('low', 'medium', 'high', 'xhigh'))):
+        raise RuntimeError('install the GN2API comparison interface with selectable reasoning effort first')
     if run(['systemctl', 'is-active', 'modeltrace-ovh']) != 'active':
         raise RuntimeError('independent service is not active')
     if re.search(r'^\s*worker_shutdown_timeout\s+(?!0\s*;)', run(['nginx', '-T']), re.M):
         raise RuntimeError('finite nginx worker shutdown timeout requires review')
     report = dict(mode='read-only preflight', service_sha256=current_hash,
                   script_version=VERSION, gateway_compatible=True,
-                  changes=['independent extension files', 'additive SQLite columns/artifact table', 'nginx script version and 128k body limit'])
+                  changes=['independent extension files', 'additive reasoning effort settings', '720/1200 second round budgets', 'nginx script version and 128k body limit'])
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not args.apply:
         return
@@ -132,7 +133,7 @@ def main():
     shutil.copy2(NGINX, backup / 'nginx.conf')
     stopped = changed_nginx = False
     try:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + 1320
         while True:
             with sqlite3.connect(DB, timeout=5) as db:
                 db.execute('BEGIN IMMEDIATE')

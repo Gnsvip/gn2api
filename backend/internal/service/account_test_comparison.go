@@ -17,6 +17,20 @@ import (
 const comparisonProfile = "codex-http-xhigh-v1"
 const comparisonInstructions = "Follow the user's instructions exactly. Do not use tools."
 
+// ComparisonProfiles keeps the requested effort part of the audited contract.
+func ComparisonProfiles() []string {
+	return []string{"codex-http-low-v1", "codex-http-medium-v1", "codex-http-high-v1", comparisonProfile}
+}
+
+func comparisonReasoningEffort(profile string) (string, bool) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		if profile == "codex-http-"+effort+"-v1" {
+			return effort, true
+		}
+	}
+	return "", false
+}
+
 type comparisonSinkKey struct{}
 type comparisonSink func(string, any)
 
@@ -25,14 +39,15 @@ func (s *AccountTestService) prepareComparison(c *gin.Context, account *Account,
 	if profile == "" {
 		return nil
 	}
-	if profile != comparisonProfile || !isAttributionProbe(c) || !isCodexOAuthAccount(account) {
+	effort, supported := comparisonReasoningEffort(profile)
+	if !supported || !isAttributionProbe(c) || !isCodexOAuthAccount(account) {
 		return fmt.Errorf("unsupported comparison profile or account")
 	}
 	if requested == "" || requested != actual {
 		return fmt.Errorf("comparison requires the exact requested model without mapping")
 	}
 	payload["instructions"] = comparisonInstructions
-	payload["reasoning"] = map[string]any{"effort": "xhigh"}
+	payload["reasoning"] = map[string]any{"effort": effort}
 	payload["tools"] = []any{}
 	payload["tool_choice"] = "none"
 	payload["parallel_tool_calls"] = false

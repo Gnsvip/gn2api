@@ -95,12 +95,14 @@ with sync_playwright() as p:
     page.wait_for_function("document.querySelector('[role=tabpanel]:not([hidden]) select')?.disabled === false")
     assert page.get_by_label('检测模型', exact=True).input_value() == 'gpt-6-astra'
     assert page.get_by_label('挑战次数', exact=True).input_value() == '3'
+    assert page.get_by_label('归因推理等级', exact=True).input_value() == 'xhigh'
+    page.get_by_label('归因推理等级', exact=True).select_option('medium')
     assert writes == []  # Choosing the default does not enable or write anything.
     page.get_by_role('switch', name='启用定时模型归因', exact=True).check()
     page.get_by_role('button', name='保存当前页', exact=True).click()
     page.wait_for_function("document.querySelector('[data-row-id=\"8\"] .mt-toggle').getAttribute('aria-checked') === 'true'")
     assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-astra', auto_pause_enabled=False,
-                                  auto_pause_threshold=3, interval_minutes=10, challenge_count=3))
+                                  auto_pause_threshold=3, interval_minutes=10, challenge_count=3, reasoning_effort='medium'))
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('[data-row-id="7"] .mt-toggle').click()
     page.wait_for_function("document.querySelector('[data-row-id=\"7\"] .mt-toggle').getAttribute('aria-checked') === 'false'")
@@ -159,7 +161,7 @@ with sync_playwright() as p:
     assert '当前页设置已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
-    assert writes[-1] == ('7', dict(enabled=False, model='gpt-6-sol', auto_pause_enabled=True, auto_pause_threshold=3, interval_minutes=30, challenge_count=2))
+    assert writes[-1] == ('7', dict(enabled=False, model='gpt-6-sol', auto_pause_enabled=True, auto_pause_threshold=3, interval_minutes=30, challenge_count=2, reasoning_effort='xhigh'))
     assert states['8']['challenge_count'] == 3
     page.set_viewport_size({'width': 1160, 'height': 1000})
     page.locator('[data-row-id="7"] .mt-label').click()
@@ -215,6 +217,8 @@ with sync_playwright() as p:
     assert '{{challenge}}' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
     page.get_by_label('测试提示词', exact=True).fill('请认真完成：\n{{challenge}}')
     page.get_by_label('测试模型', exact=True).select_option('gpt-6-sol')
+    assert page.get_by_label('题目推理等级', exact=True).input_value() == 'xhigh'
+    page.get_by_label('题目推理等级', exact=True).select_option('low')
     page.get_by_label('提示词挑战次数', exact=True).select_option('2')
     page.get_by_label('测试间隔（分钟）', exact=True).fill('15')
     page.get_by_role('switch', name='连续红点自动停止调度').check()
@@ -225,7 +229,7 @@ with sync_playwright() as p:
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-sol', prompt='请认真完成：\n{{challenge}}',
-                                  challenge_count=2, interval_minutes=15, auto_pause_enabled=True, auto_pause_threshold=2, test_mode='attribution'))
+                                  challenge_count=2, interval_minutes=15, auto_pause_enabled=True, auto_pause_threshold=2, test_mode='attribution', reasoning_effort='low'))
     assert json.dumps(states['8']['history']) == attribution_before
     states['8']['prompt_test']['history'] = [dict(status=color, expected='gpt-6-sol', checked_at=NOW,
                                                  message=color) for color in ['green', 'yellow', 'red']]
@@ -235,6 +239,7 @@ with sync_playwright() as p:
         assert page.locator('[data-row-id="8"] .mt-' + color).count() == (2 if color == 'green' else 1)
     open_custom()
     assert page.get_by_label('测试间隔（分钟）', exact=True).input_value() == '15'
+    assert page.get_by_label('题目推理等级', exact=True).input_value() == 'low'
     assert page.locator('.mt-prompt-history li').count() == 3
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-prompt-settings.png')))
     page.get_by_label('测试提示词', exact=True).fill('')
@@ -264,6 +269,7 @@ with sync_playwright() as p:
     page.get_by_label('测试 知识题', exact=True).check()
     page.get_by_role('switch', name='启用此页定时测试', exact=True).check()
     page.get_by_label('测试模型', exact=True).select_option('gpt-6.1-sol')
+    page.get_by_label('题目推理等级', exact=True).select_option('high')
     assert '通常 1 次 / 轮' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='保存当前页', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
@@ -272,6 +278,7 @@ with sync_playwright() as p:
     page.locator('dialog').wait_for(state='detached')
     saved = writes[-1][1]
     assert saved['test_mode'] == 'qa' and saved['enabled'] and saved['model'] == 'gpt-6.1-sol'
+    assert saved['reasoning_effort'] == 'high'
     assert [item['enabled'] for item in saved['cases']] == [False, True]
     assert saved['cases'][1]['prompt'].endswith('Only return True or False.')
     assert json.dumps(states['8']['history']) == attribution_before
@@ -320,6 +327,20 @@ with sync_playwright() as p:
     assert evidence.get_by_role('button', name='加载更多').is_hidden()
     evidence.screenshot(path=str(out.with_name('modeltrace-evidence-mobile.png')))
     evidence.get_by_role('button', name='×', exact=True).click()
+    page.get_by_role('button', name='关闭', exact=True).click()
+    states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
+        requests=2, reasoning_effort='medium', message=message, outcome=outcome)
+        for outcome, message in [('round_timeout', '本轮检测超时'), ('upstream_error', '上游处理错误'),
+                                 ('bank_unverified', '仅展示候选'), ('insufficient_samples', '有效回答不足')]]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
+    page.locator('[data-row-id="8"] .mt-label').click()
+    page.get_by_role('tab', name='模型归因', exact=True).click()
+    assert page.get_by_label('归因推理等级', exact=True).input_value() == 'medium'
+    page.get_by_role('button', name='查看全部 4 条', exact=True).click()
+    for title in ('检测超时', '上游错误', '指纹库未校准', '样本不足'):
+        assert page.locator('[role=tabpanel]:visible .mt-result-title').filter(has_text=title).count() == 1
+    assert '初测最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-effort-settings.png')))
     page.get_by_role('button', name='关闭', exact=True).click()
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")

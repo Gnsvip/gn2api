@@ -23,7 +23,7 @@ class Answers(PromptControl):
         super().__init__()
         self.answers = iter(answers)
 
-    def prompt(self, account_id, model, prompt, cancelled, deadline):
+    def prompt(self, account_id, model, prompt, cancelled, deadline, *, reasoning_effort='xhigh'):
         self.prompts.append((account_id, model, prompt))
         answer = next(self.answers)
         if isinstance(answer, Exception):
@@ -102,8 +102,8 @@ def test_qa_toggle_cancels_active_round_before_next_question(store):
     control = Answers("21")
     original = control.prompt
 
-    def changed(*args):
-        value = original(*args)
+    def changed(*args, **kwargs):
+        value = original(*args, **kwargs)
         cases[1]["enabled"] = False
         configure(store, cases)
         return value
@@ -163,7 +163,7 @@ def test_qa_invalid_case_configuration_rejected(store, cases):
 def test_qa_missing_capability_sends_no_questions(store):
     configure(store)
     control = Answers()
-    def unavailable():
+    def unavailable(reasoning_effort='xhigh'):
         raise s.ProbeError("接口不支持")
     control.check_prompt_support = unavailable
     result = s.run_prompt_round(prompt_claim(store), store, FakeAccounts(), control)

@@ -94,3 +94,54 @@ func TestComparisonAuditDoesNotConsumeRequestBody(t *testing.T) {
 	got, _ := io.ReadAll(req.Body)
 	require.Equal(t, raw, got)
 }
+
+func TestComparisonSelectedEffortReachesFinalWire(t *testing.T) {
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		t.Run(effort, func(t *testing.T) {
+			account := newCodexSynthUnitAccount(12240)
+			cfg := &config.Config{}
+			cfg.Gateway.CodexEgress.Enabled = true
+			upstream := &comparisonTestUpstream{}
+			svc := &AccountTestService{cfg: cfg, httpUpstream: upstream}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest("POST", "/test", nil)
+			profile := "codex-http-" + effort + "-v1"
+			require.Contains(t, ComparisonProfiles(), profile)
+			c.Request.Header.Set("X-Sub2API-Comparison-Profile", profile)
+			c.Request.Header.Set("X-Client-Request-Id", uuid.NewString())
+			c.Set(attributionTestContextKey, true)
+			require.NoError(t, svc.testOpenAIAccountConnection(c, account, "gpt-6-astra", "fixture question", "attribution"))
+			require.Equal(t, 1, upstream.calls)
+			seen := 0
+			for _, line := range strings.Split(recorder.Body.String(), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				event := gjson.Parse(strings.TrimPrefix(line, "data: "))
+				if event.Get("type").String() == "test_request" {
+					seen++
+					require.Equal(t, profile, event.Get("data.profile").String())
+					require.Equal(t, effort, event.Get("data.details.body.reasoning.effort").String())
+					require.Equal(t, "gpt-6-astra", event.Get("data.details.body.model").String())
+				}
+			}
+			require.Equal(t, 1, seen)
+		})
+	}
+}
+
+func TestComparisonRejectsUnknownEffortBeforeUpstream(t *testing.T) {
+	account := newCodexSynthUnitAccount(12240)
+	cfg := &config.Config{}
+	cfg.Gateway.CodexEgress.Enabled = true
+	upstream := &comparisonTestUpstream{}
+	svc := &AccountTestService{cfg: cfg, httpUpstream: upstream}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/test", nil)
+	c.Request.Header.Set("X-Sub2API-Comparison-Profile", "codex-http-ultra-v1")
+	c.Request.Header.Set("X-Client-Request-Id", uuid.NewString())
+	c.Set(attributionTestContextKey, true)
+	require.Error(t, svc.testOpenAIAccountConnection(c, account, "gpt-6-astra", "fixture question", "attribution"))
+	require.Zero(t, upstream.calls)
+}

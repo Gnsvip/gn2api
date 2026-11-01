@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -31,14 +32,73 @@ type updateServiceGitHubClientStub struct {
 	release        *GitHubRelease
 	recentReleases []*GitHubRelease
 	recentErr      error
+	latestRepo     string
+	recentRepo     string
+	latestCalls    int
 }
 
-func (s *updateServiceGitHubClientStub) FetchLatestRelease(context.Context, string) (*GitHubRelease, error) {
+func (s *updateServiceGitHubClientStub) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
+	s.latestRepo = repo
+	s.latestCalls++
 	return s.release, nil
 }
 
-func (s *updateServiceGitHubClientStub) FetchRecentReleases(context.Context, string, int) ([]*GitHubRelease, error) {
+func (s *updateServiceGitHubClientStub) FetchRecentReleases(_ context.Context, repo string, _ int) ([]*GitHubRelease, error) {
+	s.recentRepo = repo
 	return s.recentReleases, s.recentErr
+}
+
+func TestUpdateServiceBuildMetadataDoesNotOfferDowngrade(t *testing.T) {
+	for _, latest := range []string{"v0.2.19", "v0.2.35", "v0.2.35+other.2", "v0.2.36"} {
+		t.Run(latest, func(t *testing.T) {
+			client := &updateServiceGitHubClientStub{release: &GitHubRelease{TagName: latest}}
+			svc := NewUpdateService(&updateServiceCacheStub{}, client, "0.2.35+effort-budget.1", "release")
+			info, err := svc.CheckUpdate(context.Background(), true)
+			require.NoError(t, err)
+			require.Equal(t, latest == "v0.2.36", info.HasUpdate)
+			require.Equal(t, "Gnsvip/gn2api", client.latestRepo)
+			if !info.HasUpdate {
+				require.ErrorIs(t, svc.PerformUpdate(context.Background()), ErrNoUpdateAvailable)
+			}
+		})
+	}
+}
+
+func TestUpdateServiceRejectsForeignAndLegacyCache(t *testing.T) {
+	for _, repo := range []string{"", "Wei-Shaw/sub2api", "Gnsvip/gn2api"} {
+		t.Run(repo, func(t *testing.T) {
+			data, err := json.Marshal(map[string]any{"repository": repo, "latest": "0.2.37", "timestamp": time.Now().Unix()})
+			require.NoError(t, err)
+			cache := &updateServiceCacheStub{data: string(data)}
+			client := &updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.2.36"}}
+			svc := NewUpdateService(cache, client, "0.2.36", "release")
+			info, err := svc.CheckUpdate(context.Background(), false)
+			require.NoError(t, err)
+			if repo == "Gnsvip/gn2api" {
+				require.True(t, info.Cached)
+				require.Equal(t, 0, client.latestCalls)
+				return
+			}
+			require.False(t, info.HasUpdate)
+			require.False(t, info.Cached)
+			require.Equal(t, "0.2.36", info.LatestVersion)
+			require.Equal(t, 1, client.latestCalls)
+			cached, err := svc.CheckUpdate(context.Background(), false)
+			require.NoError(t, err)
+			require.True(t, cached.Cached)
+			require.Equal(t, "0.2.36", cached.LatestVersion)
+			require.Equal(t, 1, client.latestCalls)
+		})
+	}
+}
+
+func TestUpdateServiceRollbackUsesForkRepository(t *testing.T) {
+	client := &updateServiceGitHubClientStub{recentReleases: []*GitHubRelease{{TagName: "v0.2.35"}}}
+	svc := NewUpdateService(&updateServiceCacheStub{}, client, "0.2.36", "release")
+	versions, err := svc.ListRollbackVersions(context.Background())
+	require.NoError(t, err)
+	require.Len(t, versions, 1)
+	require.Equal(t, "Gnsvip/gn2api", client.recentRepo)
 }
 
 func (s *updateServiceGitHubClientStub) DownloadFile(context.Context, string, string, int64) error {

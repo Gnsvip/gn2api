@@ -97,6 +97,7 @@ def invoke(store, job, run_id, account, metadata, operation):
     attempt_id = str(uuid.uuid4())
     started = time.time()
     metadata = {**metadata, "requested_model": job["model"], "generation": job["generation"],
+                "reasoning_effort": job.get("reasoning_effort", "xhigh"),
                 "run_sequence": job.get("run_sequence"), "proxy_id": account.get("proxy_id"),
                 "timezone": (account.get("extra") or {}).get("codex_timezone")}
     credentials = account.get("credentials") or {}
@@ -114,9 +115,11 @@ def invoke(store, job, run_id, account, metadata, operation):
                           "result": value, "latency_ms": int((time.time() - started) * 1000)})
         return value, attempt_id
     except BaseException as error:
+        probe_error = type(error).__name__ in ("ProbeError", "InsufficientSample", "RoundTimeout")
         emit("finished", {"status": "cancelled" if type(error).__name__ == "Cancelled" else "failed",
                           "error_type": type(error).__name__,
-                          "error": str(error) if type(error).__name__ in ("ProbeError", "InsufficientSample") else type(error).__name__,
+                          "error": str(error) if probe_error else type(error).__name__,
+                          "error_code": error.code if probe_error else None,
                           "latency_ms": int((time.time() - started) * 1000)})
         raise
     finally:

@@ -33,6 +33,9 @@ sys.path.insert(0, str(ROOT / "vendor"))
 from fingerprint import analyze_global_outputs, generate_challenges, load_bank, parse_numbers
 
 COMPARISON_PROFILE = "codex-http-xhigh-v1"
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+ATTRIBUTION_INITIAL_SECONDS = 720
+ATTRIBUTION_MAX_SECONDS = 1200
 COMPARISON_INSTRUCTIONS = "Follow the user's instructions exactly. Do not use tools."
 BANK_COMMIT = "6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2"
 BANK = load_bank(ROOT / "vendor/data/unified_bank.json")
@@ -65,14 +68,30 @@ LOG = logging.getLogger("modeltrace")
 
 class ProbeError(Exception):
     """Only sanitized, user-readable messages may enter this exception."""
+    def __init__(self, message, code="test_error"):
+        super().__init__(message)
+        self.code = code
+
+
+class RoundTimeout(ProbeError):
+    def __init__(self):
+        super().__init__("本轮检测超时（整轮时间预算已用尽）", "round_timeout")
 
 
 class InsufficientSample(ProbeError):
     """A complete response with too few numbers; a new challenge may replace it."""
+    def __init__(self, message):
+        super().__init__(message, "insufficient_samples")
 
 
 class Cancelled(Exception):
     pass
+
+
+def comparison_profile(effort="xhigh"):
+    if effort not in REASONING_EFFORTS:
+        raise ProbeError("推理等级请选择 low、medium、high 或 xhigh", "invalid_effort")
+    return f"codex-http-{effort}-v1"
 
 
 class Store:
@@ -123,6 +142,7 @@ class Store:
             # Migrate existing installations without losing settings or history.
             columns = {row[1] for row in db.execute("PRAGMA table_info(monitors)")}
             for name, definition in {
+                "reasoning_effort": "TEXT NOT NULL DEFAULT 'xhigh'",
                 "auto_pause_enabled": "INTEGER NOT NULL DEFAULT 0",
                 "auto_pause_threshold": "INTEGER NOT NULL DEFAULT 3",
                 "mismatch_streak": "INTEGER NOT NULL DEFAULT 0",
@@ -139,6 +159,7 @@ class Store:
                     db.execute(f"ALTER TABLE monitors ADD COLUMN {name} {definition}")
             prompt_columns = {row[1] for row in db.execute("PRAGMA table_info(prompt_monitors)")}
             for name, definition in {
+                "reasoning_effort": "TEXT NOT NULL DEFAULT 'xhigh'",
                 "test_mode": "TEXT NOT NULL DEFAULT 'attribution'",
                 "cases": "TEXT NOT NULL DEFAULT '[]'",
             }.items():
@@ -167,10 +188,12 @@ class Store:
 
     def configure_prompt(self, account_id, enabled, model, prompt,
                          auto_pause_enabled=None, auto_pause_threshold=None, interval_minutes=None,
-                         challenge_count=None, test_mode=None, cases=None):
+                         challenge_count=None, test_mode=None, cases=None, reasoning_effort=None):
         with self.action_lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM prompt_monitors WHERE account_id=?", (account_id,)).fetchone()
+            reasoning_effort = (old["reasoning_effort"] if old else "xhigh") if reasoning_effort is None else reasoning_effort
+            comparison_profile(reasoning_effort)
             auto_pause_enabled = bool(old and old["auto_pause_enabled"]) if auto_pause_enabled is None else auto_pause_enabled
             auto_pause_threshold = (old["auto_pause_threshold"] if old else 3) if auto_pause_threshold is None else auto_pause_threshold
             interval_minutes = (old["interval_minutes"] if old else 10) if interval_minutes is None else interval_minutes
@@ -178,6 +201,7 @@ class Store:
             test_mode = (old["test_mode"] if old else "attribution") if test_mode is None else test_mode
             cases_json = (old["cases"] if old else "[]") if cases is None else json.dumps(cases, ensure_ascii=False, sort_keys=True)
             same = (old and bool(old["enabled"]) == enabled and old["model"] == model
+                    and old["reasoning_effort"] == reasoning_effort
                     and old["prompt"] == prompt and old["challenge_count"] == challenge_count
                     and old["test_mode"] == test_mode and old["cases"] == cases_json
                     and bool(old["auto_pause_enabled"]) == auto_pause_enabled
@@ -191,10 +215,11 @@ class Store:
             next_run = (old["next_run"] if old["interval_minutes"] == interval_minutes
                         else time.time() + interval_minutes * 60) if same_monitor else time.time() + random.uniform(1, 12)
             db.execute("""INSERT INTO prompt_monitors(account_id,enabled,model,prompt,next_run,updated_at,
-                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count,test_mode,cases)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count,test_mode,cases,reasoning_effort)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
                 enabled=excluded.enabled, model=excluded.model, prompt=excluded.prompt,
                 test_mode=excluded.test_mode, cases=excluded.cases,
+                reasoning_effort=excluded.reasoning_effort,
                 challenge_count=excluded.challenge_count, generation=generation+1,
                 next_run=excluded.next_run, updated_at=excluded.updated_at,
                 auto_pause_enabled=excluded.auto_pause_enabled,
@@ -203,19 +228,22 @@ class Store:
                 failure_streak=0,failure_context='',pause_status='',pause_retry_at=0,
                 paused_at=0,pause_message='',running=0,message=''""",
                 (account_id, int(enabled), model, prompt, next_run, time.time(),
-                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count, test_mode, cases_json))
+                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count, test_mode, cases_json, reasoning_effort))
 
     def configure(self, account_id, enabled, model, auto_pause_enabled=None, auto_pause_threshold=None,
-                  interval_minutes=None, challenge_count=None):
+                  interval_minutes=None, challenge_count=None, reasoning_effort=None):
         with self.action_lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM monitors WHERE account_id=?", (account_id,)).fetchone()
+            reasoning_effort = (old["reasoning_effort"] if old else "xhigh") if reasoning_effort is None else reasoning_effort
+            comparison_profile(reasoning_effort)
             auto_pause_enabled = bool(old and old["auto_pause_enabled"]) if auto_pause_enabled is None else auto_pause_enabled
             auto_pause_threshold = (old["auto_pause_threshold"] if old else 3) if auto_pause_threshold is None else auto_pause_threshold
             interval_minutes = (old["interval_minutes"] if old else 10) if interval_minutes is None else interval_minutes
             challenge_count = (old["challenge_count"] if old else 3) if challenge_count is None else challenge_count
             # Repeated identical requests must not schedule extra paid probes.
             if (old and bool(old["enabled"]) == enabled and old["model"] == model
+                    and old["reasoning_effort"] == reasoning_effort
                     and bool(old["auto_pause_enabled"]) == auto_pause_enabled
                     and old["auto_pause_threshold"] == auto_pause_threshold
                     and old["challenge_count"] == challenge_count):
@@ -228,18 +256,19 @@ class Store:
             next_run = (old["next_run"] if old["interval_minutes"] == interval_minutes
                         else time.time() + interval_minutes * 60) if same_monitor else time.time() + random.uniform(1, 12)
             db.execute("""INSERT INTO monitors(account_id,enabled,model,next_run,updated_at,
-                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count)
-                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+                    auto_pause_enabled,auto_pause_threshold,interval_minutes,challenge_count,reasoning_effort)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
                 enabled=excluded.enabled, model=excluded.model, generation=generation+1,
                 next_run=excluded.next_run, updated_at=excluded.updated_at,
                 auto_pause_enabled=excluded.auto_pause_enabled,
                 auto_pause_threshold=excluded.auto_pause_threshold,
                 interval_minutes=excluded.interval_minutes,
                 challenge_count=excluded.challenge_count,
+                reasoning_effort=excluded.reasoning_effort,
                 mismatch_streak=0,mismatch_context='',pause_status='',pause_retry_at=0,
                 running=0, message=''""",
                 (account_id, int(enabled), model, next_run, time.time(),
-                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count))
+                 int(auto_pause_enabled), auto_pause_threshold, interval_minutes, challenge_count, reasoning_effort))
 
     def is_current(self, job):
         current = self.get(job["account_id"])
@@ -289,13 +318,15 @@ class Store:
                 streak = (current["mismatch_streak"] if current["mismatch_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
             result.update(checked_at=now, expected=job["model"], bank_commit=BANK_COMMIT)
+            result["reasoning_effort"] = job.get("reasoning_effort", "xhigh")
             result["mismatch_streak"] = streak
             db.execute("INSERT INTO results(account_id,checked_at,model,result) VALUES(?,?,?,?)",
                        (job["account_id"], now, job["model"], json.dumps(result, ensure_ascii=False)))
             db.execute("""UPDATE monitors SET running=0,message=?,mismatch_streak=?,mismatch_context=?,
-                       pause_status=?,pause_retry_at=0 WHERE account_id=?""",
+                        pause_status=?,pause_retry_at=0,
+                        next_run=CASE WHEN next_run<=? THEN ? ELSE next_run END WHERE account_id=?""",
                        (result.get("message", ""), streak, context if streak else "",
-                        "pending" if pending else "", job["account_id"]))
+                        "pending" if pending else "", now, now + current["interval_minutes"] * 60, job["account_id"]))
 
     def finish_prompt(self, job, result):
         with self.action_lock, self.db() as db:
@@ -318,6 +349,7 @@ class Store:
             pending = streak >= current["auto_pause_threshold"]
             mode = job.get("test_mode", "attribution")
             result.update(checked_at=now, expected=job["model"], test_mode=mode,
+                          reasoning_effort=job.get("reasoning_effort", "xhigh"),
                           template_hash=hashlib.sha256((job["cases"] if mode == "qa" else job["prompt"]).encode()).hexdigest())
             if mode == "attribution":
                 result["bank_commit"] = BANK_COMMIT
@@ -328,9 +360,10 @@ class Store:
                 db.execute("INSERT INTO prompt_artifacts(result_id,case_id,html,prompt) VALUES(?,?,?,?)",
                            (inserted.lastrowid, case_id, artifact["html"], artifact["prompt"]))
             db.execute("""UPDATE prompt_monitors SET running=0,message=?,failure_streak=?,failure_context=?,
-                       pause_status=?,pause_retry_at=0 WHERE account_id=?""",
+                        pause_status=?,pause_retry_at=0,
+                        next_run=CASE WHEN next_run<=? THEN ? ELSE next_run END WHERE account_id=?""",
                        (result.get("message", ""), streak, context if streak else "",
-                        "pending" if pending else "", job["account_id"]))
+                        "pending" if pending else "", now, now + current["interval_minutes"] * 60, job["account_id"]))
 
     def artifact(self, account_id, result_id, case_id):
         with self.db() as db:
@@ -462,6 +495,8 @@ class Store:
         prompt_public = {
             "enabled": bool(prompt and prompt["enabled"]),
             "model": prompt["model"] if prompt else "",
+            "reasoning_effort": prompt["reasoning_effort"] if prompt else "xhigh",
+            "reasoning_efforts": list(REASONING_EFFORTS),
             "prompt": prompt["prompt"] if prompt else DEFAULT_PROMPT,
             "test_mode": prompt["test_mode"] if prompt else "qa",
             "cases": json.loads(prompt["cases"]) if prompt else DEFAULT_QA_CASES,
@@ -482,6 +517,8 @@ class Store:
         return {
             "account_id": account_id, "enabled": bool(config and config["enabled"]),
             "model": config["model"] if config else "", "running": bool(config and config["running"]),
+            "reasoning_effort": config["reasoning_effort"] if config else "xhigh",
+            "reasoning_efforts": list(REASONING_EFFORTS),
             "next_run": config["next_run"] if config and config["enabled"] else None,
             "interval_minutes": config["interval_minutes"] if config else 10,
             "challenge_count": config["challenge_count"] if config else 3,
@@ -790,7 +827,7 @@ def read_stream(response, protocol, cancelled, deadline):
         if cancelled():
             raise Cancelled()
         if time.monotonic() > deadline:
-            raise ProbeError("检测超时，本轮未完成")
+            raise RoundTimeout()
         received += len(raw)
         if received > MAX_RESPONSE_BYTES:
             raise ProbeError("检测输出超出限制")
@@ -874,7 +911,7 @@ def probe(account, model, challenge, cancelled, deadline, codex_version):
             # No retries, redirects, account fallback, or protocol fallback.
             remaining = deadline - time.monotonic()
             if remaining < 5:
-                raise ProbeError("本轮检测超时")
+                raise RoundTimeout()
             read_timeout = min(PROBE_READ_TIMEOUT, remaining)
             with session.post(url, headers=headers, json=payload, stream=True, allow_redirects=False,
                               timeout=(min(8, remaining), read_timeout)) as response:
@@ -891,7 +928,7 @@ def probe(account, model, challenge, cancelled, deadline, codex_version):
             if cancelled():
                 raise Cancelled() from None
             if time.monotonic() >= deadline:
-                raise ProbeError("本轮检测超时（240 秒预算已用尽）") from None
+                raise RoundTimeout() from None
             raise ProbeError(transport_failure_message(exc, read_timeout)) from None
     minimum = max(80, math.ceil(challenge["expected_count"] * .55))
     parsed_count = len(parse_numbers(output))
@@ -917,13 +954,16 @@ def summarize(outputs, model):
             "comparison_profile": COMPARISON_PROFILE,
             "bank_sha256": hashlib.sha256((ROOT / "vendor/data/unified_bank.json").read_bytes()).hexdigest(),
             "candidates": [{"model": c["model"], "probability": c["probability"]} for c in candidates[:3]],
-            "message": "指纹库未在当前请求条件下验证；仅展示闭集候选，不判定模型身份"}
+            "outcome": "bank_unverified",
+            "message": "指纹库未校准：当前请求条件尚无验证证据；仅展示闭集候选，不判定模型身份"}
 
 
 def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=None, prompt_template=None):
     if cancelled is None:
         cancelled = lambda: not store.is_current(job)
-    deadline = time.monotonic() + 240
+    started = time.monotonic()
+    budget_seconds = ATTRIBUTION_INITIAL_SECONDS
+    deadline = started + budget_seconds
     challenge_count = job.get("challenge_count", 3)
     request_limit = challenge_count * 2
     requests_sent, summaries = 0, []
@@ -931,6 +971,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
     valid_samples, insufficient_samples = 0, 0
     last_insufficient = ''
     try:
+        profile = comparison_profile(job.get("reasoning_effort", "xhigh"))
         if prompt_template is not None:
             validate_prompt_template(prompt_template)
         account = accounts.get(job["account_id"])
@@ -948,7 +989,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
                 if cancelled():
                     raise Cancelled()
                 if deadline - time.monotonic() < 5:
-                    raise ProbeError("本轮检测超时")
+                    raise RoundTimeout()
                 account = accounts.get(job["account_id"])
                 ensure_available(account)
                 if account_context(account) != context:
@@ -966,14 +1007,22 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
                 except InsufficientSample as exc:
                     insufficient_samples += 1
                     last_insufficient = str(exc)
+                    if time.monotonic() >= deadline:
+                        raise RoundTimeout() from None
+                    # Extend once, relative to round start; a replacement never resets time.
+                    budget_seconds = ATTRIBUTION_MAX_SECONDS
+                    deadline = started + budget_seconds
                     continue
+                if time.monotonic() >= deadline:
+                    raise RoundTimeout()
                 outputs.append(output)
                 identities.append(attempt_id)
                 valid_samples += 1
             if len(outputs) < challenge_count:
                 stage = "初测" if attempt == 0 else "不符复测"
-                raise ProbeError(f"{stage}仅取得 {len(outputs)}/{challenge_count} 份有效回答，已达本轮 {request_limit} 次请求上限，待确认。{last_insufficient}")
+                raise ProbeError(f"{stage}仅取得 {len(outputs)}/{challenge_count} 份有效回答，已达本轮 {request_limit} 次请求上限。{last_insufficient}", "insufficient_samples")
             summary = summarize(outputs, job["model"])
+            summary.update(reasoning_effort=job.get("reasoning_effort", "xhigh"), comparison_profile=profile)
             summary["sent_model"] = actual
             summary["attempt_ids"] = identities
             attempts.attach_analysis(store, account, identities, summary)
@@ -982,6 +1031,8 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
                 if request_limit - requests_sent < challenge_count:
                     summary.update(status="yellow", message=f"初测归因不符，但补采后剩余请求预算不足以完成 {challenge_count} 份独立复测，待确认")
                     break
+                budget_seconds = ATTRIBUTION_MAX_SECONDS
+                deadline = started + budget_seconds
                 continue
             break
         result = dict(summaries[-1])
@@ -1000,9 +1051,14 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
             raise ProbeError("账号路由或配置已变化，本轮作废")
         result["_context"] = context.hex()
     except ProbeError as exc:
-        result = {"status": "yellow", "message": str(exc)}
+        result = {"status": "yellow", "message": str(exc), "outcome": exc.code}
+        if isinstance(exc, RoundTimeout):
+            result["message"] = f"检测超时：本轮 {budget_seconds} 秒预算已用尽，取得 {valid_samples} 份有效回答"
     result.update(run_id=run_id, stages=summaries, requests=requests_sent, valid_samples=valid_samples, insufficient_samples=insufficient_samples,
-                  challenge_count=challenge_count, request_limit=request_limit)
+                  challenge_count=challenge_count, request_limit=request_limit,
+                  reasoning_effort=job.get("reasoning_effort", "xhigh"), budget_seconds=budget_seconds,
+                  initial_budget_seconds=ATTRIBUTION_INITIAL_SECONDS, max_budget_seconds=ATTRIBUTION_MAX_SECONDS,
+                  elapsed_seconds=round(time.monotonic() - started, 3))
     return result
 
 
@@ -1015,16 +1071,18 @@ def run_prompt_round(job, store, accounts, controller, *, attribution_monitor=Fa
         raise Cancelled()
     try:
         validate_prompt_template(job["prompt"])
-        controller.check_prompt_support()
+        controller.check_prompt_support(job.get("reasoning_effort", "xhigh"))
     except ProbeError as exc:
-        return {"status": "yellow", "message": str(exc), "requests": 0,
+        return {"status": "yellow", "message": str(exc), "outcome": exc.code, "requests": 0,
+                "reasoning_effort": job.get("reasoning_effort", "xhigh"),
                 "valid_samples": 0, "insufficient_samples": 0,
                 "challenge_count": job.get("challenge_count", 3),
                 "request_limit": job.get("challenge_count", 3) * 2,
                 "latency_ms": int((time.monotonic() - started) * 1000)}
 
     def gateway_probe(account, model, challenge, cancelled, deadline, _version):
-        output = controller.prompt(account["id"], model, challenge["prompt"], cancelled, deadline)
+        output = controller.prompt(account["id"], model, challenge["prompt"], cancelled, deadline,
+                                   reasoning_effort=job.get("reasoning_effort", "xhigh"))
         minimum = max(80, math.ceil(challenge["expected_count"] * .55))
         count = len(parse_numbers(output))
         attempts.emit("parsed_output", {"output": output, "parsed_count": count, "minimum_count": minimum})
@@ -1041,7 +1099,8 @@ def run_prompt_round(job, store, accounts, controller, *, attribution_monitor=Fa
 
 def run_qa_round(job, store, accounts, controller):
     started = time.monotonic()
-    deadline = started + 240
+    budget_seconds = ATTRIBUTION_INITIAL_SECONDS
+    deadline = started + budget_seconds
     cancelled = lambda: not store.is_prompt_current(job)
     requests_sent, results, artifacts = 0, [], {}
     selected = []
@@ -1052,7 +1111,7 @@ def run_qa_round(job, store, accounts, controller):
         if cancelled():
             raise Cancelled()
         if deadline - time.monotonic() < 5:
-            raise ProbeError("本轮问答测试超时")
+            raise RoundTimeout()
         account = accounts.get(job["account_id"])
         ensure_available(account, require_bank=False)
         if context is not None and account_context(account) != context:
@@ -1066,7 +1125,8 @@ def run_qa_round(job, store, accounts, controller):
             {"kind": "qa", "case_id": case["id"], "stage": attempt + 1,
              "prompt": case["prompt"], "expected_answer": case["expected_answer"],
              "context_sha256": context.hex()},
-            lambda: controller.prompt(job["account_id"], job["model"], case["prompt"], cancelled, deadline))
+            lambda: controller.prompt(job["account_id"], job["model"], case["prompt"], cancelled, deadline,
+                                      reasoning_effort=job.get("reasoning_effort", "xhigh")))
         item["attempts"].append({"attempt_id": identity, "output": output,
                                  "normalized_answer": normalized_answer(output)})
         return output
@@ -1077,7 +1137,7 @@ def run_qa_round(job, store, accounts, controller):
         cases = validate_qa_cases(json.loads(job["cases"]), True)
         selected = [case for case in cases if case["enabled"]]
         context = account_context(check_account())
-        controller.check_prompt_support()
+        controller.check_prompt_support(job.get("reasoning_effort", "xhigh"))
         for case in selected:
             item = {"id": case["id"], "name": case["name"], "expected_answer": case["expected_answer"],
                     "status": "yellow", "requests": 0, "kind": case["kind"], "attempts": []}
@@ -1093,6 +1153,9 @@ def run_qa_round(job, store, accounts, controller):
                 continue
             answers = []
             for attempt in range(2):
+                if attempt == 1:
+                    budget_seconds = ATTRIBUTION_MAX_SECONDS
+                    deadline = started + budget_seconds
                 check_account()
                 requests_sent += 1
                 item["requests"] += 1
@@ -1119,11 +1182,13 @@ def run_qa_round(job, store, accounts, controller):
         result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目复测仍未通过",
                                                 "yellow": "本轮含待确认结果"}[status], "_context": context.hex(), "round_complete": True}
     except ProbeError as exc:
-        result = {"status": "yellow", "message": str(exc), "round_complete": False}
+        result = {"status": "yellow", "message": str(exc), "outcome": exc.code, "round_complete": False}
         if results and results[-1]["status"] == "yellow":
             results[-1]["message"] = str(exc)
     result.update(run_id=run_id, test_mode="qa", requests=requests_sent, request_limit=sum(1 if case["kind"] == "manual" else 2 for case in selected),
                   _artifacts=artifacts,
+                  reasoning_effort=job.get("reasoning_effort", "xhigh"), budget_seconds=budget_seconds,
+                  initial_budget_seconds=ATTRIBUTION_INITIAL_SECONDS, max_budget_seconds=ATTRIBUTION_MAX_SECONDS,
                   cases=results, selected_cases=len(selected), latency_ms=int((time.monotonic() - started) * 1000))
     return result
 
@@ -1156,7 +1221,7 @@ def scheduler(store, accounts, stop, codex_version, controller):
                     continue
                 except Exception as exc:
                     LOG.warning("probe failed account_id=%s exception=%s", job["account_id"], type(exc).__name__)
-                    result = {"status": "yellow", "message": "检测暂不可用，等待下一轮"}
+                    result = {"status": "yellow", "outcome": "test_error", "message": "检测暂不可用，等待下一轮"}
                 store.finish(job, result)
             else:
                 if prompt_job is None:
@@ -1167,7 +1232,7 @@ def scheduler(store, accounts, stop, codex_version, controller):
                     continue
                 except Exception as exc:
                     LOG.warning("prompt test failed account_id=%s exception=%s", prompt_job["account_id"], type(exc).__name__)
-                    prompt_result = {"status": "yellow", "message": "提示词测试暂不可用，等待下一轮"}
+                    prompt_result = {"status": "yellow", "outcome": "test_error", "message": "提示词测试暂不可用，等待下一轮"}
                 store.finish_prompt(prompt_job, prompt_result)
             store.apply_pending_pause(accounts, controller)
             store.apply_pending_prompt_pause(accounts, controller)
@@ -1176,13 +1241,13 @@ def scheduler(store, accounts, stop, codex_version, controller):
             stop.wait(15)
 
 
-def validate_comparison_request(data, correlation_id, account_id, model, prompt):
+def validate_comparison_request(data, correlation_id, account_id, model, prompt, reasoning_effort="xhigh"):
     details = data.get("details") or {}
     body = details.get("body") or {}
-    if (data.get("client_request_id") != correlation_id or data.get("profile") != COMPARISON_PROFILE
+    if (data.get("client_request_id") != correlation_id or data.get("profile") != comparison_profile(reasoning_effort)
             or details.get("account_id") != account_id
             or details.get("transport") != "codex-http1-openssl36"
-            or body.get("model") != model or body.get("reasoning") != {"effort": "xhigh"}
+            or body.get("model") != model or body.get("reasoning") != {"effort": reasoning_effort}
             or body.get("instructions") != COMPARISON_INSTRUCTIONS
             or body.get("tools") != [] or body.get("tool_choice") != "none"
             or body.get("parallel_tool_calls") is not False or body.get("text") != {"verbosity": "medium"}):
@@ -1249,7 +1314,8 @@ class SchedulingControl:
             if payload.get("code") != 0 or data.get("id") != account_id or data.get("schedulable") is not False:
                 raise ProbeError("停止调度未获确认")
 
-    def check_prompt_support(self):
+    def check_prompt_support(self, reasoning_effort="xhigh"):
+        profile = comparison_profile(reasoning_effort)
         try:
             with requests.Session() as session:
                 session.trust_env = False
@@ -1259,13 +1325,14 @@ class SchedulingControl:
                     payload = response.json()
                     data = payload.get("data") or {}
                     if (payload.get("code") == 0 and data.get("comparison_audit_v1") is True
-                            and COMPARISON_PROFILE in data.get("comparison_profiles", [])):
+                            and profile in data.get("comparison_profiles", [])):
                         return
         except (requests.RequestException, ValueError, AttributeError):
             pass
-        raise ProbeError("GN2API 尚未支持固定条件与完整记录的比较测试接口，本轮未发送模型请求；请先安装接口修复")
+        raise ProbeError(f"GN2API 尚未支持 {reasoning_effort} 档的固定条件比较接口，本轮未发送模型请求；请先安装接口修复", "capability_unavailable")
 
-    def prompt(self, account_id, model, prompt, cancelled=lambda: False, deadline=None):
+    def prompt(self, account_id, model, prompt, cancelled=lambda: False, deadline=None, *, reasoning_effort="xhigh"):
+        profile = comparison_profile(reasoning_effort)
         if type(account_id) is not int or account_id <= 0:
             raise ProbeError("账号 ID 无效")
         if not isinstance(model, str) or not model or len(model) > 160:
@@ -1276,14 +1343,14 @@ class SchedulingControl:
         pieces, total, complete = [], 0, False
         seen_request, seen_response = False, False
         upstream_attempts = set()
-        deadline = deadline if deadline is not None else time.monotonic() + 240
+        deadline = deadline if deadline is not None else time.monotonic() + ATTRIBUTION_INITIAL_SECONDS
         remaining = deadline - time.monotonic()
         if cancelled():
             raise Cancelled()
         if remaining < 5:
-            raise ProbeError("本轮检测超时")
+            raise RoundTimeout()
         correlation_id = attempts.ACTIVE.get()["id"] if attempts.ACTIVE.get() else str(uuid.uuid4())
-        audit_headers = {"X-Sub2API-Comparison-Profile": COMPARISON_PROFILE, "X-Client-Request-Id": correlation_id}
+        audit_headers = {"X-Sub2API-Comparison-Profile": profile, "X-Client-Request-Id": correlation_id}
         attempts.request_snapshot(f"{self.base_url}/api/v1/admin/accounts/{account_id}/test",
                                   audit_headers, {"model_id": model, "prompt": prompt, "mode": "attribution"}, "sub2api-admin-sse")
         try:
@@ -1304,7 +1371,7 @@ class SchedulingControl:
                         if cancelled():
                             raise Cancelled()
                         if time.monotonic() >= deadline:
-                            raise ProbeError("本轮检测超时")
+                            raise RoundTimeout()
                         total += len(raw)
                         if total > MAX_RESPONSE_BYTES:
                             raise ProbeError("测试输出超出限制")
@@ -1319,7 +1386,7 @@ class SchedulingControl:
                         event_type = event.get("type")
                         if event_type == "test_request":
                             data = event.get("data") or {}
-                            validate_comparison_request(data, correlation_id, account_id, model, prompt)
+                            validate_comparison_request(data, correlation_id, account_id, model, prompt, reasoning_effort)
                             upstream_id = data.get("upstream_attempt_id")
                             if not isinstance(upstream_id, str) or not upstream_id:
                                 raise ProbeError("网关缺少上游尝试关联 ID")
@@ -1327,7 +1394,7 @@ class SchedulingControl:
                             seen_request = True
                         elif event_type == "test_response":
                             data = event.get("data") or {}
-                            if (data.get("client_request_id") != correlation_id or data.get("profile") != COMPARISON_PROFILE
+                            if (data.get("client_request_id") != correlation_id or data.get("profile") != profile
                                     or data.get("upstream_attempt_id") not in upstream_attempts):
                                 raise ProbeError("网关响应与请求尝试不匹配")
                             seen_response = (data.get("details") or {}).get("http_status") == 200
@@ -1336,7 +1403,7 @@ class SchedulingControl:
                             if isinstance(text, str):
                                 pieces.append(text)
                         elif event_type == "error":
-                            raise ProbeError("账号测试失败")
+                            raise ProbeError("上游返回处理错误，本轮未完成；详细响应已保存在本轮尝试记录", "upstream_error")
                         elif event_type == "test_complete":
                             complete = event.get("success") is True
                             if not complete:
@@ -1347,6 +1414,8 @@ class SchedulingControl:
         except ProbeError:
             raise
         except requests.RequestException as exc:
+            if time.monotonic() >= deadline:
+                raise RoundTimeout() from None
             raise ProbeError(transport_failure_message(exc, min(PROBE_READ_TIMEOUT, remaining))) from None
         if not seen_request or not seen_response:
             raise ProbeError("账号测试缺少完整请求关联信息")
@@ -1468,6 +1537,9 @@ def create_app(store, accounts, authenticate):
         if not meta:
             return jsonify(error="账号不存在"), 404
         previous = store.get(account_id)
+        reasoning_effort = body.get("reasoning_effort", previous["reasoning_effort"] if previous else "xhigh")
+        if reasoning_effort not in REASONING_EFFORTS:
+            return jsonify(error="推理等级请选择 low、medium、high 或 xhigh"), 400
         model = body.get("model", previous["model"] if previous else "")
         if not isinstance(model, str) or len(model) > 160:
             return jsonify(error="模型无效"), 400
@@ -1484,12 +1556,13 @@ def create_app(store, accounts, authenticate):
         if body["enabled"]:
             # Allow cancelling automatic action even if the account became unavailable.
             cancelling_only = (previous and previous["enabled"] and previous["model"] == model
+                               and previous["reasoning_effort"] == reasoning_effort
                                and not auto_pause and threshold == previous["auto_pause_threshold"])
             if unavailable(meta) and not cancelling_only:
                 return jsonify(error=unavailable(meta)), 400
             if model not in model_choices(meta) and not cancelling_only:
                 return jsonify(error="请选择指纹库已收录且账号支持的模型"), 400
-        store.configure(account_id, body["enabled"], model, auto_pause, threshold, interval_minutes, challenge_count)
+        store.configure(account_id, body["enabled"], model, auto_pause, threshold, interval_minutes, challenge_count, reasoning_effort)
         return jsonify(account=render(account_id, meta))
 
     @app.put("/accounts/<int:account_id>/prompt-test")
@@ -1501,6 +1574,9 @@ def create_app(store, accounts, authenticate):
         if not meta:
             return jsonify(error="账号不存在"), 404
         previous = store.get_prompt(account_id)
+        reasoning_effort = body.get("reasoning_effort", previous["reasoning_effort"] if previous else "xhigh")
+        if reasoning_effort not in REASONING_EFFORTS:
+            return jsonify(error="推理等级请选择 low、medium、high 或 xhigh"), 400
         test_mode = body.get("test_mode", previous["test_mode"] if previous else "attribution")
         if test_mode not in ("attribution", "qa"):
             return jsonify(error="请选择问答测试或数字归因模板"), 400
@@ -1548,7 +1624,7 @@ def create_app(store, accounts, authenticate):
             ):
                 return jsonify(error="请选择此账号支持的模型"), 400
         store.configure_prompt(account_id, body["enabled"], model.strip(), prompt,
-                               auto_pause, threshold, interval_minutes, challenge_count, test_mode, cases)
+                               auto_pause, threshold, interval_minutes, challenge_count, test_mode, cases, reasoning_effort)
         return jsonify(account=render(account_id, meta))
 
     @app.get("/accounts/<int:account_id>/prompt-test/results/<int:result_id>/artifacts/<case_id>")

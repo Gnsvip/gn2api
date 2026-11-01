@@ -38,7 +38,7 @@ def test_cancelled_round_keeps_response_already_received(store):
     configure(store)
     job = prompt_claim(store)
     control = Answers("21")
-    def changed(*args):
+    def changed(*args, **kwargs):
         store.configure_prompt(7, False, "gpt-6.1-sol", s.DEFAULT_PROMPT)
         return "21"
     control.prompt = changed
