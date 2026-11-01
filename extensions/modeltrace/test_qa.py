@@ -57,14 +57,14 @@ def test_qa_skips_disabled_question_and_sends_prompt_unchanged(store):
 @pytest.mark.parametrize("answers,status,count", [
     (["21"], "green", 1),
     (["２１\n"], "green", 1),
-    (["121", "121"], "red", 2),
-    (["29", "29"], "red", 2),
-    (["29", "21"], "yellow", 2),
-    (["29", "20"], "yellow", 2),
+    (["121", "121"], "red", 1),
+    (["29", "29"], "red", 1),
+    (["29", "21"], "red", 1),
+    (["29", "20"], "red", 1),
     ([""], "yellow", 1),
     ([s.ProbeError("本轮超时")], "yellow", 1),
 ])
-def test_qa_complete_answer_and_confirmation(store, answers, status, count):
+def test_qa_complete_answer_once_even_when_an_unused_second_answer_differs(store, answers, status, count):
     configure(store)
     result = s.run_prompt_round(prompt_claim(store), store, FakeAccounts(), Answers(*answers))
     assert result["status"] == status and result["requests"] == count
@@ -72,7 +72,7 @@ def test_qa_complete_answer_and_confirmation(store, answers, status, count):
 
 def test_qa_partial_round_error_never_pauses(store):
     configure(store, [question("first"), question("second")], auto_pause_enabled=True, auto_pause_threshold=1)
-    control = Answers("29", "29", s.ProbeError("请求失败"))
+    control = Answers("29", s.ProbeError("请求失败"))
     job = prompt_claim(store)
     result = s.run_prompt_round(job, store, FakeAccounts(), control)
     assert result["status"] == "yellow" and result["cases"][0]["status"] == "red"

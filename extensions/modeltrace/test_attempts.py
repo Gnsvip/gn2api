@@ -9,15 +9,17 @@ from test_service import FakeAccounts, claim, prompt_claim, store
 from test_qa import Answers, configure, question
 
 
-def test_retest_preserves_both_answers_and_full_output(store):
+def test_separate_rounds_preserve_each_single_answer_without_overwriting(store):
     configure(store)
     job = prompt_claim(store)
-    result = s.run_prompt_round(job, store, FakeAccounts(), Answers("29", "21"))
+    result = s.run_prompt_round(job, store, FakeAccounts(), Answers("29"))
     store.finish_prompt(job, result)
     case = result["cases"][0]
     assert case["answer_preview"] == "29"
-    assert [a["output"] for a in case["attempts"]] == ["29", "21"]
-    saved = attempts.listing(store, 7, run_id=result["run_id"])["attempts"]
+    assert [a["output"] for a in case["attempts"]] == ["29"]
+    next_job = prompt_claim(store)
+    store.finish_prompt(next_job, s.run_prompt_round(next_job, store, FakeAccounts(), Answers("21")))
+    saved = attempts.listing(store, 7)["attempts"]
     records = [attempts.detail(store, 7, a["attempt_id"]) for a in saved]
     assert [next(e['payload']['output'] for e in r['events'] if e['kind'] == 'finished') for r in records] == ['21', '29']
     assert len({a["attempt_id"] for a in saved}) == 2
@@ -101,22 +103,21 @@ def test_bank_cannot_confirm_identity_in_new_conditions(monkeypatch):
         "results": [{"model": "gpt-5.6-luna", "probability": .99999}, {"model": "gpt-6-astra", "probability": .00001}],
         "probability": .99999, "prediction": "gpt-5.6-luna", "used_outputs": 3})
     result = s.summarize([{}, {}, {}], "gpt-6-astra")
-    assert result["status"] == "yellow" and not result["confident"]
+    assert result["status"] == "red" and not result["confident"]
     assert result["bank_applicability"] == "unverified" and result["candidate_separated"]
     assert result['outcome'] == 'candidate_mismatch'
     assert 'gpt-5.6-luna' in result['message']
 
 
-@pytest.mark.parametrize('second,score,expected', [('gpt-5.6-luna', .99999, 'red'),
-                                                  ('gpt-6-astra', .99999, 'yellow'),
+@pytest.mark.parametrize('prediction,score,expected', [('gpt-5.6-luna', .99999, 'red'),
+                                                  ('gpt-6-astra', .99999, 'green'),
                                                   ('gpt-5.6-luna', .55, 'yellow')])
-def test_unverified_candidate_mismatch_gets_independent_confirmation_but_never_auto_pauses(store, monkeypatch, second, score, expected):
+def test_single_batch_compares_candidates_and_respects_opt_in_pause(store, monkeypatch, prediction, score, expected):
     from test_service import FakeControl
     store.configure(7, True, 'gpt-6-astra', True, 1, challenge_count=1)
     scored = []
     def analyze(outputs, bank):
-        prediction = 'gpt-5.6-luna' if not scored else second
-        probability = .99999 if not scored else score
+        probability = score
         scored.append(outputs)
         return {'results': [{'model':prediction,'probability':probability},
                             {'model':'other','probability':1-probability}],
@@ -128,15 +129,16 @@ def test_unverified_candidate_mismatch_gets_independent_confirmation_but_never_a
         return {'text':f'sample {len(prompts)}'}, model
     job = claim(store)
     result = s.run_round(job, store, FakeAccounts(), '', probe)
-    assert result['status'] == expected and result['requests'] == result['valid_samples'] == 2
-    assert len(result['stages']) == len(result['confirmation']) == 2
-    assert len(set(prompts)) == 2 and scored[0] != scored[1]
-    assert result['budget_seconds'] == 1200
+    assert result['status'] == expected and result['requests'] == result['valid_samples'] == 1
+    assert len(result['stages']) == 1 and 'confirmation' not in result
+    assert len(prompts) == len(scored) == 1
+    assert result['budget_seconds'] == 720
     assert not result['confident'] and result['bank_applicability'] == 'unverified'
     store.finish(job, result)
     controller = FakeControl()
     store.apply_pending_pause(FakeAccounts(), controller)
-    assert controller.calls == [] and store.get(7)['mismatch_streak'] == 0
+    assert controller.calls == ([7] if expected == 'red' else [])
+    assert store.get(7)['mismatch_streak'] == (1 if expected == 'red' else 0)
 
 
 def test_large_evidence_is_bounded_on_screen_and_complete_on_download(store):
@@ -274,7 +276,7 @@ def test_comparison_rejects_changed_conditions_and_keeps_evidence(store, change)
 
 
 @pytest.mark.parametrize("prompt", [False, True])
-def test_legacy_pending_attribution_never_pauses_without_valid_bank(store, prompt):
+def test_pending_pause_without_a_recorded_mismatch_is_cancelled(store, prompt):
     from test_service import FakeControl
     table = "prompt_monitors" if prompt else "monitors"
     streak = "failure_streak" if prompt else "mismatch_streak"

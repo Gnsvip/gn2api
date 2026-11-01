@@ -83,15 +83,18 @@
     if (result.test_mode !== 'qa') {
       if (result.outcome === 'candidate_mismatch_confirmed') return `候选复测不符 · ${result.prediction}`;
       if (result.outcome === 'candidate_unstable') return '候选不稳定';
+      if (result.outcome === 'candidate_match') return `候选相符 · ${result.prediction}`;
+      if (result.outcome === 'candidate_ambiguous') return '候选分数未拉开';
       if (result.outcome === 'candidate_mismatch' || (result.outcome === 'bank_unverified'
           && result.candidate_separated && result.prediction && result.prediction !== result.expected)) {
-        return `候选不符 · ${result.prediction}（未完成复测）`;
+        return `候选不符 · ${result.prediction}${result.sampling_policy === 'single-pass-v1' ? '' : '（历史单轮结果）'}`;
       }
     }
     if (result.status === 'green') return result.test_mode === 'qa' ? '通过' : '与预期一致';
     if (result.status === 'red') return result.test_mode === 'qa' ? '未通过' : '复测仍不符';
     const titles = { round_timeout: '检测超时', upstream_error: '上游错误', insufficient_samples: '样本不足',
-      bank_unverified: '指纹库未校准', capability_unavailable: '接口不支持此档位' };
+      bank_unverified: '指纹库未校准', capability_unavailable: '接口不支持此档位',
+      output_limit: '回答文本超限', stream_limit: '传输数据超限', artifact_limit: '作品过大', artifact_format: '作品格式不正确' };
     if (titles[result.outcome]) return titles[result.outcome];
     // Old results retain their original evidence; only their display label changes.
     if (/超时/.test(result.message || '')) return '检测超时';
@@ -112,7 +115,7 @@
     `本轮请求：${result.requests || 0} 次`, result.message,
     ...(result.cases || []).map(item => item.kind === 'manual'
       ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
-      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer} · 已保存 ${item.attempts?.length || 0} 次完整回答`),
+      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer} · 本题请求：${item.requests ?? item.attempts?.length ?? 0} 次`),
     result.manual_reviewed && '人工评分只更新历史记录，不追溯触发自动停调度',
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
@@ -124,7 +127,7 @@
     typeof result.requests === 'number' && `本轮请求：${result.requests} 次`,
     typeof result.challenge_count === 'number' && `挑战设置：${result.challenge_count} 次`,
     typeof result.valid_samples === 'number' && `有效挑战回答：${result.valid_samples} 份；数字样本不足：${result.insufficient_samples || 0} 次`,
-    result.message, result.bank_applicability === 'unverified' && '校准状态：未校准；候选比较照常显示，不据此自动停调度', '候选分数不是模型身份概率'
+    result.message, result.bank_applicability === 'unverified' && '指纹适用性：当前条件未验证（不影响候选比较）', '候选分数不是模型身份概率'
   ].filter(Boolean).join('\n');
 
   async function apiResponse(path, options = {}) {
@@ -176,13 +179,26 @@
 
   function answerControls(id, result) {
     const links = el('div', 'mt-answer-links');
+    const shortAnswers = el('div', 'mt-answer-links');
     for (const item of result.cases || []) {
       if (item.kind === 'manual') continue;
       const answers = item.attempts?.length ? item.attempts : item.answer_preview
-        ? [{ output: item.answer_preview, legacy: true }] : [];
+        ? [{ output: item.answer_preview, output_truncated: item.answer_truncated, legacy: true }] : [];
       answers.forEach((answer, i) => {
-        const summaryOnly = answer.output_truncated && !answer.evidence_saved;
-        const title = `${item.name} · ${answer.legacy ? '历史末次回答（旧记录未保存完整原文）' : `第 ${i + 1} 次${summaryOnly ? '回答摘要（本轮未重复采证）' : '完整回答'}`}`;
+        const output = answer.output || '', turn = answers.length > 1 ? `第 ${i + 1} 次` : '';
+        if (!answer.output_truncated && output.trim().length <= 80 && output.trim().split('\n').length <= 3) {
+          shortAnswers.append(el('p', 'mt-note', `${item.name} · ${turn}回答：${output.trim()}`));
+          return;
+        }
+        const summaryOnly = (answer.output_truncated || answer.legacy) && !answer.evidence_saved;
+        if (summaryOnly) {
+          const summary = el('details', 'mt-answer-summary');
+          summary.append(el('summary', 'mt-note', `${item.name} · ${turn}回答摘要（本轮未重复保存原文）`),
+            el('pre', 'mt-answer-text', output),
+            el('p', 'mt-note', `仅保留前 ${output.length} 字${answer.output_chars ? `，原回答 ${answer.output_chars} 字` : ''}。已保存的正常/首次异常原文可在全部尝试记录中查看。`));
+          links.append(summary); return;
+        }
+        const title = `${item.name} · ${turn}完整回答`;
         const button = el('button', 'mt-link', title); button.type = 'button';
         button.onclick = async () => {
           button.disabled = true;
@@ -194,7 +210,7 @@
         }; links.append(button);
       });
     }
-    return links;
+    return { links, shortAnswers };
   }
 
   function evidenceButton(id, runId) {
@@ -592,8 +608,8 @@
     select.disabled = !state.available;
     label.append(select);
     const effort = effortField(state.reasoning_effort, '归因推理等级');
-    const budgetNote = el('p', 'mt-note', '初测最多 12 分钟；需要补采或复测时，整轮最多 20 分钟。若检测超过设置的间隔，完成后再等一个间隔，避免连续补跑。修改推理等级会取消旧轮次后续请求；已发出的请求可能已计费。');
-    const bankNote = el('p', 'mt-note', '当前指纹库未记录建库推理等级，尚未完成各档位校准。结果仅展示候选，不作为模型身份结论，也不触发归因自动停调度。');
+    const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟，只跑一轮，不自动补采或复测。若检测超过设置的间隔，完成后再等一个间隔，避免连续补跑。修改推理等级会取消旧轮次后续请求；已发出的请求可能已计费。');
+    const bankNote = el('p', 'mt-note', '当前指纹库尚未完成各档位校准，候选分数不证明实际型号。开启自动停止后，仍按你设置的连续不符轮数停止调度。');
     const mapping = el('p', 'mt-note');
     const refreshMapping = () => {
       const mapped = state.mapping[select.value];
@@ -616,17 +632,18 @@
       const minutes = Number(interval.value);
       const count = Number(challengeCount.value);
       estimate.textContent = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
-        ? `通常 ${count} 次 / 轮，补采或复测最多 ${count * 2} 次 / 轮；通常约 ${Math.round(1440 * count / minutes)} 次请求 / 天。` : '';
+        ? `每轮最多 ${count} 次，不自动复测；通常约 ${Math.round(1440 * count / minutes)} 次请求 / 天。` : '';
     };
     interval.addEventListener('input', refreshEstimate); refreshEstimate();
     challengeCount.addEventListener('change', refreshEstimate);
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '检测说明'),
-      el('p', '', '候选不符会独立复测；两轮分数均拉开且指向同一个非预期候选时标红。校准状态单独显示，未校准的候选不符不触发自动停调度。历史未复测的记录不会补记为已复测，候选分数不证明模型身份。'),
-      el('p', '', '挑战次数可选 1、2、3，默认 3。1 次最省额度，2 次折中，3 次更稳定；较少样本更容易误判。样本不足只补缺少部分，归因不符则用同样份数独立复测。整轮最多为所选次数的 2 倍（3 次模式整轮最多 6 次请求）；无法凑齐所选份数或完成复测记黄点，不触发自动停调度。'),
-      el('p', '', '自动停止只计连续红点，绿点或黄点清零。更改次数、策略或模型后重新计数。更改次数会取消旧轮次的后续请求和结果，下一轮仍按原计划执行；已发出的请求可能已计费。停止后当前业务请求继续，检测暂停，恢复调度需手动操作。'),
+      el('p', '', '一轮候选分数拉开后，与请求模型不符即标红，相符标绿；分数未拉开或样本不足标黄。这些颜色表示候选比较，不是型号认证。开启自动停止后，连续红点达到设置轮数即停止调度，不受校准提示阻拦。'),
+      el('p', '', '挑战次数可选 1、2、3，默认 3，设置几次最多就发几次；样本不足不追加请求。校准需要已知型号在相同档位、指令、上下文及传输条件下采样，并通过独立样本验证误判率，不能靠同一待测账号反复出现同一候选来校准。'),
+      el('p', '', '自动停止只计连续红点，绿点或黄点清零。连续 3 轮与每轮 3 个挑战是两个设置，一轮最多累计 1 次不符。更改次数、策略或模型后重新计数。更改次数会取消旧轮次的后续请求和结果，下一轮仍按原计划执行；已发出的请求可能已计费。停止后当前业务请求继续，检测暂停，恢复调度需手动操作。'),
       el('p', '', '间隔支持 1–1440 分钟。仅改间隔不打断当前检测，下一轮从保存时重新计时。关闭页面仍会检测，繁忙时可能延后。'),
-      el('p', '', '模型列表仅显示账号可用且指纹库已收录的模型。首次选择优先 gpt-6-astra，保留已有设置；当前库尚未收录 gpt-6.1-sol。'));
+      el('p', '', '模型列表仅显示账号可用且指纹库已收录的模型。首次选择优先 gpt-6-astra，保留已有设置；当前库尚未收录 gpt-6.1-sol。'),
+      el('p', '', '删除账号后会自动清理该账号的扩展设置、测试记录、留证和作品；停用或限流不会删除记录。清理在检测轮次之间执行。'));
     const reason = el('p', 'mt-note', state.reason || '');
     const policy = el('div', 'mt-policy');
     const autoLabel = el('label');
@@ -639,7 +656,7 @@
     threshold.setAttribute('aria-label', '连续不符轮数');
     const policyFields = el('div', 'mt-policy-fields'); policyFields.hidden = !auto.checked;
     auto.addEventListener('change', () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; });
-    thresholdLabel.append(threshold, document.createTextNode('轮复测不符后停止'));
+    thresholdLabel.append(threshold, document.createTextNode('轮不符后停止'));
     const progress = el('p', 'mt-note', `当前连续不符 ${state.mismatch_streak || 0} / ${state.auto_pause_threshold || 3} 轮 · 仅计红点`);
     policyFields.append(thresholdLabel, progress);
     policy.append(autoLabel, policyFields);
@@ -774,7 +791,9 @@
       code.value = data.html;
       originalPrompt.textContent = data.prompt || '';
       const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
-      frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + policy + '"><meta name="referrer" content="no-referrer"></head><body>' + data.html + '</body></html>';
+      const preview = Object.hasOwn(data, 'preview_html') ? data.preview_html : data.html;
+      if (typeof preview !== 'string') throw new Error(data.preview_error || '未找到可预览的完整 HTML / SVG；可展开源码查看原回答。');
+      frame.srcdoc = '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="' + policy + '"><meta name="referrer" content="no-referrer"></head><body>' + preview + '</body></html>';
       status.textContent = item.message || '待人工确认';
       reviewButtons.forEach(node => { node.disabled = false; });
     } catch (failure) { if (dialog.open) error.textContent = failure.message; }
@@ -869,7 +888,7 @@
     model.value = preferredModel(choices, promptState.model || state.model);
     model.setAttribute('aria-label', '测试模型'); modelLabel.append(model);
     const effort = effortField(promptState.reasoning_effort, '题目推理等级');
-    const budgetNote = el('p', 'mt-note', '初测最多 12 分钟，补采或复测时整轮最多 20 分钟。修改推理等级会取消旧轮次后续请求。数字归因仍需匹配对应档位的指纹库校准条件；问答按所设答案判断。');
+    const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟；每题一次，数字归因按所选次数运行，不自动补采或复测。修改推理等级会取消旧轮次后续请求。数字归因仍需匹配对应档位的指纹库校准条件；问答按所设答案判断。');
     const promptLabel = el('label', 'mt-prompt-label', '测试提示词模板');
     const prompt = el('textarea'); prompt.maxLength = 4000; prompt.value = promptState.prompt || '{{challenge}}';
     prompt.setAttribute('aria-label', '测试提示词'); promptLabel.append(prompt);
@@ -887,9 +906,9 @@
     const refreshEstimate = () => {
       const selected = (editor?.values() || []).filter(item => item.enabled);
       const minutes = Number(interval.value), samples = mode.value === 'qa' ? selected.length : Number(challenges.value);
-      const maximum = mode.value === 'qa' ? selected.reduce((sum, item) => sum + (item.kind === 'manual' ? 1 : 2), 0) : samples * 2;
+      const maximum = samples;
       estimate.textContent = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
-        ? `通常 ${samples} 次 / 轮，${mode.value === 'qa' ? '含不符复测' : '补采或复测'}最多 ${maximum} 次 / 轮；每天通常约 ${Math.ceil(1440 / minutes) * samples} 次，最多约 ${Math.ceil(1440 / minutes) * maximum} 次，会消耗账号额度。` : '';
+        ? `每轮最多 ${maximum} 次，不自动复测；每天最多约 ${Math.ceil(1440 / minutes) * maximum} 次，会消耗账号额度。` : '';
     };
     const initialCases = promptState.cases?.length || mode.value === 'qa' ? (promptState.cases || []) : (promptState.qa_presets || []);
     editor = qaEditor(initialCases, promptState.qa_presets, refreshEstimate);
@@ -914,10 +933,11 @@
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '测试说明'),
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
-      el('p', '', '归因模式：候选不符会独立复测；两轮分数均拉开且指向同一个非预期候选时标红。未复测、区分度不足或复测不稳定记黄。校准状态单独显示，未校准的候选不符不触发自动停调度；历史绿点不证明模型身份。'),
-      el('p', '', '问答模式：绿表示所选题目全部符合预期；黄表示请求失败、未完成或复测不稳定；红表示至少一题两次返回同一非预期答案，且本轮没有黄色结果。问答颜色不证明模型身份。每道开启的题每轮发一次，不符时最多复测一次。'),
+      el('p', '', '归因模式：按设置的挑战次数只跑一轮，候选分数拉开且不符标红，相符标绿；样本不足或分数未拉开标黄。候选比较不认证实际型号；开启自动停止后，连续不符达到设置轮数仍会停止调度。'),
+      el('p', '', '问答模式：每道开启的题只请求一次，不符也不复测。绿表示全部符合预期；红表示至少一题不符，且本轮没有未完成题；黄表示请求失败、未完成或待人工评分。问答颜色不证明模型身份。'),
       el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“预览并评分”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
-      el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'));
+      el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'),
+      el('p', '', '删除账号后自动清理其测试记录、留证和作品；清理在检测轮次之间执行，停用或限流不会触发删除。'));
     const history = el('ul', 'mt-history mt-prompt-history');
     const historyHead = el('div', 'mt-section-head'); historyHead.append(el('span', '', '最近测试结果'), evidenceButton(id));
     const historyItems = [];
@@ -939,7 +959,8 @@
         summary.title = resultLabel(result); resultDescription.textContent = description(result);
       };
       refreshResult(); details.append(summary, resultDescription);
-      if (result.test_mode === 'qa') details.append(answerControls(id, result));
+      const answers = result.test_mode === 'qa' ? answerControls(id, result) : null;
+      if (answers) details.append(answers.links);
       if (result.run_id) details.append(evidenceButton(id, result.run_id));
       for (const entry of result.cases || []) {
         if (entry.kind !== 'manual' || !entry.artifact_available || !result.result_id) continue;
@@ -948,7 +969,9 @@
           result.cases.find(current => current.id === entry.id), updated => { result = updated; refreshResult(); }));
         details.append(preview);
       }
-      item.append(details); history.append(item); historyItems.push(item);
+      item.append(details);
+      if (answers) item.append(answers.shortAnswers);
+      history.append(item); historyItems.push(item);
     }
     const empty = el('p', 'mt-note', historyItems.length ? '' : '暂无测试记录');
     const error = el('p', 'mt-error mt-save-error');

@@ -16,9 +16,10 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261102-evidence-pair'
+VERSION = '20261102-single-pass-2'
 FILES = ['service.py', 'attempts.py', 'evidence.py', 'test_evidence.py', 'test_attempts.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
-         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py', 'CALIBRATION.md']
+         'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py',
+         'test_single_pass.py', 'test_lifecycle.py', 'CALIBRATION.md']
 
 
 def digest(path):
@@ -117,7 +118,10 @@ def main():
     report = dict(mode='read-only preflight', service_sha256=current_hash,
                   script_version=VERSION, gateway_compatible=True,
                   changes=['independent extension files', 'retain first normal/anomaly evidence only; no SSE or Base64 recording',
-                           'candidate mismatch confirmation and bounded record browsing', 'nginx script version and 128k body limit'])
+                           'single batch attribution and one request per question; 720-second round budget',
+                           'honor opt-in candidate-mismatch pause thresholds; clean deleted-account records between rounds',
+                           'separate answer and stream limits; inline short answers; extract legacy HTML/SVG previews',
+                           'nginx script version and 128k body limit'])
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not args.apply:
         return
@@ -187,7 +191,7 @@ def main():
             raise RuntimeError('unrelated protected file changed')
         report = dict(status='ok', backup=str(backup), script_version=VERSION,
                       service_sha256=digest(TARGET / 'service.py'), script_sha256=digest(JS),
-                      old_attribution_preserved=True, old_prompt_tests_preserved=True,
+                      history_preserved_during_migration=True, deleted_account_cleanup_enabled=True,
                       protected_services_not_restarted=True)
         (TARGET / 'prompt-test-upgrade.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(json.dumps(report), flush=True)

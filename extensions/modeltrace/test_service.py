@@ -20,6 +20,9 @@ class FakeAccounts:
     def metadata(self, ids):
         return {i: dict(id=i, platform='openai', type='oauth', status='active', schedulable=True, mapping={}) for i in ids}
 
+    def existing_ids(self, ids):
+        return set(ids)
+
     def get(self, id):
         self.reads.append(id)
         return copy.deepcopy(self.account)
@@ -266,7 +269,7 @@ def test_apikey_protocol_override_and_proxy_no_fallback():
         s.proxy_url(a)
 
 
-def test_round_stays_on_one_account_and_caps_retest(store, monkeypatch):
+def test_round_stays_on_one_account_and_uses_one_batch(store, monkeypatch):
     store.configure(7, True, 'gpt-6-sol')
     job = claim(store)
     accounts, calls = FakeAccounts(), []
@@ -276,14 +279,14 @@ def test_round_stays_on_one_account_and_caps_retest(store, monkeypatch):
     monkeypatch.setattr(s, 'summarize', lambda outputs, model: dict(status='yellow', confident=True, prediction='gpt-5.4', probability=.99))
     result = s.run_round(job, store, accounts, '0.163.0', fake_probe)
     assert result['status'] == 'red'
-    assert len(calls) == 6
+    assert len(calls) == 3
     assert set(calls) == {(7, 'gpt-6-sol')}
     assert set(accounts.reads) == {7}
-    assert result['valid_samples'] == 6 and result['insufficient_samples'] == 0
+    assert result['valid_samples'] == 3 and result['insufficient_samples'] == 0
 
 
 @pytest.mark.parametrize('failed_calls', [set(), {2}, {1, 3}, {1, 3, 5}])
-def test_sample_replacement_preserves_successes_and_stops_when_three_ready(store, monkeypatch, failed_calls):
+def test_insufficient_sample_never_adds_replacement_requests(store, monkeypatch, failed_calls):
     store.configure(7, True, 'gpt-6-sol')
     calls, scored, deadlines = [], [], []
     def fake_probe(a, model, challenge, cancelled, deadline, version):
@@ -297,31 +300,31 @@ def test_sample_replacement_preserves_successes_and_stops_when_three_ready(store
         return dict(status='green', confident=True, prediction=model, probability=.99)
     monkeypatch.setattr(s, 'summarize', summarize)
     result = s.run_round(claim(store), store, FakeAccounts(), '0.163.0', fake_probe)
-    assert result['status'] == 'green'
-    assert result['requests'] == len(calls) == 3 + len(failed_calls)
-    assert result['valid_samples'] == 3 and result['insufficient_samples'] == len(failed_calls)
-    assert [[o['text'] for o in outputs] for outputs in scored] == [
-        [str(i) for i in range(1, len(calls) + 1) if i not in failed_calls]]
+    assert result['status'] == ('yellow' if failed_calls else 'green')
+    assert result['requests'] == len(calls) == 3
+    failed = len(failed_calls & {1, 2, 3})
+    assert result['valid_samples'] == 3 - failed and result['insufficient_samples'] == failed
+    assert [[o['text'] for o in outputs] for outputs in scored] == ([] if failed else [['1', '2', '3']])
     assert len({id(c) for c in calls}) == len(calls)  # Each request uses a fresh challenge.
-    assert len(set(deadlines)) == (2 if failed_calls else 1)
-    assert max(deadlines) - min(deadlines) == (480 if failed_calls else 0)
+    assert len(set(deadlines)) == 1
+    assert max(deadlines) - min(deadlines) == 0
 
 
-def test_six_attempts_without_three_samples_stay_yellow_and_never_pause(store, monkeypatch):
+def test_one_batch_without_enough_samples_stay_yellow_and_never_pause(store, monkeypatch):
     store.configure(7, True, 'gpt-6-sol', True, 1)
     def fake_probe(a, model, *args):
         raise s.InsufficientSample('有效数字样本不足：识别 10 个，至少需要 165 个')
     monkeypatch.setattr(s, 'summarize', lambda *args: pytest.fail('Incomplete samples must not be scored'))
     job = claim(store)
     result = s.run_round(job, store, FakeAccounts(), '0.163.0', fake_probe)
-    assert result['status'] == 'yellow' and result['requests'] == 6
-    assert result['valid_samples'] == 0 and result['insufficient_samples'] == 6
+    assert result['status'] == 'yellow' and result['requests'] == 3
+    assert result['valid_samples'] == 0 and result['insufficient_samples'] == 3
     assert '0/3' in result['message'] and '识别 10 个' in result['message']
     store.finish(job, result)
     assert store.get(7)['mismatch_streak'] == 0 and store.get(7)['pause_status'] == ''
 
 
-def test_replacement_leaves_insufficient_budget_for_confirmation(store, monkeypatch):
+def test_partial_batch_stays_yellow_without_replacement(store, monkeypatch):
     store.configure(7, True, 'gpt-6-sol', True, 1)
     calls = []
     def fake_probe(a, model, challenge, *args):
@@ -333,20 +336,20 @@ def test_replacement_leaves_insufficient_budget_for_confirmation(store, monkeypa
         status='yellow', confident=True, prediction='gpt-5.4', probability=.99))
     job = claim(store)
     result = s.run_round(job, store, FakeAccounts(), '0.163.0', fake_probe)
-    assert result['status'] == 'yellow' and result['requests'] == len(calls) == 4
-    assert result['valid_samples'] == 3 and result['insufficient_samples'] == 1
-    assert '预算不足' in result['message'] and 'confirmation' not in result
+    assert result['status'] == 'yellow' and result['requests'] == len(calls) == 3
+    assert result['valid_samples'] == 2 and result['insufficient_samples'] == 1
+    assert '不自动补采' in result['message'] and 'confirmation' not in result
     store.finish(job, result)
     assert store.get(7)['mismatch_streak'] == 0 and store.get(7)['pause_status'] == ''
 
 
-def test_incomplete_confirmation_cannot_turn_red(store, monkeypatch):
+def test_mismatch_does_not_depend_on_any_followup_response(store, monkeypatch):
     store.configure(7, True, 'gpt-6-sol', True, 1)
     calls, scored = [], []
     def fake_probe(a, model, challenge, *args):
         calls.append(challenge)
-        if len(calls) == 5:
-            raise s.InsufficientSample('有效数字样本不足')
+        if len(calls) > 3:
+            pytest.fail('No followup request is allowed')
         return {'text': str(len(calls)), 'expected_count': 300}, model
     def summarize(outputs, model):
         scored.append(outputs)
@@ -354,11 +357,11 @@ def test_incomplete_confirmation_cannot_turn_red(store, monkeypatch):
     monkeypatch.setattr(s, 'summarize', summarize)
     job = claim(store)
     result = s.run_round(job, store, FakeAccounts(), '0.163.0', fake_probe)
-    assert result['status'] == 'yellow' and result['requests'] == len(calls) == 6
-    assert len(scored) == 1 and result['valid_samples'] == 5
-    assert '不符复测仅取得 2/3' in result['message']
+    assert result['status'] == 'red' and result['requests'] == len(calls) == 3
+    assert len(scored) == 1 and result['valid_samples'] == 3
+    assert 'confirmation' not in result
     store.finish(job, result)
-    assert store.get(7)['pause_status'] == ''
+    assert store.get(7)['pause_status'] == 'pending'
 
 
 def test_other_probe_errors_are_not_retried_even_after_sample_replacement(store):
@@ -406,16 +409,16 @@ def test_partial_samples_are_never_reused_across_rounds(store, monkeypatch):
     calls = []
     def fake_probe(a, model, *args):
         calls.append(1)
-        if len(calls) % 6 in (1, 2):
+        if len(calls) % 3 in (1, 2):
             return {'text': 'partial-round-success', 'expected_count': 300}, model
         raise s.InsufficientSample('有效数字样本不足')
     monkeypatch.setattr(s, 'summarize', lambda *args: pytest.fail('No round has three valid responses'))
     for _ in range(2):
         job = claim(store)
         result = s.run_round(job, store, FakeAccounts(), '0.163.0', fake_probe)
-        assert result['status'] == 'yellow' and result['requests'] == 6 and result['valid_samples'] == 2
+        assert result['status'] == 'yellow' and result['requests'] == 3 and result['valid_samples'] == 2
         store.finish(job, result)
-    assert len(calls) == 12
+    assert len(calls) == 6
 
 
 def test_disable_between_probes_prevents_next_request(store):
@@ -496,7 +499,7 @@ def test_real_vendor_scoring_accepts_selected_count(count):
     result = s.summarize(outputs, 'gpt-6-sol')
     assert result['samples'] == count
     assert len(result['candidates']) == 3
-    assert result['status'] in ('green', 'yellow')
+    assert result['status'] in ('green', 'yellow', 'red')
     assert s.analyze_global_outputs(outputs, s.BANK)['calibration']['queries'] == str(count)
 
 
@@ -868,10 +871,10 @@ class PromptControl(FakeControl):
 
 @pytest.mark.parametrize('predictions,status,requests', [
     (['gpt-6-sol'], 'green', 2),
-    (['gpt-5.4', 'gpt-5.4'], 'red', 4),
-    (['gpt-5.4', 'gpt-6-sol'], 'yellow', 4),
+    (['gpt-5.4', 'gpt-5.4'], 'red', 2),
+    (['gpt-5.4', 'gpt-6-sol'], 'red', 2),
 ])
-def test_prompt_uses_existing_attribution_with_independent_retest(store, monkeypatch, predictions, status, requests):
+def test_prompt_uses_one_attribution_batch_without_retest(store, monkeypatch, predictions, status, requests):
     store.configure_prompt(7, True, 'gpt-6-sol', '测试前言\n{{challenge}}', challenge_count=2)
     answers = iter(predictions)
     def summarize(outputs, model):
@@ -888,7 +891,7 @@ def test_prompt_uses_existing_attribution_with_independent_retest(store, monkeyp
     assert len(set(p[2] for p in control.prompts)) == requests
 
 
-@pytest.mark.parametrize('text,error,count', [('hello', None, 6), (None, s.ProbeError('等待上游响应超时'), 1)])
+@pytest.mark.parametrize('text,error,count', [('hello', None, 3), (None, s.ProbeError('等待上游响应超时'), 1)])
 def test_prompt_insufficient_and_timeout_stay_yellow(store, text, error, count):
     store.configure_prompt(7, True, 'gpt-6-sol', '{{challenge}}', True, 1)
     control = PromptControl(text, error)
@@ -1015,7 +1018,7 @@ def test_challenge_count_change_cancels_old_result_without_earlier_paid_round(st
 
 @pytest.mark.parametrize('count', [1, 2, 3])
 @pytest.mark.parametrize('outcome', ['match', 'mismatch', 'insufficient', 'replaced_mismatch'])
-def test_selected_challenge_count_controls_requests_and_confirmation(store, monkeypatch, count, outcome):
+def test_selected_challenge_count_is_the_strict_request_limit(store, monkeypatch, count, outcome):
     store.configure(7, True, 'gpt-6-sol', True, 1, challenge_count=count)
     calls, scored = [], []
     def probe(a, model, challenge, *args):
@@ -1031,18 +1034,18 @@ def test_selected_challenge_count_controls_requests_and_confirmation(store, monk
     monkeypatch.setattr(s, 'summarize', summarize)
     job = claim(store)
     result = s.run_round(job, store, FakeAccounts(), '0.163.0', probe)
-    expected_requests = count if outcome == 'match' else count + 1 if outcome == 'replaced_mismatch' else count * 2
+    expected_requests = count
     assert result['requests'] == len(calls) == expected_requests
-    assert result['challenge_count'] == count and result['request_limit'] == count * 2
+    assert result['challenge_count'] == count and result['request_limit'] == count
     assert all(len(outputs) == count for outputs in scored)
     assert len({id(c) for c in calls}) == len(calls)
     if outcome == 'mismatch':
-        assert result['status'] == 'red' and len(scored) == 2
-        assert not {o['text'] for o in scored[0]} & {o['text'] for o in scored[1]}
+        assert result['status'] == 'red' and len(scored) == 1
     elif outcome == 'match':
         assert result['status'] == 'green' and len(scored) == 1
     else:
-        assert result['status'] == 'yellow' and 'confirmation' not in result
+        assert result['status'] == 'yellow' and not scored
+    assert 'confirmation' not in result
     store.finish(job, result)
     control = FakeControl()
     store.apply_pending_pause(FakeAccounts(), control)
@@ -1057,4 +1060,5 @@ def test_selected_count_retains_score_and_margin_thresholds(monkeypatch, count, 
         results=[dict(model='gpt-6-sol', probability=probability), dict(model='gpt-5.4', probability=second)]))
     result = s.summarize([{}] * count, 'gpt-6-sol')
     assert result['candidate_separated'] == (probability >= .8 and probability - second >= .25 and used_delta == 0)
-    assert result['status'] == 'yellow' and result['bank_applicability'] == 'unverified'
+    assert result['status'] == ('green' if result['candidate_separated'] else 'yellow')
+    assert not result['confident'] and result['bank_applicability'] == 'unverified'

@@ -36,7 +36,8 @@ from fingerprint import analyze_global_outputs, generate_challenges, load_bank, 
 COMPARISON_PROFILE = "codex-http-xhigh-v1"
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 ATTRIBUTION_INITIAL_SECONDS = 720
-ATTRIBUTION_MAX_SECONDS = 1200
+ATTRIBUTION_MAX_SECONDS = 720
+SAMPLING_POLICY = 'single-pass-v1'
 COMPARISON_INSTRUCTIONS = "Follow the user's instructions exactly. Do not use tools."
 BANK_COMMIT = "6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2"
 BANK = load_bank(ROOT / "vendor/data/unified_bank.json")
@@ -44,6 +45,7 @@ MODELS = {m["id"]: m for m in BANK["models"]}
 INTERVAL = 600
 MAX_HISTORY = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_STREAM_BYTES = 64 * 1024 * 1024
 PROMPT_MAX_CHARS = 4000
 DEFAULT_PROMPT = "{{challenge}}"
 QA_MAX_CASES = 5
@@ -80,7 +82,7 @@ class RoundTimeout(ProbeError):
 
 
 class InsufficientSample(ProbeError):
-    """A complete response with too few numbers; a new challenge may replace it."""
+    """A complete response with too few numbers; no replacement request is sent."""
     def __init__(self, message):
         super().__init__(message, "insufficient_samples")
 
@@ -315,8 +317,7 @@ class Store:
             context = result.pop("_context", "")
             evidence.commit(db, job, result)
             streak = 0
-            if (current["auto_pause_enabled"] and result.get("status") == "red" and context
-                    and result.get("bank_applicability") == "validated"):
+            if current["auto_pause_enabled"] and result.get("status") == "red" and context:
                 streak = (current["mismatch_streak"] if current["mismatch_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
             result.update(checked_at=now, expected=job["model"], bank_commit=BANK_COMMIT)
@@ -346,8 +347,7 @@ class Store:
             manual_round = job.get("test_mode") == "qa" and any(
                 case.get("enabled") and case.get("kind") == "manual" for case in json.loads(job["cases"]))
             streak = 0
-            if (current["auto_pause_enabled"] and result.get("status") == "red" and context and not manual_round
-                    and (job.get("test_mode") == "qa" or result.get("bank_applicability") == "validated")):
+            if current["auto_pause_enabled"] and result.get("status") == "red" and context and not manual_round:
                 streak = (current["failure_streak"] if current["failure_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
             mode = job.get("test_mode", "attribution")
@@ -416,9 +416,9 @@ class Store:
                 return
             latest = db.execute("SELECT result FROM results WHERE account_id=? ORDER BY id DESC LIMIT 1",
                                 (row["account_id"],)).fetchone()
-            if not latest or json.loads(latest[0]).get("bank_applicability") != "validated":
+            if not latest or json.loads(latest[0]).get("status") != "red":
                 db.execute("""UPDATE monitors SET mismatch_streak=0,mismatch_context='',pause_status='',
-                    pause_retry_at=0,message='指纹库适用性未验证，已取消自动停调度' WHERE account_id=?""",
+                    pause_retry_at=0,message='缺少最新不符结果，已取消自动停调度' WHERE account_id=?""",
                            (row["account_id"],))
                 return
             try:
@@ -437,7 +437,7 @@ class Store:
                     message='停止调度未确认，将在 60 秒后重试；关闭开关可取消' WHERE account_id=?""",
                     (time.time() + 60, row["account_id"]))
                 return
-            message = f"连续 {row['mismatch_streak']} 轮复测仍不符，已停止此账号调度；恢复需手动操作"
+            message = f"连续 {row['mismatch_streak']} 轮不符，已停止此账号调度；恢复需手动操作"
             db.execute("""UPDATE monitors SET pause_status='paused',paused_at=?,pause_message=?,message=?,
                 enabled=0,running=0,generation=generation+1 WHERE account_id=?""",
                 (time.time(), message, message, row["account_id"]))
@@ -453,9 +453,9 @@ class Store:
                 return
             latest = db.execute("SELECT result FROM prompt_results WHERE account_id=? ORDER BY id DESC LIMIT 1",
                                 (row["account_id"],)).fetchone()
-            if row["test_mode"] != "qa" and (not latest or json.loads(latest[0]).get("bank_applicability") != "validated"):
+            if not latest or json.loads(latest[0]).get("status") != "red":
                 db.execute("""UPDATE prompt_monitors SET failure_streak=0,failure_context='',pause_status='',
-                    pause_retry_at=0,message='指纹库适用性未验证，已取消自动停调度' WHERE account_id=?""",
+                    pause_retry_at=0,message='缺少最新不符结果，已取消自动停调度' WHERE account_id=?""",
                            (row["account_id"],))
                 return
             try:
@@ -473,11 +473,39 @@ class Store:
                     message='提示词测试停止调度未确认，将在 60 秒后重试；关闭开关可取消' WHERE account_id=?""",
                     (time.time() + 60, row["account_id"]))
                 return
-            kind = "问答测试复测仍未通过" if row["test_mode"] == "qa" else "提示词归因复测仍不符"
+            kind = "问答测试答案不符" if row["test_mode"] == "qa" else "提示词归因不符"
             message = f"连续 {row['failure_streak']} 轮{kind}，已停止此账号调度；恢复需手动操作"
             db.execute("""UPDATE prompt_monitors SET pause_status='paused',paused_at=?,pause_message=?,message=?,
                 enabled=0,running=0,generation=generation+1 WHERE account_id=?""",
                 (time.time(), message, message, row["account_id"]))
+
+    def cleanup_deleted_accounts(self, accounts):
+        # Run only between probe rounds. Disabled, exhausted, or unschedulable
+        # accounts still exist and must retain their settings and evidence.
+        tables = ('monitors', 'prompt_monitors', 'results', 'prompt_results',
+                  'probe_attempts', 'probe_evidence')
+        with self.db() as db:
+            ids = [r[0] for r in db.execute(' UNION '.join(
+                'SELECT account_id FROM ' + table for table in tables))]
+        removed = 0
+        for offset in range(0, len(ids), 200):
+            batch = ids[offset:offset + 200]
+            with self.action_lock:
+                # An exception aborts this batch; a failed lookup is never an empty list.
+                missing = sorted(set(batch) - accounts.existing_ids(batch))
+                if not missing:
+                    continue
+                marks = ','.join('?' for _ in missing)
+                with self.db() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute('DELETE FROM probe_attempt_events WHERE attempt_id IN '
+                               '(SELECT attempt_id FROM probe_attempts WHERE account_id IN (' + marks + '))', missing)
+                    db.execute('DELETE FROM prompt_artifacts WHERE result_id IN '
+                               '(SELECT id FROM prompt_results WHERE account_id IN (' + marks + '))', missing)
+                    for table in tables:
+                        db.execute('DELETE FROM ' + table + ' WHERE account_id IN (' + marks + ')', missing)
+                removed += len(missing)
+        return removed
 
     def recover(self):
         with self.db() as db:
@@ -556,6 +584,12 @@ class Accounts:
             credentials->>'auth_mode' AS auth_mode
             FROM accounts WHERE id=ANY(%s) AND deleted_at IS NULL""", (ids,))
         return {r["id"]: r for r in rows}
+
+    def existing_ids(self, ids):
+        if not ids:
+            return set()
+        return {r['id'] for r in self.query(
+            'SELECT id FROM accounts WHERE id=ANY(%s) AND deleted_at IS NULL', (ids,))}
 
     def get(self, account_id):
         # Refresh tokens, passwords, email and unrelated credentials are not retrieved.
@@ -656,16 +690,54 @@ def qa_status(cases):
 
 
 def html_artifact(output):
-    # Keep the model's document as data; only unwrap a single complete Markdown fence.
-    text = output.strip()
-    fenced = re.fullmatch(r"```(?:html|svg|xml)?\s*\n(.*?)\n```", text, flags=re.S | re.I)
-    if fenced:
-        text = fenced.group(1).strip()
-    if not text:
-        raise ProbeError("模型未返回可预览的内容")
-    if len(text.encode("utf-8")) > MAX_ARTIFACT_BYTES:
-        raise ProbeError("生成内容超过 512 KiB 预览上限，本题待确认")
-    return text
+    # Read documents as data, including legacy tool-call JSON. Never execute commands.
+    candidates = []
+    for match in list(re.finditer(r'(?m)^\s*\{', output))[:16]:
+        try:
+            value, _ = json.JSONDecoder().raw_decode(output[match.start():].lstrip())
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            candidates.extend(value[key] for key in ('cmd', 'command', 'input', 'html')
+                              if isinstance(value.get(key), str))
+    candidates.append(output)
+    for candidate in candidates:
+        fenced = re.findall(r'```(?:html|svg|xml)?[ \t]*\n(.*?)\n```', candidate, re.S | re.I)
+        for source in [*fenced, candidate]:
+            match = re.search(r'(?im)^\s*((?:<!doctype\s+html[^>]*>\s*)?<html\b[\s\S]*?</html\s*>|<svg\b[\s\S]*?</svg\s*>|<svg\b[^>]*?/>)', source)
+            if match:
+                text = match[1].strip()
+                if len(text.encode('utf-8')) > MAX_ARTIFACT_BYTES:
+                    raise ProbeError('生成作品超过 512 KiB 预览上限', 'artifact_limit')
+                return text
+    raise ProbeError('模型未返回完整 HTML / SVG 作品；说明或工具调用文本不能作为画面预览', 'artifact_format')
+
+
+def manual_preview_prompt(prompt):
+    return prompt + ('\n\n预览输出要求：直接返回一个完整、可独立打开的 HTML 文档或 SVG，'
+                     '将 CSS 和 JavaScript 内联。不要调用工具、创建文件、给出命令或解释，'
+                     '不要输出工具调用记录。你的回复本身就是要预览的作品。')
+
+
+class AnswerText:
+    """Bound decoded answer bytes independently of transport/audit overhead."""
+    def __init__(self):
+        self.parts = []
+        self.bytes = 0
+
+    def append(self, text):
+        if not isinstance(text, str):
+            raise ProbeError('上游返回了无效的文本内容')
+        self.bytes += len(text.encode('utf-8'))
+        if self.bytes > MAX_RESPONSE_BYTES:
+            raise ProbeError('最终回答超过 2 MiB 文本上限', 'output_limit')
+        self.parts.append(text)
+
+    def __bool__(self):
+        return bool(self.parts)
+
+    def text(self):
+        return ''.join(self.parts)
 
 
 def validate_prompt_template(prompt):
@@ -824,7 +896,7 @@ def stream_failure_message(event):
 
 
 def read_stream(response, protocol, cancelled, deadline):
-    pieces, received, complete = [], 0, False
+    pieces, received, complete = AnswerText(), 0, False
     for raw in response.iter_lines(chunk_size=256):
         attempts.stream_line(raw, limit=MAX_RESPONSE_BYTES)
         if cancelled():
@@ -832,8 +904,8 @@ def read_stream(response, protocol, cancelled, deadline):
         if time.monotonic() > deadline:
             raise RoundTimeout()
         received += len(raw)
-        if received > MAX_RESPONSE_BYTES:
-            raise ProbeError("检测输出超出限制")
+        if received > MAX_STREAM_BYTES:
+            raise ProbeError('流式传输超过 64 MiB 上限', 'stream_limit')
         if not raw.startswith(b"data:"):
             continue
         data = raw[5:].strip()
@@ -856,8 +928,10 @@ def read_stream(response, protocol, cancelled, deadline):
                 if result.get("status") not in (None, "completed") or result.get("error"):
                     raise ProbeError("上游响应未完整结束")
                 if not pieces:
-                    pieces.extend(part.get("text", "") for item in result.get("output", [])
-                                  for part in item.get("content", []) if part.get("type") == "output_text")
+                    for item in result.get("output", []):
+                        for part in item.get("content", []):
+                            if part.get("type") == "output_text":
+                                pieces.append(part.get("text", ""))
                 complete = True
                 break
         elif protocol == "anthropic":
@@ -877,7 +951,7 @@ def read_stream(response, protocol, cancelled, deadline):
                     complete = True
     if not complete or not pieces:
         raise ProbeError("流式响应中断或没有有效文本")
-    return "".join(pieces)
+    return pieces.text()
 
 
 def transport_failure_message(error, read_timeout):
@@ -950,17 +1024,17 @@ def summarize(outputs, model):
     separated = (1 <= result["used_outputs"] <= 3 and result["used_outputs"] == len(outputs)
                  and probability >= CONFIDENCE and margin >= MARGIN)
     confident = False
-    status = "yellow"
     mismatch = separated and result["prediction"] != model
+    status = 'red' if mismatch else 'green' if separated else 'yellow'
     return {"status": status, "prediction": result["prediction"], "probability": probability,
             "confident": confident, "samples": result["used_outputs"],
             "analysis": result, "candidate_separated": separated, "bank_applicability": "unverified",
             "comparison_profile": COMPARISON_PROFILE,
             "bank_sha256": hashlib.sha256((ROOT / "vendor/data/unified_bank.json").read_bytes()).hexdigest(),
             "candidates": [{"model": c["model"], "probability": c["probability"]} for c in candidates[:3]],
-            "outcome": "candidate_mismatch" if mismatch else "bank_unverified",
-            "message": (f"候选不符：{result['prediction']}，待独立复测；指纹库未校准" if mismatch else
-                        "指纹库未校准：仅展示候选，不判定模型身份")}
+            "outcome": "candidate_mismatch" if mismatch else "candidate_match" if separated else "candidate_ambiguous",
+            "message": (f"候选与请求模型不符：{result['prediction']}" if mismatch else
+                        '候选与请求模型相符' if separated else '候选分数未拉开，暂不能比较')}
 
 
 @evidence.capture_round
@@ -971,7 +1045,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
     budget_seconds = ATTRIBUTION_INITIAL_SECONDS
     deadline = started + budget_seconds
     challenge_count = job.get("challenge_count", 3)
-    request_limit = challenge_count * 2
+    request_limit = challenge_count
     requests_sent, summaries = 0, []
     run_id = str(uuid.uuid4())
     valid_samples, insufficient_samples = 0, 0
@@ -985,71 +1059,51 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
         context = account_context(account)
         if job["model"] not in MODELS:
             raise ProbeError("指纹库未收录所选模型")
-        # Keep successful responses within this round; replacements and confirmation
-        # share twice the selected sample count. Never combine partial responses.
+        # Exactly one batch: neither mismatches nor insufficient samples add requests.
         challenges = iter(generate_challenges(request_limit))
-        for attempt in range(2):
-            outputs = []
-            identities = []
-            while len(outputs) < challenge_count and requests_sent < request_limit:
-                if cancelled():
-                    raise Cancelled()
-                if deadline - time.monotonic() < 5:
-                    raise RoundTimeout()
-                account = accounts.get(job["account_id"])
-                ensure_available(account)
-                if account_context(account) != context:
-                    raise ProbeError("账号路由或配置已变化，本轮作废", 'comparison_changed')
-                challenge = next(challenges)
-                if prompt_template is not None:
-                    challenge = {**challenge, "prompt": prompt_template.replace("{{challenge}}", challenge["prompt"])}
-                requests_sent += 1
-                try:
-                    (output, actual), attempt_id = attempts.invoke(
-                        store, job, run_id, account,
-                        {"kind": "attribution", "stage": attempt + 1, "sample": requests_sent,
-                         "challenge": challenge, "template": prompt_template, "context_sha256": context.hex()},
-                        lambda: probe_fn(account, job["model"], challenge, cancelled, deadline, codex_version))
-                except InsufficientSample as exc:
-                    insufficient_samples += 1
-                    last_insufficient = str(exc)
-                    if time.monotonic() >= deadline:
-                        raise RoundTimeout() from None
-                    # Extend once, relative to round start; a replacement never resets time.
-                    budget_seconds = ATTRIBUTION_MAX_SECONDS
-                    deadline = started + budget_seconds
-                    continue
+        outputs = []
+        identities = []
+        while len(outputs) < challenge_count and requests_sent < request_limit:
+            if cancelled():
+                raise Cancelled()
+            if deadline - time.monotonic() < 5:
+                raise RoundTimeout()
+            account = accounts.get(job["account_id"])
+            ensure_available(account)
+            if account_context(account) != context:
+                raise ProbeError("账号路由或配置已变化，本轮作废", 'comparison_changed')
+            challenge = next(challenges)
+            if prompt_template is not None:
+                challenge = {**challenge, "prompt": prompt_template.replace("{{challenge}}", challenge["prompt"])}
+            requests_sent += 1
+            try:
+                (output, actual), attempt_id = attempts.invoke(
+                    store, job, run_id, account,
+                    {"kind": "attribution", "stage": 1, "sample": requests_sent,
+                     "challenge": challenge, "template": prompt_template, "context_sha256": context.hex()},
+                    lambda: probe_fn(account, job["model"], challenge, cancelled, deadline, codex_version))
+            except InsufficientSample as exc:
+                insufficient_samples += 1
+                last_insufficient = str(exc)
                 if time.monotonic() >= deadline:
-                    raise RoundTimeout()
-                outputs.append(output)
-                identities.append(attempt_id)
-                valid_samples += 1
-            if len(outputs) < challenge_count:
-                stage = "初测" if attempt == 0 else "不符复测"
-                raise ProbeError(f"{stage}仅取得 {len(outputs)}/{challenge_count} 份有效回答，已达本轮 {request_limit} 次请求上限。{last_insufficient}", "insufficient_samples")
-            summary = summarize(outputs, job["model"])
-            summary.update(reasoning_effort=job.get("reasoning_effort", "xhigh"), comparison_profile=profile)
-            summary["sent_model"] = actual
-            summary["attempt_ids"] = identities
-            attempts.attach_analysis(store, account, identities, summary)
-            summaries.append(summary)
-            if attempt == 0 and (summary.get("candidate_separated") or summary["confident"]) and summary["prediction"] != job["model"]:
-                if request_limit - requests_sent < challenge_count:
-                    summary.update(status="yellow", message=f"初测归因不符，但补采后剩余请求预算不足以完成 {challenge_count} 份独立复测，待确认")
-                    break
-                budget_seconds = ATTRIBUTION_MAX_SECONDS
-                deadline = started + budget_seconds
+                    raise RoundTimeout() from None
                 continue
-            break
+            if time.monotonic() >= deadline:
+                raise RoundTimeout()
+            outputs.append(output)
+            identities.append(attempt_id)
+            valid_samples += 1
+        if len(outputs) < challenge_count:
+            raise ProbeError(f"仅取得 {len(outputs)}/{challenge_count} 份有效回答，本轮最多 {request_limit} 次，不自动补采。{last_insufficient}", "insufficient_samples")
+        summary = summarize(outputs, job["model"])
+        summary.update(reasoning_effort=job.get("reasoning_effort", "xhigh"), comparison_profile=profile)
+        summary["sent_model"] = actual
+        summary["attempt_ids"] = identities
+        attempts.attach_analysis(store, account, identities, summary)
+        summaries.append(summary)
         result = dict(summaries[-1])
-        if len(summaries) == 2:
-            first, second = summaries
-            result["confirmation"] = [{"prediction": s["prediction"], "probability": s["probability"]} for s in summaries]
-            if (second.get("candidate_separated") or second["confident"]) and first["prediction"] == second["prediction"] != job["model"]:
-                result.update(status="red", outcome="candidate_mismatch_confirmed",
-                              message=f"候选复测仍不符：{second['prediction']}（统计归因，非模型身份认证）")
-            else:
-                result.update(status="yellow", outcome="candidate_unstable", message="两轮候选结果不一致或分数未拉开，待确认")
+        if (result.get('candidate_separated') or result.get('confident')) and result['prediction'] != job['model']:
+            result.update(status='red', outcome='candidate_mismatch', message=f"候选与请求模型不符：{result['prediction']}")
         if cancelled():
             raise Cancelled()
         latest = accounts.get(job["account_id"])
@@ -1061,7 +1115,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code}
         if isinstance(exc, RoundTimeout):
             result["message"] = f"检测超时：本轮 {budget_seconds} 秒预算已用尽，取得 {valid_samples} 份有效回答"
-    result.update(run_id=run_id, stages=summaries, requests=requests_sent, valid_samples=valid_samples, insufficient_samples=insufficient_samples,
+    result.update(run_id=run_id, sampling_policy=SAMPLING_POLICY, stages=summaries, requests=requests_sent, valid_samples=valid_samples, insufficient_samples=insufficient_samples,
                   challenge_count=challenge_count, request_limit=request_limit,
                   reasoning_effort=job.get("reasoning_effort", "xhigh"), budget_seconds=budget_seconds,
                   initial_budget_seconds=ATTRIBUTION_INITIAL_SECONDS, max_budget_seconds=ATTRIBUTION_MAX_SECONDS,
@@ -1084,7 +1138,7 @@ def run_prompt_round(job, store, accounts, controller, *, attribution_monitor=Fa
                 "reasoning_effort": job.get("reasoning_effort", "xhigh"),
                 "valid_samples": 0, "insufficient_samples": 0,
                 "challenge_count": job.get("challenge_count", 3),
-                "request_limit": job.get("challenge_count", 3) * 2,
+                "request_limit": job.get("challenge_count", 3), "sampling_policy": SAMPLING_POLICY,
                 "latency_ms": int((time.monotonic() - started) * 1000)}
 
     def gateway_probe(account, model, challenge, cancelled, deadline, _version):
@@ -1128,12 +1182,13 @@ def run_qa_round(job, store, accounts, controller):
 
     def ask(case, attempt):
         account = check_account()
+        sent_prompt = manual_preview_prompt(case['prompt']) if case['kind'] == 'manual' else case['prompt']
         output, identity = attempts.invoke(
             store, job, run_id, account,
             {"kind": "qa", "case_id": case["id"], "stage": attempt + 1,
-             "prompt": case["prompt"], "expected_answer": case["expected_answer"],
+             "prompt": sent_prompt, "expected_answer": case["expected_answer"],
              "context_sha256": context.hex()},
-            lambda: controller.prompt(job["account_id"], job["model"], case["prompt"], cancelled, deadline,
+            lambda: controller.prompt(job["account_id"], job["model"], sent_prompt, cancelled, deadline,
                                       reasoning_effort=job.get("reasoning_effort", "xhigh")))
         item["attempts"].append({"attempt_id": identity, "output": output,
                                  "normalized_answer": normalized_answer(output)})
@@ -1159,42 +1214,28 @@ def run_qa_round(job, store, accounts, controller):
                 artifacts[case["id"]] = {"html": html_artifact(output), "prompt": case["prompt"]}
                 item.update(review_status="pending", artifact_available=True, message="已生成作品，待人工预览评分")
                 continue
-            answers = []
-            for attempt in range(2):
-                if attempt == 1:
-                    budget_seconds = ATTRIBUTION_MAX_SECONDS
-                    deadline = started + budget_seconds
-                check_account()
-                requests_sent += 1
-                item["requests"] += 1
-                output = ask(case, attempt)
-                check_account()
-                answer = normalized_answer(output)
-                if not answer:
-                    raise ProbeError("模型未返回可判定的文字答案")
-                item['comparison_observed'] = True
-                answers.append(answer)
-                if "answer_preview" not in item:
-                    item["answer_preview"] = output.strip()[:160]
-                    item["answer_truncated"] = len(output.strip()) > 160
-                if answer == normalized_answer(case["expected_answer"]):
-                    item.update(status="green" if attempt == 0 else "yellow",
-                                message="答案符合预期" if attempt == 0 else "初测与复测不一致，待确认")
-                    break
-                if attempt == 1:
-                    confirmed = answers[0] == answers[1]
-                    item.update(status="red" if confirmed else "yellow",
-                                message="两次均返回同一非预期答案" if confirmed else "两次非预期答案不同，待确认")
-            # No replacement questions: each selected question runs once, with at most one confirmation.
+            check_account()
+            requests_sent += 1
+            item['requests'] = 1
+            output = ask(case, 0)
+            check_account()
+            answer = normalized_answer(output)
+            if not answer:
+                raise ProbeError('模型未返回可判定的文字答案')
+            item.update(comparison_observed=True, answer_preview=output.strip()[:160],
+                        answer_truncated=len(output.strip()) > 160)
+            matched = answer == normalized_answer(case['expected_answer'])
+            item.update(status='green' if matched else 'red',
+                        message='答案符合预期' if matched else '答案与预期不符')
         check_account()
         status = qa_status(results)
-        result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目复测仍未通过",
+        result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目答案与预期不符",
                                                 "yellow": "本轮含待确认结果"}[status], "_context": context.hex(), "round_complete": True}
     except ProbeError as exc:
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code, "round_complete": False}
         if results and results[-1]["status"] == "yellow":
             results[-1]["message"] = str(exc)
-    result.update(run_id=run_id, test_mode="qa", requests=requests_sent, request_limit=sum(1 if case["kind"] == "manual" else 2 for case in selected),
+    result.update(run_id=run_id, sampling_policy=SAMPLING_POLICY, test_mode="qa", requests=requests_sent, request_limit=len(selected),
                   _artifacts=artifacts,
                   reasoning_effort=job.get("reasoning_effort", "xhigh"), budget_seconds=budget_seconds,
                   initial_budget_seconds=ATTRIBUTION_INITIAL_SECONDS, max_budget_seconds=ATTRIBUTION_MAX_SECONDS,
@@ -1205,8 +1246,12 @@ def run_qa_round(job, store, accounts, controller):
 def scheduler(store, accounts, stop, codex_version, controller):
     store.recover()
     prefer_prompt = False
+    next_cleanup = 0
     while not stop.wait(2):
         try:
+            if time.monotonic() >= next_cleanup:
+                next_cleanup = time.monotonic() + 60
+                store.cleanup_deleted_accounts(accounts)
             store.apply_pending_pause(accounts, controller)
             store.apply_pending_prompt_pause(accounts, controller)
             if hasattr(os, "getloadavg") and os.getloadavg()[0] > max(1, (os.cpu_count() or 1) * .8):
@@ -1349,7 +1394,7 @@ class SchedulingControl:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > PROMPT_MAX_CHARS + 2000:
             raise ProbeError("测试提示词无效")
         key = self._key()
-        pieces, total, complete = [], 0, False
+        pieces, total, complete = AnswerText(), 0, False
         seen_request, seen_response = False, False
         upstream_attempts = set()
         deadline = deadline if deadline is not None else time.monotonic() + ATTRIBUTION_INITIAL_SECONDS
@@ -1382,8 +1427,8 @@ class SchedulingControl:
                         if time.monotonic() >= deadline:
                             raise RoundTimeout()
                         total += len(raw)
-                        if total > MAX_RESPONSE_BYTES:
-                            raise ProbeError("测试输出超出限制")
+                        if total > MAX_STREAM_BYTES:
+                            raise ProbeError('网关流式传输超过 64 MiB 上限', 'stream_limit')
                         if not raw.startswith(b"data:"):
                             continue
                         try:
@@ -1429,9 +1474,9 @@ class SchedulingControl:
             raise ProbeError(transport_failure_message(exc, min(PROBE_READ_TIMEOUT, remaining))) from None
         if not seen_request or not seen_response:
             raise ProbeError("账号测试缺少完整请求关联信息")
-        if not complete or not "".join(pieces).strip():
+        if not complete or not pieces.text().strip():
             raise ProbeError("账号测试没有返回完整回答")
-        return "".join(pieces)
+        return pieces.text()
 
 
 class AdminAuth:
@@ -1664,6 +1709,11 @@ def create_app(store, accounts, authenticate):
         artifact = store.artifact(account_id, result_id, case_id)
         if artifact is None:
             return jsonify(error="作品不存在或已随历史记录清理"), 404
+        # Old records stay byte-for-byte intact; only their preview is extracted.
+        try:
+            artifact['preview_html'] = html_artifact(artifact['html'])
+        except ProbeError as exc:
+            artifact.update(preview_html=None, preview_error=str(exc))
         return jsonify(artifact)
 
     @app.put("/accounts/<int:account_id>/prompt-test/results/<int:result_id>/reviews/<case_id>")

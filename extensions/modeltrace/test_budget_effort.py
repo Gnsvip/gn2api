@@ -26,7 +26,7 @@ def test_three_slow_valid_samples_finish_without_lowering_effort(store, monkeypa
     clock = [1000.0]
     monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
     store.configure(7, True, 'gpt-6-astra')
-    # This case covers the initial budget; a mismatch correctly starts a second stage.
+    # This case covers the initial budget; a matching candidate also stops after one stage.
     monkeypatch.setattr(s, 'analyze_global_outputs', lambda outputs, bank: {
         'results': [{'model':'gpt-6-astra','probability':.99}, {'model':'other','probability':.01}],
         'prediction':'gpt-6-astra','probability':.99,'used_outputs':len(outputs)})
@@ -42,11 +42,11 @@ def test_three_slow_valid_samples_finish_without_lowering_effort(store, monkeypa
     assert result['elapsed_seconds'] == 519
     assert deadlines == [1720] * 3
     assert result['budget_seconds'] == 720 and result['reasoning_effort'] == 'xhigh'
-    assert result['outcome'] == 'bank_unverified' and not result['confident']
+    assert result['outcome'] == 'candidate_match' and not result['confident']
     assert len(attempts.listing(store, 7)['attempts']) == 3
 
 
-@pytest.mark.parametrize('duration,expected_requests,budget', [(721, 1, 720), (300, 4, 1200)])
+@pytest.mark.parametrize('duration,expected_requests,budget', [(721, 1, 720), (300, 3, 720)])
 def test_expired_round_cannot_be_revived_by_replacement(store, monkeypatch, duration, expected_requests, budget):
     clock = [1000.0]
     monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
@@ -61,10 +61,10 @@ def test_expired_round_cannot_be_revived_by_replacement(store, monkeypatch, dura
     result = s.run_round(claim(store), store, FakeAccounts(), '', insufficient)
     assert result['outcome'] == 'round_timeout'
     assert result['requests'] == expected_requests and result['budget_seconds'] == budget
-    assert deadlines[0] == 1720 and all(d == 2200 for d in deadlines[1:])
+    assert deadlines[0] == 1720 and all(d == 1720 for d in deadlines[1:])
 
 
-def test_retest_uses_one_twenty_minute_cap_from_round_start(store, monkeypatch):
+def test_mismatch_does_not_start_second_batch_or_extend_twelve_minute_budget(store, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
     store.configure(7, True, 'gpt-6-astra')
@@ -75,12 +75,12 @@ def test_retest_uses_one_twenty_minute_cap_from_round_start(store, monkeypatch):
         clock[0] += 173
         return {'text': 'fixture', 'expected_count': 300}, model
 
-    # Exercise the confirmation branch without pretending the installed bank is calibrated.
+    # A mismatching candidate must never add a second batch.
     monkeypatch.setattr(s, 'summarize', lambda *args: dict(status='yellow', prediction='fixture-other', confident=True, probability=.99))
     result = s.run_round(claim(store), store, FakeAccounts(), '', slow_probe)
-    assert result['requests'] == 6 and result['elapsed_seconds'] == 1038
-    assert deadlines == [1720] * 3 + [2200] * 3
-    assert result['budget_seconds'] == 1200
+    assert result['requests'] == 3 and result['elapsed_seconds'] == 519
+    assert deadlines == [1720] * 3
+    assert result['budget_seconds'] == 720
 
 
 @pytest.mark.parametrize('prompt', [False, True])

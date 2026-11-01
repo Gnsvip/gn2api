@@ -52,7 +52,7 @@ def test_only_first_normal_and_anomaly_survive_restarts_and_proxy_changes(store)
         qa(fresh, '21', accounts=accounts)
     _, anomaly = qa(fresh, '29', '29', accounts=accounts)
     kept = diagnostics(fresh)
-    assert len(kept) == 3 and kept[0] == baseline[0]
+    assert len(kept) == 2 and kept[0] == baseline[0]
     for _ in range(3):
         qa(fresh, '29', '29', accounts=accounts)
     assert diagnostics(fresh) == kept
@@ -81,27 +81,27 @@ def test_repeated_long_answers_only_keep_preview_and_first_full_evidence(store):
 
 
 def test_each_question_retains_anomaly_even_when_round_is_yellow(store):
-    configure(store, [question(), question('tibo', expected='True')])
-    _, result = qa(store, '29', '21', 'False', 'False')
+    configure(store, [question(), question('tibo', expected='True'), question('later')])
+    _, result = qa(store, '29', 'False', s.RoundTimeout())
     assert result['status'] == 'yellow'
     records = evidence.listing(store, 7)
     assert {(r['summary']['case_id'], r['slot']) for r in records} == {('candy', 'anomaly'), ('tibo', 'anomaly')}
-    assert len(diagnostics(store)) == 4
+    assert len(diagnostics(store)) == 2
 
 
 def test_finished_case_is_preserved_when_later_question_times_out(store):
     configure(store, [question(), question('tibo', expected='True')])
-    qa(store, '29', '29', s.RoundTimeout())
+    qa(store, '29', s.RoundTimeout())
     records = evidence.listing(store, 7)
     assert len(records) == 1 and records[0]['summary']['case_id'] == 'candy'
 
 
-def test_first_wrong_answer_is_kept_even_if_its_confirmation_times_out(store):
+def test_first_wrong_answer_is_kept_without_attempting_confirmation(store):
     configure(store)
     qa(store, '29', s.RoundTimeout())
     records = evidence.listing(store, 7)
     assert len(records) == 1 and records[0]['slot'] == 'anomaly'
-    assert records[0]['summary']['status'] == 'yellow'
+    assert records[0]['summary']['status'] == 'red'
     assert evidence.answer(store, 7, records[0]['summary']['attempt_ids'][0])['output'] == '29'
 
 
@@ -150,7 +150,7 @@ def test_attribution_match_and_first_separated_mismatch_capture_without_certifyi
         result = s.run_round(job, store, FakeAccounts(), '0.166.0', lambda *_: ({'text':'full numbers'}, job['model']))
         store.finish(job, result)
     records = evidence.listing(store, 7)
-    assert len(records) == 2 and len(diagnostics(store)) == 3
+    assert len(records) == 2 and len(diagnostics(store)) == 2
     assert all(r['summary']['bank_applicability'] == 'unverified' for r in records)
     assert records[0]['summary']['prediction'] == 'gpt-5.6-luna'
 

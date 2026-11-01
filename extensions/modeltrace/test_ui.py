@@ -50,13 +50,17 @@ with sync_playwright() as p:
     def open_custom():
         page.locator('[data-row-id="8"] .mt-label').click()
         page.get_by_role('tab', name='自定义题目', exact=True).click()
-    page.add_init_script("localStorage.setItem('auth_token','fixture-admin');")
+    # Fixture login belongs to the admin page, never the isolated artwork frame.
+    page.add_init_script("if (window === window.top) localStorage.setItem('auth_token','fixture-admin');")
     page.on('pageerror', lambda e: errors.append(str(e)))
     def route(r):
         if '/api/v1/admin/accounts/' in r.request.url:
             r.fulfill(json={'code': 0, 'data': [{'id': model} for model in live_models]})
         elif '/custom/modeltrace/api/' in r.request.url:
-            if '/attempts/' in r.request.url:
+            if '/artifacts/' in r.request.url:
+                r.fulfill(json={'html':'说明和工具调用，不应进入画面', 'prompt':'画一只鹈鹕',
+                    'preview_html':'<!doctype html><html><head><meta charset="utf-8"></head><body><svg xmlns="http://www.w3.org/2000/svg" width="200" height="120"><circle cx="60" cy="60" r="40" fill="orange"/><text y="110">鹈鹕 🚲</text></svg></body></html>'})
+            elif '/attempts/' in r.request.url:
                 parts = urlsplit(r.request.url)
                 identity, action = parts.path.rsplit('/', 2)[-2:]
                 evidence_requests.append(action)
@@ -141,7 +145,9 @@ with sync_playwright() as p:
     assert not page.locator('[role=tabpanel]:visible').locator('.mt-help').evaluate('(e) => e.open')
     assert '整轮最多 6 次请求' not in page.locator('dialog').inner_text()
     page.get_by_text('检测说明', exact=True).click()
-    assert '整轮最多 6 次请求' in page.locator('dialog').inner_text()
+    assert '设置几次最多就发几次' in page.locator('dialog').inner_text()
+    assert '连续红点达到设置轮数即停止调度，不受校准提示阻拦' in page.locator('dialog').inner_text()
+    assert '删除账号后会自动清理' in page.locator('dialog').inner_text()
     page.get_by_text('检测说明', exact=True).click()
     page.get_by_role('button', name='查看全部 10 条', exact=True).click()
     assert page.locator('[role=tabpanel]:visible').locator('.mt-history li:visible').count() == 10
@@ -174,10 +180,10 @@ with sync_playwright() as p:
     assert page.locator('[role=tabpanel]:visible').locator('.mt-error').inner_text() == '检测间隔请填写 1–1440 分钟的整数'
     page.get_by_role('spinbutton', name='检测间隔（分钟）').fill('30')
     page.get_by_label('挑战次数', exact=True).select_option('1')
-    assert '通常 1 次 / 轮，补采或复测最多 2 次 / 轮' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
+    assert '每轮最多 1 次，不自动复测' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
     assert '48 次请求 / 天' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
     page.get_by_label('挑战次数', exact=True).select_option('2')
-    assert '通常 2 次 / 轮，补采或复测最多 4 次 / 轮' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
+    assert '每轮最多 2 次，不自动复测' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
     assert '96 次请求 / 天' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
     page.get_by_role('button', name='保存当前页', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
@@ -293,7 +299,7 @@ with sync_playwright() as p:
     page.get_by_role('switch', name='启用此页定时测试', exact=True).check()
     page.get_by_label('测试模型', exact=True).select_option('gpt-6.1-sol')
     page.get_by_label('题目推理等级', exact=True).select_option('high')
-    assert '通常 1 次 / 轮' in page.locator('dialog').inner_text()
+    assert '每轮最多 1 次' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='保存当前页', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
     assert '当前页设置已保存' in page.locator('dialog').inner_text()
@@ -398,14 +404,14 @@ with sync_playwright() as p:
     open_custom()
     page.locator('[role=tabpanel]:visible .mt-result > summary').click()
     page.get_by_role('button', name='糖果形状题 · 第 1 次完整回答', exact=True).click()
-    page.locator('.mt-answer-text').wait_for()
-    assert len(page.locator('.mt-answer-text').inner_text()) == 4000
+    page.locator('.mt-preview-dialog .mt-answer-text').wait_for()
+    assert len(page.locator('.mt-preview-dialog .mt-answer-text').inner_text()) == 4000
     page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
     before_requests = len(evidence_requests)
-    page.get_by_role('button', name='糖果形状题 · 第 2 次回答摘要（本轮未重复采证）', exact=True).click()
-    assert page.locator('.mt-answer-text').inner_text() == long_answer[:160]
+    page.locator('.mt-answer-summary > summary').click()
+    assert page.locator('.mt-answer-summary .mt-answer-text').inner_text() == long_answer[:160]
+    assert page.locator('.mt-preview-dialog').count() == 0
     assert len(evidence_requests) == before_requests
-    page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
         requests=2, reasoning_effort='medium', message=message, outcome=outcome)
@@ -418,7 +424,7 @@ with sync_playwright() as p:
     page.get_by_role('button', name='查看全部 4 条', exact=True).click()
     for title in ('检测超时', '上游错误', '指纹库未校准', '样本不足'):
         assert page.locator('[role=tabpanel]:visible .mt-result-title').filter(has_text=title).count() == 1
-    assert '初测最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert '每轮最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-effort-settings.png')))
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
@@ -430,10 +436,37 @@ with sync_playwright() as p:
     page.locator('[data-row-id="8"] .mt-label').click()
     page.get_by_role('tab', name='模型归因', exact=True).click()
     labels = page.locator('[role=tabpanel]:visible .mt-result-title').all_text_contents()
-    assert labels == ['候选复测不符 · gpt-5.6-luna', '候选不符 · gpt-5.6-luna（未完成复测）']
+    assert labels == ['候选复测不符 · gpt-5.6-luna', '候选不符 · gpt-5.6-luna（历史单轮结果）']
     page.locator('[role=tabpanel]:visible .mt-result > summary').first.click()
-    assert '校准状态：未校准' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert '指纹适用性：当前条件未验证' in page.locator('[role=tabpanel]:visible').inner_text()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-candidate-mismatch.png')))
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # One-word answers are visible inline, without an answer fetch or a second dialog.
+    states['8']['prompt_test']['history'] = [dict(status='red', test_mode='qa', expected='gpt-6-astra', checked_at=NOW,
+        requests=1, sampling_policy='single-pass-v1', result_id=9, cases=[dict(id='tibo', name='Tibo 题', kind='exact',
+        status='red', expected_answer='True', message='答案与预期不符', requests=1,
+        attempts=[dict(output='False', evidence_saved=True, attempt_id='short-answer')])])]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
+    assert not page.locator('[role=tabpanel]:visible .mt-result').evaluate('(e) => e.open')
+    assert 'Tibo 题 · 回答：False' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert page.get_by_role('button', name='Tibo 题 · 完整回答', exact=True).count() == 0
+    assert '次完整回答' not in page.locator('[role=tabpanel]:visible').inner_text()
+    page.get_by_text('Tibo 题 · 回答：False', exact=True).scroll_into_view_if_needed()
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-single-answer.png')))
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # The extracted document renders in the existing sandbox; source remains available.
+    states['8']['prompt_test']['history'][0].update(status='yellow', cases=[dict(id='drawing', name='鹈鹕', kind='manual',
+        status='yellow', artifact_available=True, message='待人工评分')])
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
+    page.locator('[role=tabpanel]:visible .mt-result > summary').click()
+    page.get_by_role('button', name='鹈鹕 · 预览并评分', exact=True).click()
+    preview = page.locator('.mt-preview-dialog')
+    preview.locator('iframe').wait_for()
+    assert page.frame_locator('.mt-preview-dialog iframe').locator('svg').count() == 1
+    assert page.frame_locator('.mt-preview-dialog iframe').locator('body').inner_text() == '鹈鹕 🚲'
+    assert 'allow-same-origin' not in preview.locator('iframe').get_attribute('sandbox')
+    preview.screenshot(path=str(out.with_name('modeltrace-extracted-artwork.png')))
+    preview.get_by_role('button', name='关闭', exact=True).click()
     page.get_by_role('button', name='关闭', exact=True).click()
     assert all(action in ('events', 'download', 'answer') for action in evidence_requests)
     page.evaluate("history.pushState({},'', '/dashboard')")

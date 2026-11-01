@@ -82,6 +82,7 @@ def condition(job, records, case, result):
     # Proxy, timezone, client identity and observed transport remain in the evidence:
     # changing these must not hide the anomaly behind a new baseline.
     value = {'schema': 1, 'kind': metadata['kind'], 'model': job['model'],
+             'sampling_policy': result.get('sampling_policy', 'legacy-retest'),
              'reasoning_effort': job.get('reasoning_effort', 'xhigh'), 'source': source,
              'comparison_profile': requests[0].get('profile') if requests else None}
     if case:
