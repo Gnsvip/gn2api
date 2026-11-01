@@ -16,6 +16,7 @@ import unicodedata
 import uuid
 
 import attempts
+import evidence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ from urllib.parse import quote, urlsplit
 import psycopg
 import requests
 from urllib3.exceptions import ReadTimeoutError
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from psycopg.rows import dict_row
 from waitress import serve
 
@@ -312,6 +313,7 @@ class Store:
             now = time.time()
             result = dict(result)
             context = result.pop("_context", "")
+            evidence.commit(db, job, result)
             streak = 0
             if (current["auto_pause_enabled"] and result.get("status") == "red" and context
                     and result.get("bank_applicability") == "validated"):
@@ -339,6 +341,7 @@ class Store:
             now = time.time()
             result = dict(result)
             context = result.pop("_context", "")
+            evidence.commit(db, job, result)
             artifacts = result.pop("_artifacts", {})
             manual_round = job.get("test_mode") == "qa" and any(
                 case.get("enabled") and case.get("kind") == "manual" for case in json.loads(job["cases"]))
@@ -948,16 +951,19 @@ def summarize(outputs, model):
                  and probability >= CONFIDENCE and margin >= MARGIN)
     confident = False
     status = "yellow"
+    mismatch = separated and result["prediction"] != model
     return {"status": status, "prediction": result["prediction"], "probability": probability,
             "confident": confident, "samples": result["used_outputs"],
             "analysis": result, "candidate_separated": separated, "bank_applicability": "unverified",
             "comparison_profile": COMPARISON_PROFILE,
             "bank_sha256": hashlib.sha256((ROOT / "vendor/data/unified_bank.json").read_bytes()).hexdigest(),
             "candidates": [{"model": c["model"], "probability": c["probability"]} for c in candidates[:3]],
-            "outcome": "bank_unverified",
-            "message": "指纹库未校准：当前请求条件尚无验证证据；仅展示闭集候选，不判定模型身份"}
+            "outcome": "candidate_mismatch" if mismatch else "bank_unverified",
+            "message": (f"候选不符：{result['prediction']}，待独立复测；指纹库未校准" if mismatch else
+                        "指纹库未校准：仅展示候选，不判定模型身份")}
 
 
+@evidence.capture_round
 def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=None, prompt_template=None):
     if cancelled is None:
         cancelled = lambda: not store.is_current(job)
@@ -993,7 +999,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
                 account = accounts.get(job["account_id"])
                 ensure_available(account)
                 if account_context(account) != context:
-                    raise ProbeError("账号路由或配置已变化，本轮作废")
+                    raise ProbeError("账号路由或配置已变化，本轮作废", 'comparison_changed')
                 challenge = next(challenges)
                 if prompt_template is not None:
                     challenge = {**challenge, "prompt": prompt_template.replace("{{challenge}}", challenge["prompt"])}
@@ -1002,7 +1008,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
                     (output, actual), attempt_id = attempts.invoke(
                         store, job, run_id, account,
                         {"kind": "attribution", "stage": attempt + 1, "sample": requests_sent,
-                         "challenge": challenge, "context_sha256": context.hex()},
+                         "challenge": challenge, "template": prompt_template, "context_sha256": context.hex()},
                         lambda: probe_fn(account, job["model"], challenge, cancelled, deadline, codex_version))
                 except InsufficientSample as exc:
                     insufficient_samples += 1
@@ -1027,7 +1033,7 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
             summary["attempt_ids"] = identities
             attempts.attach_analysis(store, account, identities, summary)
             summaries.append(summary)
-            if attempt == 0 and summary["confident"] and summary["prediction"] != job["model"]:
+            if attempt == 0 and (summary.get("candidate_separated") or summary["confident"]) and summary["prediction"] != job["model"]:
                 if request_limit - requests_sent < challenge_count:
                     summary.update(status="yellow", message=f"初测归因不符，但补采后剩余请求预算不足以完成 {challenge_count} 份独立复测，待确认")
                     break
@@ -1039,16 +1045,17 @@ def run_round(job, store, accounts, codex_version, probe_fn=probe, *, cancelled=
         if len(summaries) == 2:
             first, second = summaries
             result["confirmation"] = [{"prediction": s["prediction"], "probability": s["probability"]} for s in summaries]
-            if second["confident"] and first["prediction"] == second["prediction"] != job["model"]:
-                result.update(status="red", message="复测仍与预期不符（统计归因，非定论）")
+            if (second.get("candidate_separated") or second["confident"]) and first["prediction"] == second["prediction"] != job["model"]:
+                result.update(status="red", outcome="candidate_mismatch_confirmed",
+                              message=f"候选复测仍不符：{second['prediction']}（统计归因，非模型身份认证）")
             else:
-                result.update(status="yellow", message="两轮结果不稳定，待确认")
+                result.update(status="yellow", outcome="candidate_unstable", message="两轮候选结果不一致或分数未拉开，待确认")
         if cancelled():
             raise Cancelled()
         latest = accounts.get(job["account_id"])
         ensure_available(latest)
         if account_context(latest) != context:
-            raise ProbeError("账号路由或配置已变化，本轮作废")
+            raise ProbeError("账号路由或配置已变化，本轮作废", 'comparison_changed')
         result["_context"] = context.hex()
     except ProbeError as exc:
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code}
@@ -1097,6 +1104,7 @@ def run_prompt_round(job, store, accounts, controller, *, attribution_monitor=Fa
     return result
 
 
+@evidence.capture_round
 def run_qa_round(job, store, accounts, controller):
     started = time.monotonic()
     budget_seconds = ATTRIBUTION_INITIAL_SECONDS
@@ -1115,7 +1123,7 @@ def run_qa_round(job, store, accounts, controller):
         account = accounts.get(job["account_id"])
         ensure_available(account, require_bank=False)
         if context is not None and account_context(account) != context:
-            raise ProbeError("账号路由或配置已变化，本轮作废")
+            raise ProbeError("账号路由或配置已变化，本轮作废", 'comparison_changed')
         return account
 
     def ask(case, attempt):
@@ -1164,6 +1172,7 @@ def run_qa_round(job, store, accounts, controller):
                 answer = normalized_answer(output)
                 if not answer:
                     raise ProbeError("模型未返回可判定的文字答案")
+                item['comparison_observed'] = True
                 answers.append(answer)
                 if "answer_preview" not in item:
                     item["answer_preview"] = output.strip()[:160]
@@ -1251,7 +1260,7 @@ def validate_comparison_request(data, correlation_id, account_id, model, prompt,
             or body.get("instructions") != COMPARISON_INSTRUCTIONS
             or body.get("tools") != [] or body.get("tool_choice") != "none"
             or body.get("parallel_tool_calls") is not False or body.get("text") != {"verbosity": "medium"}):
-        raise ProbeError("网关比较条件或请求关联信息不一致")
+        raise ProbeError("网关比较条件或请求关联信息不一致", 'comparison_changed')
     context = []
     matched = 0
     for item in body.get("input", []):
@@ -1260,7 +1269,7 @@ def validate_comparison_request(data, correlation_id, account_id, model, prompt,
         else:
             context.append(item)
     if matched != 1:
-        raise ProbeError("网关没有原样发送指定题目")
+        raise ProbeError("网关没有原样发送指定题目", 'comparison_changed')
     # Per-request session identifiers are intentionally fresh; keep every semantic field.
     frozen = {k: v for k, v in body.items() if k not in ("input", "client_metadata", "prompt_cache_key")}
     ephemeral = {"session_id", "thread_id", "turn_id", "root_turn_id", "x-codex-window-id"}
@@ -1271,7 +1280,7 @@ def validate_comparison_request(data, correlation_id, account_id, model, prompt,
             metadata["x-codex-turn-metadata"] = {k: v for k, v in turn.items()
                                                   if k not in ephemeral | {"window_id"}}
         except (TypeError, ValueError, AttributeError):
-            raise ProbeError("网关客户端元数据无效") from None
+            raise ProbeError("网关客户端元数据无效", 'comparison_changed') from None
     frozen["client_metadata"] = metadata
     frozen["context"] = context
     headers = {k.lower(): v for k, v in details.get("headers", {}).items()
@@ -1281,7 +1290,7 @@ def validate_comparison_request(data, correlation_id, account_id, model, prompt,
     try:
         attempts.compare_contract(contract)
     except ValueError:
-        raise ProbeError("本轮请求模型、档位、指令、环境或传输条件已变化，比较作废") from None
+        raise ProbeError("本轮请求模型、档位、指令、环境或传输条件已变化，比较作废", 'comparison_changed') from None
     attempts.emit("gateway_request", data)
 
 
@@ -1398,12 +1407,13 @@ class SchedulingControl:
                                     or data.get("upstream_attempt_id") not in upstream_attempts):
                                 raise ProbeError("网关响应与请求尝试不匹配")
                             seen_response = (data.get("details") or {}).get("http_status") == 200
+                            attempts.emit('gateway_response', data)
                         elif event_type == "content":
                             text = event.get("text")
                             if isinstance(text, str):
                                 pieces.append(text)
                         elif event_type == "error":
-                            raise ProbeError("上游返回处理错误，本轮未完成；详细响应已保存在本轮尝试记录", "upstream_error")
+                            raise ProbeError("上游返回处理错误，本轮未完成", "upstream_error")
                         elif event_type == "test_complete":
                             complete = event.get("success") is True
                             if not complete:
@@ -1515,6 +1525,28 @@ def create_app(store, accounts, authenticate):
     def get_attempt(account_id, attempt_id):
         result = attempts.detail(store, account_id, attempt_id)
         return jsonify(result) if result else (jsonify(error="尝试记录不存在"), 404)
+
+    @app.get("/accounts/<int:account_id>/attempts/<attempt_id>/events")
+    def get_attempt_events(account_id, attempt_id):
+        view = request.args.get('view', 'key')
+        if view not in ('key', 'all'):
+            return jsonify(error='记录视图无效'), 400
+        result = attempts.event_page(store, account_id, attempt_id, max(0, request.args.get("after", 0, type=int)), view == 'all')
+        return jsonify(result) if result else (jsonify(error="尝试记录不存在"), 404)
+
+    @app.get("/accounts/<int:account_id>/attempts/<attempt_id>/answer")
+    def get_attempt_answer(account_id, attempt_id):
+        result = evidence.answer(store, account_id, attempt_id)
+        return jsonify(result) if result is not None else (jsonify(error="回答不存在"), 404)
+
+    @app.get("/accounts/<int:account_id>/attempts/<attempt_id>/download")
+    def download_attempt(account_id, attempt_id):
+        chunks = attempts.export(store, account_id, attempt_id)
+        if chunks is None:
+            return jsonify(error="尝试记录不存在"), 404
+        filename = re.sub(r'[^a-zA-Z0-9_-]', '_', attempt_id)
+        return Response(chunks, mimetype="application/json", headers={
+            "Content-Disposition": f'attachment; filename="attempt-{filename}.json"', "Cache-Control": "no-store"})
 
     @app.get("/accounts")
     def states():

@@ -12,8 +12,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// openAIRequestTimezoneExtraKey 是账号 extra 里手动覆盖请求时区的键。
-// 决定 4：账号可手动覆盖，覆盖优先于按出口 IP 自动确定的结果。
+// openAIRequestTimezoneExtraKey 是旧版保存的账号请求时区键。
+// 保留配置兼容性；实际出站时区由出口 IP 缓存决定，不采用账号覆盖值。
 const openAIRequestTimezoneExtraKey = "openai_request_timezone"
 
 // DefaultOpenAIRequestTimezone 是拿不到出口时区时的回退值。
@@ -26,8 +26,8 @@ const DefaultOpenAIRequestTimezone = codexDefaultTimezone
 // 共享同一个出口时区，直连账号共享直连出口的时区。
 const directEgressProxyID int64 = -1
 
-// OpenAIRequestTimezone 返回账号应该使用的 IANA 请求时区。
-// 优先取账号 extra 的手动覆盖（须为合法时区），否则返回空串交给解析器按出口决定。
+// OpenAIRequestTimezone 读取旧版保存的账号时区（须为合法 IANA 时区）。
+// 此值不代表当前出口时区；出站调用方必须使用解析器。
 func (a *Account) OpenAIRequestTimezone() string {
 	if a == nil || !a.IsOpenAI() {
 		return ""
@@ -50,16 +50,16 @@ func NormalizeOpenAIRequestTimezone(name string) string {
 // OpenAIRequestTimezoneResolution 是一次时区解析的结果。
 type OpenAIRequestTimezoneResolution struct {
 	Timezone string
-	// Source 记录时区来源：override=账号手动覆盖 / proxy=代理出口缓存 /
-	// direct=直连出口缓存 / fallback=回退默认值。
+	// Source 记录时区来源：proxy=代理出口缓存 / direct=直连出口缓存 /
+	// fallback=未取得可信出口时区，回退默认值。
 	Source   string
 	Fallback bool
 }
 
 // OpenAIRequestTimezoneResolver 按出口 IP 自动确定 OpenAI 账号的请求时区。
 //
-// 决定 4：有代理看代理出口，没代理看直连出口；缓存按「代理 / 直连」分键；
-// 账号手动覆盖优先；拿不到时区时用可配置默认并在日志/管理端标记为回退。
+// 有代理看代理出口，没代理看服务器直连出口；缓存按「代理 / 直连」分键。
+// 旧账号时区不参与选择；拿不到可信出口时区时使用默认值并标记为回退。
 type OpenAIRequestTimezoneResolver struct {
 	latencyCache    ProxyLatencyCache
 	defaultTimezone string
@@ -76,16 +76,11 @@ func NewOpenAIRequestTimezoneResolver(latencyCache ProxyLatencyCache, defaultTim
 }
 
 // Resolve 决定一个账号出站请求应该使用的时区。
-// 顺序：手动覆盖 → 该账号代理出口的缓存时区 → 直连出口的缓存时区 → 回退默认。
+// 只查询实际代理（或无代理时的服务器直连）缓存；无效时回退默认，
+// 不能借用另一个出口的缓存，也不能恢复旧账号手动设置。
 func (r *OpenAIRequestTimezoneResolver) Resolve(ctx context.Context, account *Account) OpenAIRequestTimezoneResolution {
 	if account == nil || !account.IsOpenAI() {
 		return OpenAIRequestTimezoneResolution{Timezone: r.defaultTimezone, Source: "fallback", Fallback: true}
-	}
-	if override := NormalizeOpenAIRequestTimezone(codexAccountTimezone(account)); override != "" {
-		return OpenAIRequestTimezoneResolution{Timezone: override, Source: "override"}
-	}
-	if override := account.OpenAIRequestTimezone(); override != "" {
-		return OpenAIRequestTimezoneResolution{Timezone: override, Source: "override"}
 	}
 	cacheKey := directEgressProxyID
 	if account.ProxyID != nil && *account.ProxyID > 0 {
@@ -126,15 +121,17 @@ func (s *OpenAIGatewayService) accountWithEgressTimezone(ctx context.Context, ac
 		return account
 	}
 	selected := *account
+	resolutionAccount := &selected
 	// Actual transport selection is authoritative. Do not apply another proxy's cached geolocation.
-	if proxyURL != accountProxyURL(account) {
+	if proxyURL == "" {
 		selected.ProxyID = nil
 		selected.Proxy = nil
-		if proxyURL != "" {
-			return account
-		}
+	} else if proxyURL != accountProxyURL(account) {
+		// An unidentified proxy has no verified cache association. Use the
+		// explicit fallback, never the account's old timezone or direct IP.
+		resolutionAccount = nil
 	}
-	resolution := s.requestTimezoneResolver.Resolve(ctx, &selected)
+	resolution := s.requestTimezoneResolver.Resolve(ctx, resolutionAccount)
 	selected.Extra = shallowCopyMap(account.Extra)
 	if selected.Extra == nil {
 		selected.Extra = map[string]any{}

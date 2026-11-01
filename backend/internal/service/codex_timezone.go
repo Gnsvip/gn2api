@@ -21,8 +21,9 @@ var (
 	codexDateElement      = regexp.MustCompile(`(?s)<current_date>.*?</current_date>`)
 )
 
-// An explicitly configured account timezone describes its verified egress.
-// Apply it at the send boundary, including native clients and diagnostic tests.
+// Read the timezone from the request-owned account snapshot. The egress
+// resolver replaces saved profile values before HTTP/WS sends; a persisted
+// account timezone alone does not verify the current exit IP's location.
 func codexAccountTimezone(account *Account) string {
 	if !isCodexOAuthAccount(account) {
 		return ""

@@ -125,3 +125,10 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 	}
 	return replaceOpenAIRawInput(body, input, rebuiltItems), true, nil
 }
+
+func sanitizeOpenAIResponsesInputItemIDsForAccount(body []byte, account *Account) ([]byte, bool, error) {
+	if account != nil && account.UsesOpenAICodexProtocol() && codexNativeInputRaw(body) {
+		return body, false, nil
+	}
+	return sanitizeOpenAIResponsesInputItemIDs(body)
+}

@@ -44,6 +44,7 @@ func (s *OpenAIGatewayService) doOpenAICodexProbe(req *http.Request, proxyURL st
 		s = &OpenAIGatewayService{
 			cfg: codexProbeConfig(nil), httpUpstream: s.httpUpstream,
 			accountRepo: s.accountRepo, pluginManager: s.pluginManager,
+			requestTimezoneResolver: s.requestTimezoneResolver,
 		}
 	}
 	if err := s.prepareOpenAICodexProbeRequest(req, account); err != nil {

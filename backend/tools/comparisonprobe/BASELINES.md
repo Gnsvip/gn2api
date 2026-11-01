@@ -21,7 +21,7 @@ not imply that all endpoints or six lifecycle scenarios have passed.
 | Endpoint or path | Evidence and checks | Limit |
 | --- | --- | --- |
 | HTTP `/backend-api/codex/responses` | Official header/body fixtures; `TestGolden_HTTPResponsesHeaderOrder`; Astra/xhigh native typed-input fixture through real `Forward` and passthrough | Different account/session IDs remain isolated; not byte-identical requests |
-| WS Responses | Official first turn, tool loop, compaction and 401 fixtures; `TestGolden_WSHandshakeHeaderOrder`, `TestGolden166_WSFrameReplay`; timezone writers/pool tests | Live paired acceptance for this change uses HTTP, not WS |
+| WS Responses | Official first turn, tool loop, compaction and 401 fixtures; `TestGolden_WSHandshakeHeaderOrder`, `TestGolden166_WSFrameReplay`; timezone writers/pool tests; opt-in live WS runner | Live acceptance must verify Upgrade, final frames and absence of HTTP fallback; fixtures alone do not establish live coverage |
 | GET `/backend-api/codex/models` | `TestGolden166ModelsWireBaseline` and `TestCodexModelsProductionBuilderUsesCapturedTransport` | Eligible OAuth catalog requests only |
 | POST `/oauth/token` | HTTP/WS recovery captures; `TestGolden166OAuthRefreshBaseline`, `TestOpenAIRefreshMatches166CapturedJSON`; production JSON/reason tests | Refresh body contract is aligned. Auth identity and transport are not claimed identical. No live credential refresh during acceptance |
 | Admin QA/attribution test | `TestComparisonCapturesFinalRequestAndResponse`, mapping/fallback rejection tests, ModelTrace persistence/contract tests | Fixed `codex-http-xhigh-v1` profile is distinct from the native CLI context |
@@ -38,11 +38,22 @@ retain their existing default-instruction behavior.
 The legacy input-metadata stripping workaround must also preserve these native
 typed requests, including content-item kinds and provenance. Account-scoped
 turn IDs may change; semantic message fields must not.
+Native tool continuation also retains reasoning item IDs, custom tool output
+IDs and the client's paired call IDs. `TestCodex166NativeToolReplayPreservesIDsAndPayload`
+exercises the forwarding path, and `TestCodex166NativeDeltaIDPreservationIsOAuthOnly`
+keeps the API-key and legacy compatibility rules scoped separately. In WS
+`ctx_pool` mode, frame turn metadata takes precedence over prewarm handshake
+metadata; `TestOpenAIWSIngress_FrameMetadataSurvivesPrewarmHandshake` covers
+prewarm, business turns, continuation and compaction metadata.
 
 The CLI's custom CA environment settings can select a different TLS backend.
 Live acceptance must identify the actual ClientHello, not infer TLS behavior
 from a User-Agent. Local bootstrap trust and timezone can be isolated using a
 private user/mount namespace without changing host or server configuration.
+The live runner retains terminal response events instead of duplicating every
+streaming delta. Its result must distinguish answer correctness, forwarding
+preservation and model attribution. A matching wrong answer on both paths is
+not a capability pass, and a model's declared name does not prove its identity.
 
 The existing numeric fingerprint bank is not calibrated for the new fixed
 comparison conditions. Preserve its full scores as closed-set candidates;

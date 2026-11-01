@@ -227,7 +227,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			reqModel, reqStream, promptCacheKey = requestView.Model, requestView.Stream, requestView.PromptCacheKey
 			originalModel = reqModel
 		}
-		sanitizedBody, changed, sanitizeErr := sanitizeOpenAIResponsesInputItemIDs(body)
+		sanitizedBody, changed, sanitizeErr := sanitizeOpenAIResponsesInputItemIDsForAccount(body, account)
 		if sanitizeErr != nil {
 			return nil, fmt.Errorf("sanitize OpenAI Responses input item IDs: %w", sanitizeErr)
 		}
@@ -530,6 +530,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// original body.
 		var synthResult *codexSynthResult
 		var attemptFingerprintIDs *codexFingerprintIDs
+		nativeInput := codexInputMapCarriesBaseInstructions(decoded) || codexNativeContinuation(decoded)
 		officialCodexClient := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
 		if isCodexOAuthAccount(account) && s.codexFullSynthesisEnabled() && !isCompactRequest {
 			deviceProfile, _ := codexDeviceProfileForRequest(account)
@@ -591,7 +592,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
 				IsCodexCLI:                          isCodexCLI,
 				IsCompact:                           isCompactRequest,
-				SkipDefaultInstructions:             synthesized || codexInputMapCarriesBaseInstructions(decoded),
+				SkipDefaultInstructions:             synthesized || nativeInput,
+				PreserveNativeInput:                 nativeInput,
+				PreserveToolCallIDs:                 nativeInput,
 				OmitPromotedSystemMessagesFromInput: omitPromotedSystemMessages,
 				ResponsesLite:                       responsesLite,
 			})

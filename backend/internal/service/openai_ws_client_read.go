@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -97,6 +98,9 @@ func readOpenAIWSClientMessageWithTimeoutStart(
 	for {
 		select {
 		case result := <-readDone:
+			if sink, ok := controlCtx.Value(comparisonSinkKey{}).(comparisonSink); ok && result.err == nil && json.Valid(result.payload) {
+				sink("ws_ingress_message", json.RawMessage(result.payload))
+			}
 			return result.messageType, result.payload, result.err
 		case <-timeoutStart:
 			startTimeout()

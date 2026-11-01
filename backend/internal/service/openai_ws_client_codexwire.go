@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -22,6 +23,28 @@ import (
 type codexWireClientConn struct {
 	conn          *codexwire.WSConn
 	codexTimezone string
+	audit         comparisonSink
+}
+
+func (c *codexWireClientConn) auditMessage(kind string, payload []byte) {
+	if c.audit == nil {
+		return
+	}
+	if !json.Valid(payload) {
+		return
+	}
+	if kind == "ws_test_request" {
+		c.audit(kind, json.RawMessage(payload))
+		return
+	}
+	var event map[string]any
+	if json.Unmarshal(payload, &event) != nil {
+		return
+	}
+	switch event["type"] {
+	case "response.completed", "response.failed", "response.incomplete", "error":
+		c.audit("ws_upstream_terminal", event)
+	}
 }
 
 var _ openAIWSClientConn = (*codexWireClientConn)(nil)
@@ -42,6 +65,7 @@ func (c *codexWireClientConn) WriteJSON(ctx context.Context, value any) error {
 	if err != nil {
 		return err
 	}
+	c.auditMessage("ws_test_request", payload)
 	return c.conn.WriteMessage(ctx, payload)
 }
 
@@ -56,6 +80,7 @@ func (c *codexWireClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, mapCodexWireReadError(err)
 	}
+	c.auditMessage("ws_upstream_terminal", payload)
 	return payload, nil
 }
 
@@ -70,6 +95,7 @@ func (c *codexWireClientConn) ReadFrame(ctx context.Context) (coderws.MessageTyp
 	if err != nil {
 		return coderws.MessageText, nil, mapCodexWireReadError(err)
 	}
+	c.auditMessage("ws_upstream_terminal", payload)
 	if opcode == 2 {
 		return coderws.MessageBinary, payload, nil
 	}
@@ -88,12 +114,14 @@ func (c *codexWireClientConn) WriteFrame(ctx context.Context, msgType coderws.Me
 		return err
 	}
 	if msgType == coderws.MessageBinary {
+		c.auditMessage("ws_test_request", payload)
 		return c.conn.WriteMessageBinary(ctx, payload)
 	}
 	ordered, err := codexwire.PrepareWSMessage(payload)
 	if err != nil {
 		return err
 	}
+	c.auditMessage("ws_test_request", ordered)
 	return c.conn.WriteMessage(ctx, ordered)
 }
 
@@ -159,6 +187,7 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 	// the existing dialer rather than silently bypassing their configured proxy.
 	plaintextProxy := target != nil && (target.Scheme == "ws" || target.Scheme == "http") && strings.TrimSpace(req.ProxyURL) != ""
 	if plaintextProxy || !codexEgressEligible(cfg, req.Account, target, headers) {
+		comparisonAudit(ctx, "ws_transport_fallback", map[string]any{"url": req.WSURL})
 		conn, status, responseHeaders, err := fallback.Dial(ctx, req.WSURL, headers, req.ProxyURL)
 		if target != nil && strings.EqualFold(target.Hostname(), "chatgpt.com") && target.Path == "/backend-api/codex/responses" {
 			if concrete, ok := conn.(*coderOpenAIWSClientConn); ok {
@@ -173,6 +202,8 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 	// 未命中模板头（如 x-codex-turn-state 已挪进 client_metadata 后不应再出现；
 	// cookie/attestation 等模板外注入头）按出现顺序附在官方头之后。
 	ordered = append(ordered, leftover...)
+	comparisonAudit(ctx, "ws_handshake", map[string]any{"account_id": req.Account.ID, "proxy_id": req.Account.ProxyID,
+		"url": req.WSURL, "headers": comparisonHeaders(headers), "timezone": codexAccountTimezone(req.Account), "transport": "codex-ws-rustls"})
 
 	profile, caErr := codexwire.WithCodexCustomCA(tlsfingerprint.BuiltinProfile("rustls"))
 	if caErr != nil {
@@ -195,7 +226,10 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 			respHeaders = res.Headers
 			body = res.Body
 		}
+		comparisonAudit(ctx, "ws_handshake_result", map[string]any{"success": false, "status": status})
 		return nil, status, respHeaders, &openAIWSHandshakeError{Body: body, Err: err}
 	}
-	return &codexWireClientConn{conn: wsConn, codexTimezone: codexAccountTimezone(req.Account)}, 0, res.Headers, nil
+	comparisonAudit(ctx, "ws_handshake_result", map[string]any{"success": true, "status": res.StatusCode})
+	audit, _ := ctx.Value(comparisonSinkKey{}).(comparisonSink)
+	return &codexWireClientConn{conn: wsConn, codexTimezone: codexAccountTimezone(req.Account), audit: audit}, 0, res.Headers, nil
 }

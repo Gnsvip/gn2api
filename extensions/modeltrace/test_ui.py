@@ -2,6 +2,7 @@
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qs
 
 from playwright.sync_api import sync_playwright
 DEFAULT_QA_CASES = [dict(id='candy', name='糖果形状题', enabled=False,
@@ -38,6 +39,11 @@ states['7']['history'][-1].update(requests=4, valid_samples=3, insufficient_samp
 live_models = ['gpt-6-sol', 'gpt-6-astra', 'gpt-6.1-sol']
 writes = []
 errors = []
+evidence_requests = []
+large_events = [{'sequence':i+1, 'at':NOW, 'kind':'stream',
+                 'payload':{'output':'29', 'literal':'<img src=x onerror=alert(1)>', 'line':'x' * 430}}
+                for i in range(15254)]
+large_events[-1].update(kind='analysis', payload={'prediction':'gpt-5.6-luna','probability':.99999})
 with sync_playwright() as p:
     browser = p.chromium.launch(channel='msedge', headless=True)
     page = browser.new_page(viewport={'width': 1160, 'height': 630}, device_scale_factor=1)
@@ -51,17 +57,34 @@ with sync_playwright() as p:
             r.fulfill(json={'code': 0, 'data': [{'id': model} for model in live_models]})
         elif '/custom/modeltrace/api/' in r.request.url:
             if '/attempts/' in r.request.url:
-                identity = r.request.url.rsplit('/', 1)[-1]
-                r.fulfill(json={'attempt_id': identity, 'events': [
-                    {'kind': 'request', 'payload': {'client_request_id': identity, 'model': 'gpt-6-astra'}},
-                    {'kind': 'finished', 'payload': {'output': '29' if identity == 'initial' else '21',
-                                                    'literal': '<img src=x onerror=alert(1)>'}}]})
+                parts = urlsplit(r.request.url)
+                identity, action = parts.path.rsplit('/', 2)[-2:]
+                evidence_requests.append(action)
+                events = large_events if identity == 'initial' else [dict(sequence=1, kind='finished', at=NOW, payload={'output':'21'})]
+                if action == 'download':
+                    r.fulfill(json={'attempt_id':identity, 'events':events})
+                elif action == 'answer':
+                    r.fulfill(json={'output': long_answer})
+                elif action == 'events':
+                    args = parse_qs(parts.query)
+                    after = int(args.get('after', ['0'])[0])
+                    filtered = events if args.get('view', ['key'])[0] == 'all' else [e for e in events if e['kind'] != 'stream']
+                    rows = [e for e in filtered if e['sequence'] > after][:40]
+                    r.fulfill(json={'attempt_id':identity, 'event_count':len(filtered), 'total_event_count':len(events),
+                        'events':[{k:e[k] for k in ('sequence','at','kind')} | {'preview':json.dumps(e['payload']), 'truncated':False} for e in rows],
+                        'next_cursor':rows[-1]['sequence'] if rows and rows[-1]['sequence'] < filtered[-1]['sequence'] else None})
+                else:
+                    r.fulfill(status=500, json={'error':'UI must not fetch unbounded full JSON'})
             elif '/attempts?' in r.request.url:
                 more = 'before=' in r.request.url
                 identities = ['interrupted'] if more else ['initial', 'retest']
                 r.fulfill(json={'attempts': [dict(attempt_id=i, started_at=NOW,
                     metadata={'case_id': 'candy', 'stage': n+1}, finished={'status': 'unfinished' if more else 'completed'})
-                    for n, i in enumerate(identities)], 'next_cursor': None if more else 10})
+                    for n, i in enumerate(identities)], 'next_cursor': None if more else 10,
+                    'saved_evidence': [] if more or 'run_id=' in r.request.url else [dict(slot=slot,
+                        run_id='saved-' + slot, created_at=NOW, condition_sha256='abcdef123456',
+                        summary=dict(case_id='candy', model='gpt-6-astra', reasoning_effort='xhigh'))
+                        for slot in ('normal', 'anomaly')]})
             elif r.request.method == 'PUT':
                 parts = r.request.url.rstrip('/').split('/')
                 id = parts[-2] if parts[-1] == 'prompt-test' else parts[-1]
@@ -309,24 +332,80 @@ with sync_playwright() as p:
     page.get_by_role('button', name='全部尝试记录（含中断）', exact=True).click()
     evidence = page.locator('.mt-preview-dialog')
     evidence.locator('summary').first.wait_for()
-    assert evidence.locator('summary').count() == 2
-    evidence.locator('summary').nth(0).click()
+    assert evidence.locator('.mt-evidence-entry > summary').count() == 2
+    assert '正常基线' in evidence.locator('.mt-saved-evidence').inner_text()
+    assert '首次异常' in evidence.locator('.mt-saved-evidence').inner_text()
+    evidence.locator('.mt-evidence-entry > summary').nth(0).click()
     evidence.get_by_role('button', name='下载完整 JSON').wait_for()
+    assert evidence.locator('.mt-event').count() == 1
+    assert 'gpt-5.6-luna' in evidence.locator('pre').text_content()
+    evidence.get_by_label('事件视图', exact=True).select_option('all')
+    page.wait_for_function("document.querySelectorAll('.mt-event').length === 40")
+    assert evidence.locator('.mt-event').count() == 40
+    evidence.locator('.mt-event > summary').first.click()
     assert '29' in evidence.locator('pre').first.inner_text()
     assert evidence.locator('img').count() == 0
+    assert len(evidence.text_content()) < 60000 and evidence_requests == ['events', 'events']
+    # The browser event loop stays available while paging a production-sized stream.
+    assert page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => resolve(true)))')
+    evidence.get_by_role('button', name='下一页事件', exact=True).click()
+    page.wait_for_function("document.querySelector('.mt-event summary')?.textContent.startsWith('#41')")
+    assert evidence.locator('.mt-event').count() == 40
+    evidence.get_by_role('button', name='上一页事件', exact=True).click()
+    page.wait_for_function("document.querySelector('.mt-event summary')?.textContent.startsWith('#1 ·')")
     with page.expect_download() as download_info:
         evidence.get_by_role('button', name='下载完整 JSON').click()
     assert download_info.value.suggested_filename == 'attempt-initial.json'
-    assert json.loads(Path(download_info.value.path()).read_text())['attempt_id'] == 'initial'
-    evidence.locator('summary').nth(1).click()
+    downloaded = json.loads(Path(download_info.value.path()).read_text())
+    assert downloaded['attempt_id'] == 'initial' and len(downloaded['events']) == 15254
+    evidence.get_by_label('事件视图', exact=True).select_option('key')
+    page.wait_for_function("document.querySelectorAll('.mt-event').length === 1")
+    evidence.locator('.mt-event > summary').first.click()
+    evidence.locator('.mt-evidence-entry > summary').nth(1).click()
     page.wait_for_function("document.querySelectorAll('.mt-preview-dialog [data-loaded=true]').length === 2")
-    assert '21' in evidence.locator('pre').nth(1).inner_text()
+    evidence.locator('.mt-evidence-entry').nth(1).locator('.mt-event > summary').click()
+    assert '21' in evidence.locator('.mt-evidence-entry').nth(1).locator('pre').inner_text()
     evidence.get_by_role('button', name='加载更多').click()
-    page.wait_for_function("document.querySelectorAll('.mt-preview-dialog summary').length === 3")
-    assert 'unfinished' in evidence.locator('summary').last.inner_text()
+    page.wait_for_function("document.querySelectorAll('.mt-preview-dialog .mt-evidence-entry').length === 3")
+    assert 'unfinished' in evidence.locator('.mt-evidence-entry > summary').last.inner_text()
     assert evidence.get_by_role('button', name='加载更多').is_hidden()
     evidence.screenshot(path=str(out.with_name('modeltrace-evidence-mobile.png')))
     evidence.get_by_role('button', name='×', exact=True).click()
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # Long candy answers are absent from result summaries and paged on explicit open.
+    long_answer = '糖果解题过程 7+9+8+4=28。' * 600 + '最终答案29'
+    states['8']['prompt_test']['history'] = [dict(status='yellow', test_mode='qa', expected='gpt-6-astra', checked_at=NOW,
+        message='本轮含待确认结果', requests=2, cases=[dict(name='糖果形状题', kind='exact', expected_answer='21',
+        message='两次非预期答案不同', attempts=[dict(output=long_answer),dict(output='29')])])]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
+    open_custom()
+    page.locator('[role=tabpanel]:visible .mt-result > summary').click()
+    assert len(page.locator('[role=tabpanel]:visible .mt-result').text_content()) < 1200
+    assert '7+9+8+4' not in page.locator('[role=tabpanel]:visible').inner_text()
+    page.get_by_role('button', name='糖果形状题 · 第 1 次完整回答', exact=True).click()
+    answer_dialog = page.locator('.mt-preview-dialog')
+    assert len(answer_dialog.locator('pre').inner_text()) == 4000
+    answer_dialog.get_by_role('button', name='下一页', exact=True).click()
+    assert answer_dialog.locator('pre').inner_text() == long_answer[4000:8000]
+    answer_dialog.get_by_role('button', name='×', exact=True).click()
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-candy-collapsed.png')))
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # New selected evidence fetches the full answer only on click; repeats are explicit previews.
+    states['8']['prompt_test']['history'][0]['cases'][0]['attempts'] = [
+        dict(attempt_id='saved-answer', output=long_answer[:160], output_truncated=True, evidence_saved=True),
+        dict(attempt_id='summary-only', output=long_answer[:160], output_truncated=True, evidence_saved=False)]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
+    open_custom()
+    page.locator('[role=tabpanel]:visible .mt-result > summary').click()
+    page.get_by_role('button', name='糖果形状题 · 第 1 次完整回答', exact=True).click()
+    page.locator('.mt-answer-text').wait_for()
+    assert len(page.locator('.mt-answer-text').inner_text()) == 4000
+    page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
+    before_requests = len(evidence_requests)
+    page.get_by_role('button', name='糖果形状题 · 第 2 次回答摘要（本轮未重复采证）', exact=True).click()
+    assert page.locator('.mt-answer-text').inner_text() == long_answer[:160]
+    assert len(evidence_requests) == before_requests
+    page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
         requests=2, reasoning_effort='medium', message=message, outcome=outcome)
@@ -342,6 +421,21 @@ with sync_playwright() as p:
     assert '初测最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-effort-settings.png')))
     page.get_by_role('button', name='关闭', exact=True).click()
+    states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
+        prediction='gpt-5.6-luna', candidate_separated=True, probability=.9999989, bank_applicability='unverified',
+        outcome='bank_unverified', message='指纹库未校准'), dict(status='red', expected='gpt-6-astra', checked_at=NOW,
+        prediction='gpt-5.6-luna', candidate_separated=True, bank_applicability='unverified',
+        outcome='candidate_mismatch_confirmed', message='候选复测仍不符')]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
+    page.locator('[data-row-id="8"] .mt-label').click()
+    page.get_by_role('tab', name='模型归因', exact=True).click()
+    labels = page.locator('[role=tabpanel]:visible .mt-result-title').all_text_contents()
+    assert labels == ['候选复测不符 · gpt-5.6-luna', '候选不符 · gpt-5.6-luna（未完成复测）']
+    page.locator('[role=tabpanel]:visible .mt-result > summary').first.click()
+    assert '校准状态：未校准' in page.locator('[role=tabpanel]:visible').inner_text()
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-candidate-mismatch.png')))
+    page.get_by_role('button', name='关闭', exact=True).click()
+    assert all(action in ('events', 'download', 'answer') for action in evidence_requests)
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")
     assert errors == [], errors

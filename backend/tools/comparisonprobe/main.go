@@ -5,7 +5,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,15 +30,61 @@ import (
 
 type auditBody struct {
 	io.ReadCloser
-	record func(string, any)
+	record       func(string, any)
+	pending      []byte
+	bytesRead    int64
+	terminalSeen bool
+	closed       bool
 }
 
-func (b auditBody) Read(p []byte) (int, error) {
+func (b *auditBody) Read(p []byte) (int, error) {
 	n, e := b.ReadCloser.Read(p)
 	if n > 0 {
-		b.record("upstream_bytes", string(p[:n]))
+		b.bytesRead += int64(n)
+		b.pending = append(b.pending, p[:n]...)
+		for {
+			index := bytes.IndexByte(b.pending, '\n')
+			if index < 0 {
+				break
+			}
+			line := bytes.TrimSpace(b.pending[:index])
+			b.pending = b.pending[index+1:]
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			var event map[string]any
+			if json.Unmarshal(bytes.TrimSpace(line[5:]), &event) != nil {
+				continue
+			}
+			switch event["type"] {
+			case "response.completed", "response.failed", "response.incomplete", "error":
+				b.terminalSeen = true
+				b.record("upstream_terminal", event)
+			}
+		}
+		if len(b.pending) > 2<<20 {
+			b.record("evidence_error", "SSE event exceeded acceptance limit")
+			b.pending = nil
+		}
 	}
 	return n, e
+}
+
+func (b *auditBody) Close() error {
+	if !b.closed {
+		b.closed = true
+		b.record("upstream_stream_summary", map[string]any{"bytes": b.bytesRead, "terminal_seen": b.terminalSeen})
+	}
+	return b.ReadCloser.Close()
+}
+
+func validateTarget(account *service.Account, target int64) error {
+	token, _ := account.Credentials["access_token"].(string)
+	if target <= 0 || account.ID != target || account.Platform != service.PlatformOpenAI || account.Type != service.AccountTypeOAuth ||
+		strings.TrimSpace(token) == "" || account.ProxyID == nil || account.Proxy == nil || *account.ProxyID != account.Proxy.ID {
+		return errors.New("explicit target account and matching OAuth proxy required")
+	}
+	return nil
 }
 
 type auditTransport struct {
@@ -54,13 +103,15 @@ func (u auditTransport) DoWithTLS(r *http.Request, p string, id int64, n int, pr
 func (u auditTransport) wrap(r *http.Response, e error) (*http.Response, error) {
 	if r != nil {
 		u.record("upstream_response", map[string]any{"status": r.StatusCode, "headers": service.ComparisonHeaders(r.Header)})
-		r.Body = auditBody{r.Body, u.record}
+		r.Body = &auditBody{ReadCloser: r.Body, record: u.record}
 	}
 	return r, e
 }
 
 func main() {
 	output := flag.String("audit", "", "new audit JSONL path")
+	target := flag.Int64("account-id", 0, "required selected acceptance account ID")
+	websocket := flag.Bool("websocket", false, "enable the explicit WS acceptance scenario")
 	fullSynthesis := flag.Bool("full-synthesis", true, "match production's Codex request synthesis default")
 	mapOrderJitter := flag.Bool("metadata-order-jitter", true, "match production's client metadata ordering default")
 	canonicalUA := flag.String("canonical-user-agent", "", "explicit target profile for isolated official-client comparison")
@@ -68,12 +119,16 @@ func main() {
 	if *output == "" {
 		log.Fatal("audit output required")
 	}
-	var account service.Account
-	if err := json.NewDecoder(os.Stdin).Decode(&account); err != nil {
+	var input struct {
+		service.Account
+		Egress *service.ProxyLatencyInfo
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
 		log.Fatal("invalid account input")
 	}
-	if account.ID != 12232 || account.ProxyID == nil || account.Proxy == nil || account.Credentials["access_token"] == nil {
-		log.Fatal("target account and explicit proxy required")
+	account := input.Account
+	if err := validateTarget(&account, *target); err != nil {
+		log.Fatal(err)
 	}
 	// Never carry a refresh credential into the runtime.
 	delete(account.Credentials, "refresh_token")
@@ -87,6 +142,7 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 		raw, _ := json.Marshal(map[string]any{"at": time.Now().UTC(), "kind": kind, "data": data})
+		// Only terminal events are retained; streaming deltas are not duplicated.
 		encoded := string(raw)
 		for _, key := range []string{"access_token", "id_token"} {
 			if token, ok := account.Credentials[key].(string); ok && token != "" {
@@ -104,6 +160,13 @@ func main() {
 	cfg.Gateway.CodexFullSynthesis = fullSynthesis
 	cfg.Gateway.CodexWire.MapOrderJitter = mapOrderJitter
 	cfg.Gateway.CodexWire.Profile = "auto"
+	if *websocket {
+		cfg.Gateway.OpenAIWS.Enabled = true
+		cfg.Gateway.OpenAIWS.OAuthEnabled = true
+		cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+		cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+		cfg.Gateway.OpenAIWS.IngressModeDefault = "passthrough"
+	}
 	if *canonicalUA != "" {
 		service.SetCodexCanonicalUserAgentResolver(func() string { return *canonicalUA })
 	}
@@ -119,8 +182,21 @@ func main() {
 	})
 	upstream := auditTransport{repository.NewHTTPUpstream(cfg), record}
 	harness := service.NewComparisonHarness(cfg, upstream)
+	if err := harness.SetEgressSnapshot(&account, input.Egress); err != nil {
+		log.Fatal(err)
+	}
+	record("acceptance_target", map[string]any{"account_id": account.ID, "proxy_id": account.ProxyID, "exit_ip": input.Egress.IPAddress, "timezone": input.Egress.Timezone, "timezone_observed_at": input.Egress.UpdatedAt})
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	router.GET("/responses", func(c *gin.Context) {
+		if !*websocket || !strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+			c.Status(http.StatusUpgradeRequired)
+			return
+		}
+		if err := harness.WebSocket(c, &account, record); err != nil {
+			record("ws_forward_finished", map[string]any{"error": err.Error()})
+		}
+	})
 	router.POST("/responses", func(c *gin.Context) {
 		raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 8<<20))
 		if err != nil {
@@ -141,7 +217,8 @@ func main() {
 			}
 			c.Request.Header.Del("Content-Encoding")
 		}
-		record("ingress", map[string]any{"headers": service.ComparisonHeaders(c.Request.Header), "body": json.RawMessage(raw)})
+		digest := sha256.Sum256(raw)
+		record("ingress", map[string]any{"headers": service.ComparisonHeaders(c.Request.Header), "body": json.RawMessage(raw), "sha256": fmt.Sprintf("%x", digest)})
 		if err = harness.Forward(c, &account, raw, record); err != nil {
 			record("failure", map[string]any{"type": "forward_error", "error": err.Error()})
 			if !c.Writer.Written() {
@@ -164,7 +241,7 @@ func main() {
 		log.Fatal("listen failed")
 	}
 	fmt.Println(listener.Addr().String())
-	server := &http.Server{Handler: router, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 300 * time.Second}
-	go func() { time.Sleep(20 * time.Minute); _ = server.Close() }()
+	server := &http.Server{Handler: router, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 1250 * time.Second}
+	go func() { time.Sleep(60 * time.Minute); _ = server.Close() }()
 	_ = server.Serve(listener)
 }

@@ -43,6 +43,7 @@
     .mt-result>summary::after{content:'›';color:#94a3b8;margin-left:auto}.mt-result[open]>summary::after{transform:rotate(90deg)}
     .mt-result time{color:#64748b;white-space:nowrap;font-variant-numeric:tabular-nums}.mt-result-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .mt-result pre{margin:0 0 10px 17px;white-space:pre-wrap;overflow-wrap:anywhere;color:#64748b;font:12px/1.7 system-ui}
+    .mt-answer-links{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 10px 17px;gap:5px}.mt-answer-text{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 system-ui}.mt-evidence-events{max-height:45vh;overflow:auto}.mt-evidence-paging{display:flex;gap:14px;align-items:center;margin:10px 0}.mt-evidence-entry{border-bottom:1px solid #e2e8f066}
     .mt-help{margin:14px 0;font-size:12px;color:#64748b}.mt-help>summary{cursor:pointer;width:fit-content}.mt-help p{line-height:1.7}
     .dark .mt-result pre,.dark .mt-result time,.dark .mt-help,.dark .mt-link{color:#94a3b8}
     .mt-policy{margin:16px 0 0;padding:12px;border:1px solid #e2e8f0;border-radius:9px}.mt-policy label{display:block}.dark .mt-policy{border-color:#374151}
@@ -79,6 +80,14 @@
     return { label, select };
   };
   const resultLabel = result => {
+    if (result.test_mode !== 'qa') {
+      if (result.outcome === 'candidate_mismatch_confirmed') return `候选复测不符 · ${result.prediction}`;
+      if (result.outcome === 'candidate_unstable') return '候选不稳定';
+      if (result.outcome === 'candidate_mismatch' || (result.outcome === 'bank_unverified'
+          && result.candidate_separated && result.prediction && result.prediction !== result.expected)) {
+        return `候选不符 · ${result.prediction}（未完成复测）`;
+      }
+    }
     if (result.status === 'green') return result.test_mode === 'qa' ? '通过' : '与预期一致';
     if (result.status === 'red') return result.test_mode === 'qa' ? '未通过' : '复测仍不符';
     const titles = { round_timeout: '检测超时', upstream_error: '上游错误', insufficient_samples: '样本不足',
@@ -103,7 +112,7 @@
     `本轮请求：${result.requests || 0} 次`, result.message,
     ...(result.cases || []).map(item => item.kind === 'manual'
       ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
-      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer}\n${item.attempts?.length ? item.attempts.map((a, i) => `第 ${i + 1} 次回答：${a.output}`).join('\n') : `历史末次回答：${item.answer_preview || '未取得完整回答'}${item.answer_truncated ? '…（已截断）' : ''}（旧记录未保存各次原文）`}`),
+      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer} · 已保存 ${item.attempts?.length || 0} 次完整回答`),
     result.manual_reviewed && '人工评分只更新历史记录，不追溯触发自动停调度',
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
@@ -115,20 +124,77 @@
     typeof result.requests === 'number' && `本轮请求：${result.requests} 次`,
     typeof result.challenge_count === 'number' && `挑战设置：${result.challenge_count} 次`,
     typeof result.valid_samples === 'number' && `有效挑战回答：${result.valid_samples} 份；数字样本不足：${result.insufficient_samples || 0} 次`,
-    result.message, result.bank_applicability === 'unverified' && '当前请求条件未完成指纹库验证', '候选分数不是模型身份概率'
+    result.message, result.bank_applicability === 'unverified' && '校准状态：未校准；候选比较照常显示，不据此自动停调度', '候选分数不是模型身份概率'
   ].filter(Boolean).join('\n');
 
-  async function api(path, options = {}) {
+  async function apiResponse(path, options = {}) {
     const currentToken = token();
     if (!currentToken) throw new Error('请使用管理员账号登录');
     const response = await fetch(API + path, {
       ...options, headers: { 'Authorization': 'Bearer ' + currentToken, 'Content-Type': 'application/json' },
       credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(12000)
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || '检测服务暂不可用');
+    if (!response.ok) {
+      const data = await response.json();
+      throw new Error(data.error || '检测服务暂不可用');
+    }
+    if (currentToken !== token()) throw new Error('登录状态已变化');
+    return response;
+  }
+
+  async function api(path, options = {}) {
+    const currentToken = token(), data = await (await apiResponse(path, options)).json();
     if (currentToken !== token()) throw new Error('登录状态已变化');
     return data;
+  }
+
+  function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = el('a'); link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function openAnswer(title, output) {
+    const dialog = el('dialog', 'mt-dialog mt-preview-dialog');
+    const header = el('div', 'mt-header');
+    const close = el('button', 'mt-close', '×'); close.type = 'button'; close.onclick = () => dialog.close();
+    header.append(el('h3', '', title), close);
+    const body = el('div', 'mt-body'), text = el('pre', 'mt-answer-text'); body.append(text);
+    const actions = el('div', 'mt-actions'), info = el('span', 'mt-note');
+    const prev = el('button', '', '上一页'), next = el('button', '', '下一页');
+    let page = 0;
+    const render = () => {
+      text.textContent = output.slice(page * 4000, (page + 1) * 4000);
+      info.textContent = `第 ${page + 1}/${Math.max(1, Math.ceil(output.length / 4000))} 页 · 共 ${output.length} 字`;
+      prev.disabled = page === 0; next.disabled = (page + 1) * 4000 >= output.length; body.scrollTop = 0;
+    };
+    prev.onclick = () => { page--; render(); }; next.onclick = () => { page++; render(); };
+    actions.append(info, prev, next); dialog.append(header, body, actions);
+    dialog.addEventListener('close', () => dialog.remove());
+    document.body.append(dialog); render(); dialog.showModal();
+  }
+
+  function answerControls(id, result) {
+    const links = el('div', 'mt-answer-links');
+    for (const item of result.cases || []) {
+      if (item.kind === 'manual') continue;
+      const answers = item.attempts?.length ? item.attempts : item.answer_preview
+        ? [{ output: item.answer_preview, legacy: true }] : [];
+      answers.forEach((answer, i) => {
+        const summaryOnly = answer.output_truncated && !answer.evidence_saved;
+        const title = `${item.name} · ${answer.legacy ? '历史末次回答（旧记录未保存完整原文）' : `第 ${i + 1} 次${summaryOnly ? '回答摘要（本轮未重复采证）' : '完整回答'}`}`;
+        const button = el('button', 'mt-link', title); button.type = 'button';
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const saved = answer.evidence_saved ? await api(`/accounts/${id}/attempts/${answer.attempt_id}/answer`) : answer;
+            openAnswer(title, saved.output || '');
+          } catch (error) { openAnswer('读取回答失败', error.message); }
+          finally { button.disabled = false; }
+        }; links.append(button);
+      });
+    }
+    return links;
   }
 
   function evidenceButton(id, runId) {
@@ -144,6 +210,7 @@
     const close = el('button', 'mt-close', '×'); close.type = 'button'; close.onclick = () => dialog.close();
     header.append(el('h3', '', '完整尝试记录'), close);
     const body = el('div', 'mt-body');
+    body.append(el('p', 'mt-note', '同账号、模型、档位和题目仅保留一次正常基线与首次异常完整诊断，不覆盖、不自动删除。其余尝试保留摘要；旧记录仍可查看。这里的管理 HTTP 测试不代表桌面 WS 流量。'));
     const next = el('button', 'mt-link', '加载更多'); next.type = 'button';
     dialog.append(header, body, next);
     dialog.addEventListener('close', () => dialog.remove());
@@ -156,24 +223,84 @@
         if (runId) params.set('run_id', runId);
         if (cursor) params.set('before', cursor);
         const data = await api(`/accounts/${id}/attempts?${params}`);
+        if (data.saved_evidence?.length) {
+          const saved = el('div', 'mt-saved-evidence');
+          saved.append(el('h4', '', '已保留的正常 / 首次异常对照'));
+          for (const record of data.saved_evidence) {
+            const item = el('div');
+            item.append(el('span', '', `${record.slot === 'normal' ? '正常基线' : '首次异常'} · ${record.summary.case_id || '归因候选'} · ${record.summary.model} / ${record.summary.reasoning_effort} · ${date(record.created_at)} · 条件 ${record.condition_sha256.slice(0, 8)} `), evidenceButton(id, record.run_id));
+            saved.append(item);
+          }
+          body.append(saved);
+        }
         if (!data.attempts.length && !cursor) body.append(el('p', 'mt-note', '暂无完整记录。旧版本未保存的原文无法恢复。'));
         for (const attempt of data.attempts) {
-          const details = el('details', 'mt-result');
-          details.append(el('summary', '', `${date(attempt.started_at)} · ${attempt.metadata.case_id || '数字归因'} · 第 ${attempt.metadata.stage} 次 · ${attempt.finished.status}`));
-          const content = el('pre', '', '展开后加载请求、完整响应和关联信息'); details.append(content);
+          const details = el('details', 'mt-result mt-evidence-entry');
+          const captureLabel = {normal: '正常基线已保留', anomaly: '首次异常已保留'}[attempt.metadata.capture_slot] || '';
+          details.append(el('summary', '', `${date(attempt.started_at)} · ${attempt.metadata.case_id || '数字归因'} · 第 ${attempt.metadata.stage} 次 · ${attempt.finished.status}${captureLabel ? ' · ' + captureLabel : ''}`));
+          const content = el('div'); details.append(content);
           details.addEventListener('toggle', async () => {
-            if (!details.open || details.dataset.loaded) return;
+            if (!details.open || details.dataset.loaded || details.dataset.loading) return;
+            details.dataset.loading = 'true'; content.textContent = '正在加载记录…';
             try {
-              const record = await api(`/accounts/${id}/attempts/${attempt.attempt_id}`);
-              content.textContent = JSON.stringify(record, null, 2); details.dataset.loaded = 'true';
-              const download = el('button', 'mt-link', '下载完整 JSON'); download.type = 'button';
-              download.onclick = () => {
-                const url = URL.createObjectURL(new Blob([JSON.stringify(record, null, 2)], { type: 'application/json' }));
-                const link = el('a'); link.href = url; link.download = `attempt-${attempt.attempt_id}.json`; link.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
+              const base = `/accounts/${id}/attempts/${attempt.attempt_id}`;
+              const first = await api(`${base}/events`);
+              if (!dialog.open) return;
+              const note = el('p', 'mt-note'), events = el('div', 'mt-evidence-events');
+              const view = el('select'); view.setAttribute('aria-label', '事件视图');
+              for (const [value, title] of [['key', '回答、归因及请求关联'], ['all', '全部记录（旧版含流事件）']]) {
+                const option = el('option', '', title); option.value = value; view.append(option);
+              }
+              const paging = el('div', 'mt-evidence-paging');
+              const prev = el('button', 'mt-link', '上一页事件'), nextPage = el('button', 'mt-link', '下一页事件');
+              prev.type = nextPage.type = 'button';
+              let cursors = [0], page = 0, nextCursor;
+              const renderPage = data => {
+                events.replaceChildren(); nextCursor = data.next_cursor;
+                note.textContent = `${attempt.metadata.capture_mode === 'results-only-v1' ? '本次未记录原始流量。' : ''}此视图 ${data.event_count} 条 / 全部 ${data.total_event_count} 条 · 第 ${page + 1} 页。长内容显示前 2000 字；完整记录可下载 JSON。`;
+                for (const event of data.events) {
+                  const entry = el('details', 'mt-result mt-event');
+                  entry.append(el('summary', '', `#${event.sequence} · ${event.kind}${event.truncated ? ' · 长内容预览' : ''}`),
+                    el('pre', '', event.preview));
+                  events.append(entry);
+                }
+                prev.disabled = page === 0; nextPage.disabled = nextCursor == null; events.scrollTop = 0;
               };
-              details.append(download);
+              const turnPage = async direction => {
+                prev.disabled = nextPage.disabled = view.disabled = true;
+                const target = page + direction, cursor = direction > 0 ? nextCursor : cursors[target];
+                try {
+                  const data = await api(`${base}/events?after=${cursor}&view=${view.value}`);
+                  if (!dialog.open) return;
+                  page = target; cursors[page] = cursor; renderPage(data);
+                } catch (error) { note.textContent = error.message; }
+                finally { view.disabled = false; prev.disabled = page === 0; nextPage.disabled = nextCursor == null; }
+              };
+              prev.onclick = () => turnPage(-1); nextPage.onclick = () => turnPage(1);
+              view.onchange = async () => {
+                prev.disabled = nextPage.disabled = view.disabled = true;
+                try {
+                  const data = await api(`${base}/events?view=${view.value}`);
+                  if (!dialog.open) return;
+                  cursors = [0]; page = 0; renderPage(data); view.dataset.loaded = view.value;
+                } catch (error) { view.value = view.dataset.loaded || 'key'; note.textContent = error.message; }
+                finally { view.disabled = false; prev.disabled = page === 0; nextPage.disabled = nextCursor == null; }
+              };
+              const download = el('button', 'mt-link', '下载完整 JSON'); download.type = 'button';
+              download.onclick = async () => {
+                download.disabled = true;
+                try {
+                  const currentToken = token(), blob = await (await apiResponse(`${base}/download`)).blob();
+                  if (currentToken !== token()) throw new Error('登录状态已变化');
+                  saveBlob(blob, `attempt-${attempt.attempt_id}.json`);
+                }
+                catch (error) { note.textContent = error.message; }
+                finally { download.disabled = false; }
+              };
+              paging.append(prev, nextPage, download); content.replaceChildren(view, note, events, paging);
+              renderPage(first); details.dataset.loaded = 'true';
             } catch (error) { content.textContent = error.message; }
+            finally { delete details.dataset.loading; }
           });
           body.append(details);
         }
@@ -495,7 +622,7 @@
     challengeCount.addEventListener('change', refreshEstimate);
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '检测说明'),
-      el('p', '', '检测超时、上游错误、样本不足和指纹库未校准分别显示。指纹库校准前仅展示候选；绿色和红色历史记录不代表模型身份已获证明。'),
+      el('p', '', '候选不符会独立复测；两轮分数均拉开且指向同一个非预期候选时标红。校准状态单独显示，未校准的候选不符不触发自动停调度。历史未复测的记录不会补记为已复测，候选分数不证明模型身份。'),
       el('p', '', '挑战次数可选 1、2、3，默认 3。1 次最省额度，2 次折中，3 次更稳定；较少样本更容易误判。样本不足只补缺少部分，归因不符则用同样份数独立复测。整轮最多为所选次数的 2 倍（3 次模式整轮最多 6 次请求）；无法凑齐所选份数或完成复测记黄点，不触发自动停调度。'),
       el('p', '', '自动停止只计连续红点，绿点或黄点清零。更改次数、策略或模型后重新计数。更改次数会取消旧轮次的后续请求和结果，下一轮仍按原计划执行；已发出的请求可能已计费。停止后当前业务请求继续，检测暂停，恢复调度需手动操作。'),
       el('p', '', '间隔支持 1–1440 分钟。仅改间隔不打断当前检测，下一轮从保存时重新计时。关闭页面仍会检测，繁忙时可能延后。'),
@@ -533,7 +660,7 @@
       const when = el('time', '', shortDate(result.checked_at)); when.dateTime = new Date(result.checked_at * 1000).toISOString();
       const text = resultLabel(result);
       summary.append(dot, when, el('span', 'mt-result-title', text));
-      summary.title = result.message;
+      summary.title = resultLabel(result);
       details.append(summary, el('pre', '', description(result)));
       if (result.run_id) details.append(evidenceButton(id, result.run_id));
       item.append(details); list.append(item); historyItems.push(item);
@@ -787,7 +914,7 @@
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '测试说明'),
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
-      el('p', '', '绿：高分归因与预期一致。黄：样本不足、区分度不足、请求失败或复测不稳定。红：两轮独立归因均高分指向同一个其他模型。候选库内分数不是真伪证明。'),
+      el('p', '', '归因模式：候选不符会独立复测；两轮分数均拉开且指向同一个非预期候选时标红。未复测、区分度不足或复测不稳定记黄。校准状态单独显示，未校准的候选不符不触发自动停调度；历史绿点不证明模型身份。'),
       el('p', '', '问答模式：绿表示所选题目全部符合预期；黄表示请求失败、未完成或复测不稳定；红表示至少一题两次返回同一非预期答案，且本轮没有黄色结果。问答颜色不证明模型身份。每道开启的题每轮发一次，不符时最多复测一次。'),
       el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“预览并评分”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'));
@@ -809,9 +936,10 @@
         dot.className = 'mt-dot mt-' + color;
         resultTitle.textContent = (manual ? '含人工预览 · ' : result.test_mode === 'qa' ? '问答 · ' : '归因 · ')
           + resultLabel(result);
-        summary.title = result.message || ''; resultDescription.textContent = description(result);
+        summary.title = resultLabel(result); resultDescription.textContent = description(result);
       };
       refreshResult(); details.append(summary, resultDescription);
+      if (result.test_mode === 'qa') details.append(answerControls(id, result));
       if (result.run_id) details.append(evidenceButton(id, result.run_id));
       for (const entry of result.cases || []) {
         if (entry.kind !== 'manual' || !entry.artifact_available || !result.result_id) continue;

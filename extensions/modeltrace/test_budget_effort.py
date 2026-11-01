@@ -26,6 +26,10 @@ def test_three_slow_valid_samples_finish_without_lowering_effort(store, monkeypa
     clock = [1000.0]
     monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
     store.configure(7, True, 'gpt-6-astra')
+    # This case covers the initial budget; a mismatch correctly starts a second stage.
+    monkeypatch.setattr(s, 'analyze_global_outputs', lambda outputs, bank: {
+        'results': [{'model':'gpt-6-astra','probability':.99}, {'model':'other','probability':.01}],
+        'prediction':'gpt-6-astra','probability':.99,'used_outputs':len(outputs)})
     deadlines = []
 
     def slow_probe(account, model, challenge, cancelled, deadline, version):

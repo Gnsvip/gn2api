@@ -274,6 +274,33 @@ func codexInputCarriesBaseInstructions(body []byte) bool {
 	return json.Unmarshal(body, &reqBody) == nil && codexInputMapCarriesBaseInstructions(reqBody)
 }
 
+// Recognize native full history and incremental turns without decoding large
+// tool results. Their item IDs and call IDs already belong to the Codex wire
+// protocol and must not be rewritten by legacy Responses compatibility rules.
+func codexNativeInputRaw(body []byte) bool {
+	view := parseRawJSONView(body)
+	turn := view.Get("client_metadata.turn_id").String()
+	continuation := view.Get("previous_response_id").String() != "" && turn != ""
+	native := false
+	view.Get("input").ForEach(func(_, item gjson.Result) bool {
+		metadata := item.Get("internal_chat_message_metadata_passthrough")
+		if continuation && metadata.Get("turn_id").String() == turn {
+			native = true
+			return false
+		}
+		if item.Get("role").String() == "developer" {
+			metadata.Get("content_item_kinds").ForEach(func(_, kind gjson.Result) bool {
+				if kind.String() == "model.base_instructions" {
+					native = true
+				}
+				return !native
+			})
+		}
+		return !native
+	})
+	return native
+}
+
 // Incremental native turns contain only new input items, so the base prompt
 // from an earlier frame is absent. Preserve their typed metadata as well.
 func codexNativeContinuation(body map[string]any) bool {

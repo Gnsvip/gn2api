@@ -18,9 +18,11 @@ def test_retest_preserves_both_answers_and_full_output(store):
     assert case["answer_preview"] == "29"
     assert [a["output"] for a in case["attempts"]] == ["29", "21"]
     saved = attempts.listing(store, 7, run_id=result["run_id"])["attempts"]
-    assert [a["finished"]["output"] for a in saved] == ["21", "29"]
+    records = [attempts.detail(store, 7, a["attempt_id"]) for a in saved]
+    assert [next(e['payload']['output'] for e in r['events'] if e['kind'] == 'finished') for r in records] == ['21', '29']
     assert len({a["attempt_id"] for a in saved}) == 2
-    assert saved[0]["metadata"]["prompt"] == "Only answer candy"
+    diagnostic = next(e['payload'] for e in records[0]['events'] if e['kind'] == 'diagnostic')
+    assert diagnostic['metadata']['prompt'] == 'Only answer candy'
 
 
 def test_history_window_does_not_delete_evidence(store):
@@ -44,10 +46,13 @@ def test_cancelled_round_keeps_response_already_received(store):
     control.prompt = changed
     with pytest.raises(s.Cancelled):
         s.run_prompt_round(job, store, FakeAccounts(), control)
-    assert attempts.listing(store, 7)["attempts"][0]["finished"]["output"] == "21"
+    entry = attempts.listing(store, 7)["attempts"][0]
+    assert entry['finished']['output_chars'] == 2
+    record = attempts.detail(store, 7, entry['attempt_id'])
+    assert next(e['payload']['output'] for e in record['events'] if e['kind'] == 'finished') == '21'
 
 
-def test_failure_keeps_partial_stream_and_omits_credentials(store):
+def test_failure_keeps_classified_result_without_raw_traffic_or_credentials(store):
     account = FakeAccounts().get(7)
     job = dict(account_id=7, model="gpt-6-astra", generation=1)
     def failed():
@@ -62,7 +67,9 @@ def test_failure_keeps_partial_stream_and_omits_credentials(store):
     detail = attempts.detail(store, 7, entry["attempt_id"])
     encoded = json.dumps(detail)
     assert "test-secret" not in encoded and "Cookie" not in encoded and "Authorization" not in encoded
-    assert "partial" in encoded and "[REDACTED]" in encoded
+    assert "partial" not in encoded and 'line_base64' not in encoded
+    assert {e['kind'] for e in detail['events']} == {'request', 'finished'}
+    assert 'body' not in detail['events'][0]['payload']
     assert entry["finished"]["status"] == "failed"
 
 
@@ -96,6 +103,76 @@ def test_bank_cannot_confirm_identity_in_new_conditions(monkeypatch):
     result = s.summarize([{}, {}, {}], "gpt-6-astra")
     assert result["status"] == "yellow" and not result["confident"]
     assert result["bank_applicability"] == "unverified" and result["candidate_separated"]
+    assert result['outcome'] == 'candidate_mismatch'
+    assert 'gpt-5.6-luna' in result['message']
+
+
+@pytest.mark.parametrize('second,score,expected', [('gpt-5.6-luna', .99999, 'red'),
+                                                  ('gpt-6-astra', .99999, 'yellow'),
+                                                  ('gpt-5.6-luna', .55, 'yellow')])
+def test_unverified_candidate_mismatch_gets_independent_confirmation_but_never_auto_pauses(store, monkeypatch, second, score, expected):
+    from test_service import FakeControl
+    store.configure(7, True, 'gpt-6-astra', True, 1, challenge_count=1)
+    scored = []
+    def analyze(outputs, bank):
+        prediction = 'gpt-5.6-luna' if not scored else second
+        probability = .99999 if not scored else score
+        scored.append(outputs)
+        return {'results': [{'model':prediction,'probability':probability},
+                            {'model':'other','probability':1-probability}],
+                'prediction':prediction,'probability':probability,'used_outputs':1}
+    monkeypatch.setattr(s, 'analyze_global_outputs', analyze)
+    prompts = []
+    def probe(account, model, challenge, *args):
+        prompts.append(challenge['prompt'])
+        return {'text':f'sample {len(prompts)}'}, model
+    job = claim(store)
+    result = s.run_round(job, store, FakeAccounts(), '', probe)
+    assert result['status'] == expected and result['requests'] == result['valid_samples'] == 2
+    assert len(result['stages']) == len(result['confirmation']) == 2
+    assert len(set(prompts)) == 2 and scored[0] != scored[1]
+    assert result['budget_seconds'] == 1200
+    assert not result['confident'] and result['bank_applicability'] == 'unverified'
+    store.finish(job, result)
+    controller = FakeControl()
+    store.apply_pending_pause(FakeAccounts(), controller)
+    assert controller.calls == [] and store.get(7)['mismatch_streak'] == 0
+
+
+def test_large_evidence_is_bounded_on_screen_and_complete_on_download(store):
+    payload = json.dumps({'line':'event ' + 'x' * 430, 'line_base64':'unchanged-by-export'})
+    big_output = 'answer' * 40000
+    with store.db() as db:
+        db.execute('INSERT INTO probe_attempts(attempt_id,run_id,account_id,started_at,metadata) VALUES(?,?,?,?,?)',
+                   ('large', 'run', 7, time.time(), json.dumps({'kind':'qa','prompt':'p' * 9000})))
+        db.executemany('INSERT INTO probe_attempt_events(attempt_id,at,kind,payload) VALUES(?,?,?,?)',
+                       [('large', time.time(), 'stream', payload)] * 15254)
+        db.execute('INSERT INTO probe_attempt_events(attempt_id,at,kind,payload) VALUES(?,?,?,?)',
+                   ('large',time.time(),'finished',json.dumps({'status':'completed','output':big_output})))
+    client = s.create_app(store, FakeAccounts(), lambda h: h.get('Authorization') == 'ok').test_client()
+    headers = {'Authorization':'ok'}
+    base = '/accounts/7/attempts/large'
+    assert client.get(base+'/events').status_code == client.get(base+'/download').status_code == 401
+    listing = client.get('/accounts/7/attempts', headers=headers)
+    assert len(listing.data) < 1500 and 'prompt' not in listing.json['attempts'][0]['metadata']
+    assert listing.json['attempts'][0]['finished']['output_chars'] == len(big_output)
+    key_page = client.get(base+'/events', headers=headers).json
+    assert key_page['event_count'] == 1 and key_page['total_event_count'] == 15255
+    assert key_page['events'][0]['kind'] == 'finished'
+    assert client.get(base+'/events?view=invalid', headers=headers).status_code == 400
+    page = client.get(base+'/events?view=all', headers=headers)
+    assert len(page.json['events']) == 40 and page.json['event_count'] == 15255 and len(page.data) < 90000
+    last = page.json['events'][-1]['sequence']
+    second_page = client.get(base+f'/events?view=all&after={page.json["next_cursor"]}', headers=headers).json
+    assert second_page['events'][0]['sequence'] > last
+    tail = client.get(base+'/events?after=15254', headers=headers).json
+    assert len(tail['events']) == 1 and tail['events'][0]['truncated'] and len(tail['events'][0]['preview']) == 2000
+    assert client.get('/accounts/8/attempts/large/events', headers=headers).status_code == 404
+    assert client.get('/accounts/8/attempts/large/download', headers=headers).status_code == 404
+    downloaded = client.get(base+'/download', headers=headers)
+    assert downloaded.json == attempts.detail(store, 7, 'large')
+    assert downloaded.json['events'][-1]['payload']['output'] == big_output
+    assert 'attachment' in downloaded.headers['Content-Disposition']
 
 
 def test_attribution_analysis_survives_round_cancellation(store, monkeypatch):
@@ -115,18 +192,52 @@ def test_attribution_analysis_survives_round_cancellation(store, monkeypatch):
     assert analysis["attempt_ids"] == [entry["attempt_id"]]
 
 
-def test_http_error_evidence_is_bounded_redacted_and_marked(store):
+def test_http_error_body_is_neither_read_nor_persisted(store):
     class Response:
         def iter_content(self, chunk_size):
-            yield b'failure test-secret: ' + b'x' * 200
+            pytest.fail('raw error body must not be collected')
     job = dict(account_id=7, model="gpt-6-astra", generation=1)
     attempts.invoke(store, job, "error", FakeAccounts().get(7), {},
                     lambda: attempts.error_body(Response(), 80))
     entry = attempts.listing(store, 7)["attempts"][0]
-    event = attempts.detail(store, 7, entry["attempt_id"])["events"][0]
-    assert event["kind"] == "error_body" and event["payload"]["truncated"]
-    assert event["payload"]["received_bytes"] == 81
-    assert "test-secret" not in json.dumps(event) and "[REDACTED]" in json.dumps(event)
+    events = attempts.detail(store, 7, entry["attempt_id"])["events"]
+    assert [e['kind'] for e in events] == ['finished']
+
+
+def test_stream_size_does_not_grow_results_database(store):
+    job = dict(account_id=7, model='gpt-6-astra', generation=1)
+    def send():
+        attempts.request_snapshot('https://example.test/responses', {'X-Client-Request-Id':'linked'},
+                                  {'model':'gpt-6-astra','instructions':'RAW-INSTRUCTIONS','input':'RAW-BODY'}, 'responses')
+        attempts.emit('gateway_request', {'client_request_id':'linked', 'upstream_attempt_id':'upstream-linked',
+            'details':{'account_id':7,'transport':'codex-http1-openssl36','body':{'input':'RAW-BODY'}}})
+        attempts.compare_contract({'instructions':'RAW-CONTRACT'})
+        for _ in range(15254):
+            attempts.stream_line(b'data: RAW-STREAM' + b'x' * 430)
+        attempts.emit('parsed_output', {'output':'DUPLICATE-OUTPUT'})
+        return '29'
+    _, identity = attempts.invoke(store, job, 'results-only', FakeAccounts().get(7), {'kind':'qa'}, send)
+    data = attempts.detail(store, 7, identity)
+    assert data['metadata']['capture_mode'] == 'first-normal-anomaly-v1'
+    encoded = json.dumps(data)
+    assert all(marker not in encoded for marker in ('RAW-INSTRUCTIONS','RAW-BODY','RAW-CONTRACT','RAW-STREAM','DUPLICATE-OUTPUT','line_base64'))
+    assert 'upstream-linked' in encoded and data['events'][-1]['payload']['output'] == '29'
+    assert len(data['events']) == 4 and len(encoded) < 3000
+    with store.db() as db:
+        assert db.execute('SELECT count(*) FROM probe_attempt_events WHERE kind IN (\'stream\',\'error_body\',\'parsed_output\')').fetchone()[0] == 0
+
+
+def test_insufficient_sample_preserves_the_answer_once_without_stream(store):
+    job = dict(account_id=7, model='gpt-6-astra', generation=1)
+    def insufficient():
+        attempts.emit('parsed_output', {'output':'137 42', 'parsed_count':2, 'minimum_count':80})
+        raise s.InsufficientSample('too few numbers')
+    with pytest.raises(s.InsufficientSample):
+        attempts.invoke(store, job, 'insufficient', FakeAccounts().get(7), {}, insufficient)
+    entry = attempts.listing(store, 7)['attempts'][0]
+    data = attempts.detail(store, 7, entry['attempt_id'])
+    assert len(data['events']) == 1 and data['events'][0]['payload']['output'] == '137 42'
+    assert data['events'][0]['payload']['parsed_count'] == 2
 
 
 @pytest.mark.parametrize("change", ["context", "metadata", "proxy", "instructions", "effort", "transport"])
