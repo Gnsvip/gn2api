@@ -92,7 +92,8 @@
     }
     if (result.status === 'green') return result.test_mode === 'qa' ? '通过' : '与预期一致';
     if (result.status === 'red') return result.test_mode === 'qa' ? '未通过' : '复测仍不符';
-    const titles = { round_timeout: '检测超时', upstream_error: '上游错误', insufficient_samples: '样本不足',
+    const titles = { round_timeout: '检测超时', gateway_timeout: '网关测试超时', stream_interrupted: '响应连接中断',
+      upstream_error: '上游错误', insufficient_samples: '样本不足',
       bank_unverified: '指纹库未校准', capability_unavailable: '接口不支持此档位',
       output_limit: '回答文本超限', stream_limit: '传输数据超限', artifact_limit: '作品过大', artifact_format: '作品格式不正确' };
     if (titles[result.outcome]) return titles[result.outcome];

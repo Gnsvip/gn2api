@@ -415,14 +415,15 @@ with sync_playwright() as p:
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
         requests=2, reasoning_effort='medium', message=message, outcome=outcome)
-        for outcome, message in [('round_timeout', '本轮检测超时'), ('upstream_error', '上游处理错误'),
+        for outcome, message in [('round_timeout', '本轮检测超时'), ('gateway_timeout', '网关测试请求超时'),
+                                 ('stream_interrupted', '响应连接中断'), ('upstream_error', '上游处理错误'),
                                  ('bank_unverified', '仅展示候选'), ('insufficient_samples', '有效回答不足')]]
     page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
     page.locator('[data-row-id="8"] .mt-label').click()
     page.get_by_role('tab', name='模型归因', exact=True).click()
     assert page.get_by_label('归因推理等级', exact=True).input_value() == 'medium'
-    page.get_by_role('button', name='查看全部 4 条', exact=True).click()
-    for title in ('检测超时', '上游错误', '指纹库未校准', '样本不足'):
+    page.get_by_role('button', name='查看全部 6 条', exact=True).click()
+    for title in ('检测超时', '网关测试超时', '响应连接中断', '上游错误', '指纹库未校准', '样本不足'):
         assert page.locator('[role=tabpanel]:visible .mt-result-title').filter(has_text=title).count() == 1
     assert '每轮最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-effort-settings.png')))

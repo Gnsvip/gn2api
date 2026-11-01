@@ -2,12 +2,16 @@ package service
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
 
 const attributionTestContextKey = "account_test_attribution"
+
+// AccountTestAttributionTimeout is also exposed by the admin capabilities API.
+const AccountTestAttributionTimeout = 720 * time.Second
 
 // IsAttributionTestMode keeps monitoring separate from manual account recovery.
 func IsAttributionTestMode(mode string) bool {

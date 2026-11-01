@@ -16,10 +16,10 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261102-single-pass-2'
+VERSION = '20261102-timeout-1'
 FILES = ['service.py', 'attempts.py', 'evidence.py', 'test_evidence.py', 'test_attempts.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
          'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py',
-         'test_single_pass.py', 'test_lifecycle.py', 'CALIBRATION.md']
+         'test_single_pass.py', 'test_lifecycle.py', 'test_gateway_failures.py', 'CALIBRATION.md']
 
 
 def digest(path):
@@ -121,6 +121,7 @@ def main():
                            'single batch attribution and one request per question; 720-second round budget',
                            'honor opt-in candidate-mismatch pause thresholds; clean deleted-account records between rounds',
                            'separate answer and stream limits; inline short answers; extract legacy HTML/SVG previews',
+                           'classified gateway timeout/disconnect events; continue independent questions within the round budget',
                            'nginx script version and 128k body limit'])
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not args.apply:

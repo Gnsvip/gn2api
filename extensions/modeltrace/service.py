@@ -719,6 +719,18 @@ def manual_preview_prompt(prompt):
                      '不要输出工具调用记录。你的回复本身就是要预览的作品。')
 
 
+def gateway_failure(event):
+    # Classify bounded gateway codes; never display or persist raw errors/URLs.
+    code = event.get('code')
+    if code == 'test_timeout':
+        return ProbeError('网关测试请求超时，未收到完整回答', 'gateway_timeout')
+    error = event.get('error')
+    if code == 'stream_interrupted' or (isinstance(error, str) and (
+            error.startswith('Stream read error:') or error == 'Stream ended before response.completed')):
+        return ProbeError('响应连接中断，未收到完整回答', 'stream_interrupted')
+    return ProbeError('上游返回处理错误，未收到完整回答', 'upstream_error')
+
+
 class AnswerText:
     """Bound decoded answer bytes independently of transport/audit overhead."""
     def __init__(self):
@@ -1205,32 +1217,39 @@ def run_qa_round(job, store, accounts, controller):
             item = {"id": case["id"], "name": case["name"], "expected_answer": case["expected_answer"],
                     "status": "yellow", "requests": 0, "kind": case["kind"], "attempts": []}
             results.append(item)
-            if case["kind"] == "manual":
+            try:
                 check_account()
                 requests_sent += 1
                 item["requests"] = 1
                 output = ask(case, 0)
                 check_account()
-                artifacts[case["id"]] = {"html": html_artifact(output), "prompt": case["prompt"]}
-                item.update(review_status="pending", artifact_available=True, message="已生成作品，待人工预览评分")
-                continue
-            check_account()
-            requests_sent += 1
-            item['requests'] = 1
-            output = ask(case, 0)
-            check_account()
-            answer = normalized_answer(output)
-            if not answer:
-                raise ProbeError('模型未返回可判定的文字答案')
-            item.update(comparison_observed=True, answer_preview=output.strip()[:160],
-                        answer_truncated=len(output.strip()) > 160)
-            matched = answer == normalized_answer(case['expected_answer'])
-            item.update(status='green' if matched else 'red',
-                        message='答案符合预期' if matched else '答案与预期不符')
+                if case['kind'] == 'manual':
+                    artifacts[case['id']] = {'html': html_artifact(output), 'prompt': case['prompt']}
+                    item.update(review_status='pending', artifact_available=True, message='已生成作品，待人工预览评分')
+                    continue
+                answer = normalized_answer(output)
+                if not answer:
+                    raise ProbeError('模型未返回可判定的文字答案')
+                item.update(comparison_observed=True, answer_preview=output.strip()[:160],
+                            answer_truncated=len(output.strip()) > 160)
+                matched = answer == normalized_answer(case['expected_answer'])
+                item.update(status='green' if matched else 'red',
+                            message='答案符合预期' if matched else '答案与预期不符')
+            except ProbeError as exc:
+                if exc.code not in ('upstream_error', 'stream_interrupted', 'gateway_timeout',
+                                    'output_limit', 'stream_limit', 'artifact_format', 'artifact_limit'):
+                    raise
+                # Independent questions still run once if the shared round has time.
+                # Cancellation, changed account routing, and round expiry still abort.
+                item.update(message=str(exc), outcome=exc.code)
         check_account()
         status = qa_status(results)
         result = {"status": status, "message": {"green": "所选问答全部符合预期", "red": "有题目答案与预期不符",
                                                 "yellow": "本轮含待确认结果"}[status], "_context": context.hex(), "round_complete": True}
+        failures = [item for item in results if item.get('outcome')]
+        if failures:
+            result.update(outcome=failures[0]['outcome'], round_complete=False,
+                          message='；'.join(item['name'] + '：' + item['message'] for item in failures))
     except ProbeError as exc:
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code, "round_complete": False}
         if results and results[-1]["status"] == "yellow":
@@ -1420,7 +1439,9 @@ class SchedulingControl:
                     if response.status_code != 200:
                         attempts.error_body(response, MAX_RESPONSE_BYTES)
                         raise ProbeError("账号测试接口返回错误")
-                    for raw in response.iter_lines(chunk_size=256):
+                    # Preserve flushed HTTP chunks: a short error event must not wait
+                    # for a 256-byte read buffer to fill while the server closes upstream.
+                    for raw in response.iter_lines(chunk_size=None):
                         attempts.stream_line(raw, limit=MAX_RESPONSE_BYTES)
                         if cancelled():
                             raise Cancelled()
@@ -1458,7 +1479,7 @@ class SchedulingControl:
                             if isinstance(text, str):
                                 pieces.append(text)
                         elif event_type == "error":
-                            raise ProbeError("上游返回处理错误，本轮未完成", "upstream_error")
+                            raise gateway_failure(event)
                         elif event_type == "test_complete":
                             complete = event.get("success") is True
                             if not complete:

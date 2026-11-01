@@ -378,7 +378,9 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 			return s.sendErrorAndEnd(c, "Unsupported attribution prompt, model or account type")
 		}
 		c.Set(attributionTestContextKey, true)
-		probeCtx, cancel := context.WithTimeout(c.Request.Context(), 240*time.Second)
+		// ModelTrace gives the whole round twelve minutes; the gateway must not
+		// terminate an individual long-form response after the old four-minute cap.
+		probeCtx, cancel := context.WithTimeout(c.Request.Context(), AccountTestAttributionTimeout)
 		defer cancel()
 		c.Request = c.Request.WithContext(probeCtx)
 	}
@@ -3370,7 +3372,13 @@ func (s *AccountTestService) sendEvent(c *gin.Context, event TestEvent) {
 // sendErrorAndEnd sends an error event and ends the stream
 func (s *AccountTestService) sendErrorAndEnd(c *gin.Context, errorMsg string) error {
 	logAccountTestError(c, errorMsg)
-	s.sendEvent(c, TestEvent{Type: "error", Error: errorMsg})
+	code := "upstream_error"
+	if isAttributionProbe(c) && errors.Is(c.Request.Context().Err(), context.DeadlineExceeded) {
+		code = "test_timeout"
+	} else if strings.HasPrefix(errorMsg, "Stream read error:") || errorMsg == "Stream ended before response.completed" {
+		code = "stream_interrupted"
+	}
+	s.sendEvent(c, TestEvent{Type: "error", Error: errorMsg, Code: code})
 	return fmt.Errorf("%s", errorMsg)
 }
 
