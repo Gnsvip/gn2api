@@ -1762,11 +1762,19 @@ func (s *OpenAIGatewayService) FetchCodexModelsManifest(ctx context.Context, acc
 		setOpenAIChatGPTAccountHeaders(headers, credAccount)
 	}
 	headers.Set("Accept", "application/json")
+	if !useAPIKeyUpstream {
+		headers.Set("Accept", "*/*")
+	}
 	overrideUA := ""
 	if !useAPIKeyUpstream {
-		overrideUA = credAccount.GetOpenAIUserAgent()
+		overrideUA = s.codexIdentityOverrideUA(credAccount)
 	}
 	identity := resolveCodexOutboundIdentity(overrideUA)
+	if !useAPIKeyUpstream && codexModelsBootstrapRequest(ctx) {
+		// Preserve the CLI initialization stage while retaining the account's
+		// selected outbound family/platform and canonical version.
+		identity.userAgent = strings.TrimSuffix(identity.userAgent, " ("+identity.originator+"; "+identity.version+")")
+	}
 	headers.Set("Originator", identity.originator)
 	headers.Set("User-Agent", identity.userAgent)
 	// Version 头优先与 client_version 查询参数同源：客户端自报版本合法且不低于上游
@@ -1948,6 +1956,11 @@ func (s *OpenAIGatewayService) fetchOpenAIModelsUpstream(ctx context.Context, re
 		handled := false
 		if s.pluginManager != nil {
 			resp, handled, err = s.pluginManager.RoundTripOpenAIOAuth(reqCtx, req, request.proxyURL, request.credentialAccount)
+		}
+		if !handled && s.httpUpstream != nil && codexHTTPEgressEligible(s.cfg, request.credentialAccount, req.URL, req.Header) {
+			req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
+			resp, err = doCodexEgressHTTP(s.cfg, s.httpUpstream, req, request.proxyURL, request.credentialAccount)
+			handled = true
 		}
 		if !handled {
 			client, clientErr := httpclient.GetClient(httpclient.Options{

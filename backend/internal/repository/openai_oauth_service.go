@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -84,26 +86,30 @@ func (s *openaiOAuthService) RefreshTokenWithClientID(ctx context.Context, refre
 
 func (s *openaiOAuthService) refreshTokenWithClientID(ctx context.Context, refreshToken, proxyURL, clientID string) (*openai.TokenResponse, error) {
 	client, err := createOpenAIReqClient(proxyURL)
+	if clientID == openai.ClientID && s.tokenURL == openai.TokenURL {
+		client, err = newCodexTokenReqClient(proxyURL)
+	}
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_CLIENT_INIT_FAILED", "create HTTP client: %v", err)
 	}
 
-	formData := url.Values{}
-	formData.Set("grant_type", "refresh_token")
-	formData.Set("refresh_token", refreshToken)
-	formData.Set("client_id", clientID)
-	formData.Set("scope", openai.RefreshScopes)
-
 	var tokenResp openai.TokenResponse
-
-	authUA, authOriginator := service.CodexCanonicalAuthIdentity()
-	resp, err := client.R().
-		SetContext(ctx).
-		SetHeader("User-Agent", authUA).
-		SetHeader("originator", authOriginator).
-		SetFormDataFromValues(formData).
-		SetSuccessResult(&tokenResp).
-		Post(s.tokenURL)
+	authUA, authOriginator := service.CodexAuthIdentityForContext(ctx)
+	request := client.R().SetContext(ctx).
+		SetHeader("User-Agent", authUA).SetHeader("originator", authOriginator).
+		SetSuccessResult(&tokenResp)
+	if clientID == openai.ClientID {
+		payload := map[string]string{"grant_type": "refresh_token", "refresh_token": refreshToken, "client_id": clientID}
+		if reason := openai.RefreshReason(ctx); reason != "" {
+			payload["refresh_reason"] = reason
+		}
+		request.SetBodyJsonMarshal(payload).SetHeader("Content-Type", "application/json")
+	} else {
+		// Custom clients have no captured Codex contract; preserve their existing grant.
+		request.SetFormDataFromValues(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refreshToken},
+			"client_id": {clientID}, "scope": {openai.RefreshScopes}})
+	}
+	resp, err := request.Post(s.tokenURL)
 
 	if err != nil {
 		if shouldReturnOpenAINoProxyHint(ctx, proxyURL, err) {
@@ -113,7 +119,7 @@ func (s *openaiOAuthService) refreshTokenWithClientID(ctx context.Context, refre
 	}
 
 	if !resp.IsSuccessState() {
-		return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_TOKEN_REFRESH_FAILED", "token refresh failed: status %d, body: %s", resp.StatusCode, resp.String())
+		return nil, openai.NewRefreshTokenError(resp.StatusCode, resp.Bytes())
 	}
 
 	return &tokenResp, nil
@@ -142,4 +148,23 @@ func newOpenAINoProxyHintError(cause error) error {
 		"OPENAI_OAUTH_PROXY_REQUIRED",
 		"OpenAI OAuth request failed: no proxy is configured and this server could not reach OpenAI directly. Select a proxy that can access OpenAI, then retry; if the authorization code has expired, regenerate the authorization URL.",
 	).WithCause(cause)
+}
+
+// RetireAuthClient replaces this account's saved auth transport after a
+// successful guarded reload, including a reload of unchanged credentials.
+// Retire drains active streams; it never interrupts another in-flight refresh.
+func (s *openaiOAuthService) RetireAuthClient(ctx context.Context, refreshToken, clientID string) {
+	if id := openai.CodexAuthAccountFromContext(ctx); id > 0 {
+		// A successful reload replaces the account's auth client, including
+		// snapshots loaded concurrently with a different token or device.
+		codexAuthH2Pool.Retire(fmt.Sprintf("auth-account-%d", id))
+		return
+	}
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		clientID = openai.ClientID
+	}
+	body, _ := json.Marshal(map[string]string{"client_id": clientID, "grant_type": "refresh_token", "refresh_token": refreshToken})
+	ua, originator := service.CodexAuthIdentityForContext(ctx)
+	codexAuthH2Pool.Retire(codexAuthPoolKey(ctx, s.tokenURL, http.Header{"User-Agent": {ua}, "Originator": {originator}}, body))
 }

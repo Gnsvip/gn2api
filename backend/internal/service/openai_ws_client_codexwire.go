@@ -20,7 +20,8 @@ import (
 // ErrClosedByPeer surfaces as coderws.CloseError so the existing close-status
 // classifiers keep working.
 type codexWireClientConn struct {
-	conn *codexwire.WSConn
+	conn          *codexwire.WSConn
+	codexTimezone string
 }
 
 var _ openAIWSClientConn = (*codexWireClientConn)(nil)
@@ -34,6 +35,10 @@ func (c *codexWireClientConn) WriteJSON(ctx context.Context, value any) error {
 		ctx = context.Background()
 	}
 	payload, err := codexwire.PrepareWSMessage(value)
+	if err != nil {
+		return err
+	}
+	payload, err = applyCodexTimezone(payload, c.codexTimezone, time.Now())
 	if err != nil {
 		return err
 	}
@@ -77,6 +82,10 @@ func (c *codexWireClientConn) WriteFrame(ctx context.Context, msgType coderws.Me
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	payload, err := prepareCodexTimezoneWSFrame(payload, c.codexTimezone, msgType == coderws.MessageText)
+	if err != nil {
+		return err
 	}
 	if msgType == coderws.MessageBinary {
 		return c.conn.WriteMessageBinary(ctx, payload)
@@ -150,7 +159,13 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 	// the existing dialer rather than silently bypassing their configured proxy.
 	plaintextProxy := target != nil && (target.Scheme == "ws" || target.Scheme == "http") && strings.TrimSpace(req.ProxyURL) != ""
 	if plaintextProxy || !codexEgressEligible(cfg, req.Account, target, headers) {
-		return fallback.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+		conn, status, responseHeaders, err := fallback.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+		if target != nil && strings.EqualFold(target.Hostname(), "chatgpt.com") && target.Path == "/backend-api/codex/responses" {
+			if concrete, ok := conn.(*coderOpenAIWSClientConn); ok {
+				concrete.codexTimezone = codexAccountTimezone(req.Account)
+			}
+		}
+		return conn, status, responseHeaders, err
 	}
 	headers = headers.Clone()
 	codexwire.ProjectBusinessHeaders(headers, true)
@@ -159,7 +174,10 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 	// cookie/attestation 等模板外注入头）按出现顺序附在官方头之后。
 	ordered = append(ordered, leftover...)
 
-	profile := tlsfingerprint.BuiltinProfile("rustls")
+	profile, caErr := codexwire.WithCodexCustomCA(tlsfingerprint.BuiltinProfile("rustls"))
+	if caErr != nil {
+		return nil, 0, nil, caErr
+	}
 	timeout := 15 * time.Second
 	if cfg.Gateway.OpenAIWS.DialTimeoutSeconds > 0 {
 		timeout = time.Duration(cfg.Gateway.OpenAIWS.DialTimeoutSeconds) * time.Second
@@ -179,5 +197,5 @@ func dialOpenAIWSForAccount(ctx context.Context, cfg *config.Config, req openAIW
 		}
 		return nil, status, respHeaders, &openAIWSHandshakeError{Body: body, Err: err}
 	}
-	return &codexWireClientConn{conn: wsConn}, 0, res.Headers, nil
+	return &codexWireClientConn{conn: wsConn, codexTimezone: codexAccountTimezone(req.Account)}, 0, res.Headers, nil
 }

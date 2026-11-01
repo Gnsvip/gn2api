@@ -150,8 +150,8 @@ func TestCodexEgressDefaultHTTPRouteForAllEligibleAccounts(t *testing.T) {
 	}
 }
 
-// Use the official 0.166.0 requests, including refresh/tool-loop requests,
-// rather than merely updating a hand-written version string in a fixture.
+// Replay only the Responses requests in the official 0.166.0 scenarios.
+// OAuth refresh and model catalog contracts have separate endpoint tests.
 func TestCodexEgress166CapturedRequests(t *testing.T) {
 	files, err := filepath.Glob("../pkg/codexwire/testdata/golden/0.166.0/*.jsonl")
 	if err != nil || len(files) != 6 {

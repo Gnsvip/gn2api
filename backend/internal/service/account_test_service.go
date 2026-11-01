@@ -907,6 +907,10 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth, prompt)
+	if err := s.prepareComparison(c, credentialAccount, modelID, upstreamTestModelID, payload); err != nil {
+		return s.sendErrorAndEnd(c, err.Error())
+	}
+	ctx = c.Request.Context()
 	if isOAuth {
 		_ = prepareIntelligentTestProtection(c, credentialAccount, payload)
 	}
@@ -974,6 +978,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	}
 
 	resp, err := s.doOpenAIAccountTestUpstream(req, proxyURL, account, true)
+	if resp != nil {
+		comparisonAudit(ctx, "test_response", map[string]any{"http_status": resp.StatusCode, "headers": comparisonHeaders(resp.Header)})
+	}
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
@@ -3005,9 +3012,13 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader) error {
 	reader := bufio.NewReader(body)
 	seenCompleted := false
+	seenText := false
 
 	for {
 		line, err := reader.ReadString('\n')
+		if line != "" {
+			comparisonAudit(c.Request.Context(), "upstream_raw_line", line)
+		}
 		if err != nil {
 			if err == io.EOF {
 				if seenCompleted {
@@ -3038,12 +3049,14 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 			continue
 		}
 
+		comparisonAudit(c.Request.Context(), "upstream_event", data)
 		eventType, _ := data["type"].(string)
 
 		switch eventType {
 		case "response.output_text.delta":
 			// OpenAI Responses API uses "delta" field for text content
 			if delta, ok := data["delta"].(string); ok && delta != "" {
+				seenText = true
 				s.sendEvent(c, TestEvent{Type: "content", Text: delta})
 			}
 		case "response.completed", "response.done":
@@ -3051,6 +3064,15 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 				responseData, ok := data["response"].(map[string]any)
 				if !ok || responseData["status"] != "completed" || responseData["error"] != nil {
 					return s.sendErrorAndEnd(c, "Attribution response did not complete normally")
+				}
+			}
+			if !seenText {
+				for _, item := range gjson.Get(jsonStr, "response.output").Array() {
+					for _, content := range item.Get("content").Array() {
+						if content.Get("type").String() == "output_text" {
+							s.sendEvent(c, TestEvent{Type: "content", Text: content.Get("text").String()})
+						}
+					}
 				}
 			}
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})

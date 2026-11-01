@@ -82,6 +82,7 @@ func providePluginHostInfo(buildInfo handler.BuildInfo) service.PluginHostInfo {
 }
 
 func provideCleanup(
+	requestTimezoneWorker *service.OpenAIRequestTimezoneRefreshWorker,
 	entClient *ent.Client,
 	rdb *redis.Client,
 	opsMetricsCollector *service.OpsMetricsCollector,
@@ -339,6 +340,7 @@ func provideCleanup(
 				}
 				return nil
 			}},
+			{"OpenAIRequestTimezone", func() error { requestTimezoneWorker.Stop(); return nil }},
 			{"OpenAIWSPool", func() error {
 				if openAIGateway != nil {
 					openAIGateway.CloseOpenAIWSPool()

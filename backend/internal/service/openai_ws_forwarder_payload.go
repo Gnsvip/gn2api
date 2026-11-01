@@ -269,6 +269,31 @@ func codexWSInstructionsItemID(instructions string) string {
 	return "msg_" + fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
+func codexInputCarriesBaseInstructions(body []byte) bool {
+	var reqBody map[string]any
+	return json.Unmarshal(body, &reqBody) == nil && codexInputMapCarriesBaseInstructions(reqBody)
+}
+
+// Incremental native turns contain only new input items, so the base prompt
+// from an earlier frame is absent. Preserve their typed metadata as well.
+func codexNativeContinuation(body map[string]any) bool {
+	previous, _ := body["previous_response_id"].(string)
+	metadata, _ := body["client_metadata"].(map[string]any)
+	turn, _ := metadata["turn_id"].(string)
+	if previous == "" || turn == "" {
+		return false
+	}
+	input, _ := body["input"].([]any)
+	for _, value := range input {
+		item, _ := value.(map[string]any)
+		meta, _ := item["internal_chat_message_metadata_passthrough"].(map[string]any)
+		if meta["turn_id"] == turn {
+			return true
+		}
+	}
+	return false
+}
+
 // codexInputMapCarriesBaseInstructions reports whether a decoded body already
 // carries the official Codex base-instructions item (a developer message tagged
 // model.base_instructions).

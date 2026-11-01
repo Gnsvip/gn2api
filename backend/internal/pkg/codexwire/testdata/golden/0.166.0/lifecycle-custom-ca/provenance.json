@@ -1,0 +1,27 @@
+{
+  "source_directory": "reference-h2-20261101T075746Z",
+  "recording": "independent official CLI capture against synthetic loopback upstream",
+  "receipt": {
+    "exit_code": 0,
+    "mode": "reference",
+    "custom_ca": true,
+    "out": "reference-h2-20261101T075746Z",
+    "recorder": "codexgolden-linux-amd64",
+    "production_changed": false,
+    "model_inference_requests": 0,
+    "recorder_sha256": "708ceab7cb1715855086490f8caeb7882a5ce003bf4a60cf019d75425be49785",
+    "cli_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
+    "models_sha256": "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
+  },
+  "files_sha256": {
+    "http_fallback_tool_loop.jsonl": "a6e1d8842265793aa10e3ce15e4c78a73512194a698344fecfa8de6cd569d8a1",
+    "http_unauthorized_refresh.jsonl": "63d103fbf30e9a0c288c18dc098902bd68aa8fd1e26385df7265009e4f55303e",
+    "meta.json": "ef5d973bae6f97c0abf5715e1523a48ae442cc3eb3352c078cc87766b2f04195",
+    "tls_clienthellos.json": "e300ad63b0d8c69b17e19eed93ea55023e2e5399695da0bd220a62f5bd60b266",
+    "tls_clienthellos_scenarios.json": "f8cf6a6d4c8df2a4a9624d6b41bcc85f9ac7665e71679fe23cc761d681190e92",
+    "ws_compaction.jsonl": "0d8bd0bc1c8d9542fa12469d54d780734861d975f8786c827311f9ed29a906bf",
+    "ws_initial.jsonl": "beac15cfc581a3acd043913febc7d95fd69876106a1dc01689d97309d983fdfb",
+    "ws_tool_loop.jsonl": "84481e83fbb401dde05699747a55cf2b12abb3a3301dc2ed64241ad78e9df17c",
+    "ws_unauthorized_refresh.jsonl": "57d3440583f3fd1e1b08ad5e138a11a52a091c05fac36060f5dcb8844a86460d"
+  }
+}

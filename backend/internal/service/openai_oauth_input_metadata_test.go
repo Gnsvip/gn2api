@@ -82,3 +82,22 @@ func TestOAuthInputInternalMetadataCompatibility(t *testing.T) {
 	require.True(t, ok)
 	require.NotContains(t, input[0], "internal_chat_message_metadata_passthrough")
 }
+
+func TestOAuthNativeToolContinuationMetadataSurvives(t *testing.T) {
+	const body = `{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_first","client_metadata":{"turn_id":"turn-current"},"input":[{"type":"function_call_output","id":"fco_123","call_id":"call_123","output":"result","internal_chat_message_metadata_passthrough":{"turn_id":"turn-current","create_time":123}}]}`
+	for _, normalize := range []func([]byte) ([]byte, bool, error){
+		normalizeOpenAIOAuthResponsesCompatibilityBody,
+		func(b []byte) ([]byte, bool, error) {
+			return normalizeOpenAIResponsesWebSocketCompatibilityBody(b, &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}, false)
+		},
+	} {
+		out, _, err := normalize([]byte(body))
+		require.NoError(t, err)
+		require.Equal(t, "turn-current", gjson.GetBytes(out, "input.0.internal_chat_message_metadata_passthrough.turn_id").String())
+		require.Equal(t, int64(123), gjson.GetBytes(out, "input.0.internal_chat_message_metadata_passthrough.create_time").Int())
+		require.Equal(t, "result", gjson.GetBytes(out, "input.0.output").String())
+	}
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal([]byte(body), &decoded))
+	require.False(t, normalizeOpenAIOAuthResponsesCompatibilityFields(decoded))
+}

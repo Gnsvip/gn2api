@@ -22,3 +22,22 @@ func CodexClientUserAgentFromContext(ctx context.Context) string {
 	value, _ := ctx.Value(codexClientUAContextKey{}).(string)
 	return value
 }
+
+type codexAuthAccountContextKey struct{}
+
+// WithCodexAuthAccount isolates the transport owned by a persisted account's
+// auth state. The local account ID is never sent as an upstream header.
+func WithCodexAuthAccount(ctx context.Context, accountID int64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, codexAuthAccountContextKey{}, accountID)
+}
+
+func CodexAuthAccountFromContext(ctx context.Context) int64 {
+	if ctx != nil {
+		id, _ := ctx.Value(codexAuthAccountContextKey{}).(int64)
+		return id
+	}
+	return 0
+}

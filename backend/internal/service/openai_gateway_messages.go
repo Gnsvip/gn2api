@@ -610,7 +610,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 }
 
 func ensureCodexOAuthInstructionsField(reqBody map[string]any) {
-	if reqBody == nil {
+	if reqBody == nil || codexInputMapCarriesBaseInstructions(reqBody) {
 		return
 	}
 	if value, ok := reqBody["instructions"]; !ok || value == nil {

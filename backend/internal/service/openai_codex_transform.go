@@ -1519,7 +1519,7 @@ func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 
 // applyInstructions 处理 instructions 字段：仅在 instructions 为空时填充默认值。
 func applyInstructions(reqBody map[string]any, isCodexCLI bool) bool {
-	if !isInstructionsEmpty(reqBody) {
+	if !isInstructionsEmpty(reqBody) || codexInputMapCarriesBaseInstructions(reqBody) {
 		return false
 	}
 	model, _ := reqBody["model"].(string)

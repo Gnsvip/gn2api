@@ -211,12 +211,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	acquireCtx, acquireCancel := context.WithTimeout(ctx, s.openAIWSAcquireTimeout())
 	defer acquireCancel()
 
-	lease, err := s.getOpenAIWSConnPool().Acquire(acquireCtx, openAIWSAcquireRequest{
+	lease, err := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, s.getOpenAIWSConnPool(), &openAIWSAcquireRequest{
 		Account: account,
 		WSURL:   wsURL,
 		Headers: wsHeaders,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
-			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
+			return s.refreshOpenAIWSAuthHeaders(factoryCtx, account, headers)
 		},
 		PreferredConnID: preferredConnID,
 		ForceNewConn:    forceNewConn,

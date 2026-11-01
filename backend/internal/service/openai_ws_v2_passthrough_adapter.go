@@ -867,16 +867,19 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	agentTaskRecoveryTried := false
+	oauthRecoveryStep := 0
+	var oauthCredentialOwner *Account
+	oauthRefreshReplayed := false
 	var upstreamConn openAIWSClientConn
 	statusCode := 0
 	var handshakeHeaders http.Header
 	for {
-		headers, err = s.refreshOpenAIAgentIdentityHeaders(ctx, account, headers)
+		headers, err = s.refreshOpenAIWSAuthHeaders(ctx, account, headers)
 		if err != nil {
 			return fmt.Errorf("refresh ws authentication headers: %w", err)
 		}
 		dialCtx, cancelDial := context.WithTimeout(ctx, s.openAIWSDialTimeout())
-		upstreamConn, statusCode, handshakeHeaders, err = dialOpenAIWSForAccount(dialCtx, s.cfg, openAIWSAcquireRequest{Account: account, WSURL: wsURL, ProxyURL: proxyURL}, headers, dialer)
+		upstreamConn, statusCode, handshakeHeaders, err = dialOpenAIWSForAccount(dialCtx, s.cfg, openAIWSAcquireRequest{Account: s.accountWithEgressTimezone(ctx, account, proxyURL), WSURL: wsURL, ProxyURL: proxyURL}, headers, dialer)
 		cancelDial()
 		if err == nil {
 			break
@@ -894,6 +897,22 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			}
 			continue
 		}
+		if statusCode == http.StatusUnauthorized && oauthRefreshReplayed {
+			s.openAITokenProvider.RecordUnauthorizedAfterRefresh(ctx, oauthCredentialOwner, strings.TrimPrefix(headers.Get("Authorization"), "Bearer "))
+		}
+		if statusCode == http.StatusUnauthorized && oauthRecoveryStep < 2 {
+			var recovered bool
+			if oauthRecoveryStep == 0 {
+				headers, oauthCredentialOwner, recovered = s.reloadOpenAIOAuthHeaders(ctx, account, headers)
+			} else {
+				headers, recovered = s.recoverOpenAIOAuthHeaders(ctx, oauthCredentialOwner, headers)
+				oauthRefreshReplayed = recovered
+			}
+			oauthRecoveryStep++
+			if recovered {
+				continue
+			}
+		}
 		logOpenAIWSV2Passthrough(
 			"relay_dial_failed account_id=%d status_code=%d err=%s",
 			account.ID,
@@ -901,6 +920,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
 		)
 		s.handleOpenAIWSDialTransientFailure(ctx, account, capturedSessionModel, dialErr)
+		if action := openAIWSSessionFallbackActionFor(classifyOpenAIWSAcquireError(dialErr)); action.capability {
+			s.markOpenAIWSSessionDisabled(resolveOpenAIWSSessionScope(c, account, originalFirstClientMessage), action.reason)
+		}
 		if statusCode == http.StatusTooManyRequests {
 			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), capturedSessionModel)
 			return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, nil, err.Error())

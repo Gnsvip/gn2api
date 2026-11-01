@@ -27,6 +27,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyutil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/servertiming"
@@ -167,6 +168,8 @@ type httpUpstreamService struct {
 	clients map[string]*upstreamClientEntry // 客户端缓存池，key 由隔离策略决定
 	// OpenAI 走 HTTP/HTTPS 代理时的 H2->H1 回退状态（key=标准化 proxyKey）
 	openAIHTTP2Fallbacks sync.Map
+	codexH2Once          sync.Once
+	codexH2Pool          *codexwire.H2Pool
 }
 
 // NewHTTPUpstream 创建通用 HTTP 上游服务
@@ -272,6 +275,9 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		return nil, err
 	}
 
+	if profile.H2 {
+		return s.doCodexH2(req, proxyURL, accountID, profile)
+	}
 	if profile.H1 {
 		return s.doCodexH1(req, proxyURL, profile, upstreamProfile)
 	}

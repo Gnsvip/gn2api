@@ -403,7 +403,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	instructions := gjson.GetBytes(body, "instructions")
 	instructionsEmpty := !instructions.Exists() || instructions.Type != gjson.String || strings.TrimSpace(instructions.String()) == ""
-	if instructionsEmpty && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses {
+	if instructionsEmpty && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses && !codexInputCarriesBaseInstructions(body) {
 		markPatchSet("instructions", defaultCodexSynthInstructions(upstreamModel))
 	}
 	if billingModel != requestedModel {
@@ -1712,5 +1712,16 @@ func (s *OpenAIGatewayService) codexIdentityOverrideUA(account *Account) string 
 	if s != nil && s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		return ""
 	}
-	return account.GetOpenAIUserAgent()
+	if !isCodexOAuthAccount(account) {
+		return account.GetOpenAIUserAgent()
+	}
+	// Keep the account's explicitly selected client family/platform consistent
+	// across request synthesis and outbound HTTP/WS headers.
+	if ua := strings.TrimSpace(account.GetOpenAIUserAgent()); ua != "" {
+		return ua
+	}
+	if profile, ok := resolveCodexDeviceProfile(account); ok {
+		return profile.UserAgent
+	}
+	return ""
 }

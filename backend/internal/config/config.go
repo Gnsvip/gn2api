@@ -1365,6 +1365,8 @@ const DefaultOpenAIWSClientFirstMessageTimeoutSeconds = 30
 // GatewayOpenAIWSConfig OpenAI Responses WebSocket 配置。
 // 注意：默认全局开启；如需回滚可使用 force_http 或关闭 enabled。
 type GatewayOpenAIWSConfig struct {
+	// Codex custom-CA rustls/h2 lane; default false preserves native OpenSSL/h1.
+	CodexHTTPH2Enabled bool `mapstructure:"codex_http_h2_enabled"`
 	// ModeRouterV2Enabled: 新版 WS mode 路由开关（默认 false；关闭时保持 legacy 行为）
 	ModeRouterV2Enabled bool `mapstructure:"mode_router_v2_enabled"`
 	// IngressModeDefault: ingress 默认模式（off/ctx_pool/passthrough/http_bridge）
@@ -2572,6 +2574,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.codex_egress.enabled", true)
+	viper.SetDefault("gateway.openai_ws.codex_http_h2_enabled", false)
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
 	viper.SetDefault("gateway.openai_ws.ingress_mode_default", "ctx_pool")

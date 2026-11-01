@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"log/slog"
 	"math/rand/v2"
 	"strings"
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	openAITokenRefreshSkew    = 3 * time.Minute
+	openAITokenRefreshSkew    = 5 * time.Minute
 	openAITokenCacheSkew      = 5 * time.Minute
 	openAILockInitialWait     = 20 * time.Millisecond
 	openAILockMaxWait         = 120 * time.Millisecond
@@ -140,6 +141,14 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		return "", errors.New("not an openai oauth account")
 	}
 
+	if failure := p.refreshAPI.openAIRefreshFailure(account); failure != nil {
+		// The caller may hold a pre-reauthorization scheduler snapshot.
+		latest, err := p.accountRepo.GetByID(ctx, account.ID)
+		if err != nil || latest == nil || latest.ID != account.ID || !latest.IsActive() || p.refreshAPI.openAIRefreshFailure(latest) != nil {
+			return "", failure
+		}
+		account = latest
+	}
 	cacheKey := OpenAITokenCacheKey(account)
 
 	// 1) Try cache first.
@@ -155,8 +164,8 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	slog.Debug("openai_token_cache_miss", "account_id", account.ID)
 
 	// 2) Refresh if needed (pre-expiry skew).
-	expiresAt := account.GetCredentialAsTime("expires_at")
-	needsRefresh := !account.IsOpenAIPersonalAccessToken() && (expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew)
+	expiresAt := openAIAccessTokenExpiresAt(account)
+	needsRefresh := !account.IsOpenAIPersonalAccessToken() && codexManagedNeedsRefresh(account, time.Now())
 	if needsRefresh && strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
 		if expiresAt != nil && !time.Now().Before(*expiresAt) {
 			const reason = "openai access_token expired and refresh_token is missing"
@@ -173,8 +182,12 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		p.metrics.refreshRequests.Add(1)
 		p.metrics.touchNow()
 
-		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
+		result, err := p.refreshAPI.RefreshIfNeeded(openai.WithRefreshReason(ctx, "proactive_expiry"), account, p.executor, openAITokenRefreshSkew)
 		if err != nil {
+			var rejection *openai.RefreshTokenError
+			if errors.As(err, &rejection) && rejection.Permanent {
+				return "", rejection
+			}
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
 				return "", err
 			}
@@ -197,10 +210,10 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		} else if result.Refreshed {
 			p.metrics.refreshSuccess.Add(1)
 			account = result.Account
-			expiresAt = account.GetCredentialAsTime("expires_at")
+			expiresAt = openAIAccessTokenExpiresAt(account)
 		} else {
 			account = result.Account
-			expiresAt = account.GetCredentialAsTime("expires_at")
+			expiresAt = openAIAccessTokenExpiresAt(account)
 		}
 	} else if needsRefresh && p.tokenCache != nil {
 		// Backward-compatible test path when refreshAPI is not injected.

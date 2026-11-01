@@ -1,0 +1,22 @@
+# Isolated comparison runner
+
+Build explicitly with `go build -tags comparison_harness ./tools/comparisonprobe`.
+The service factory and this command are excluded from ordinary server builds.
+
+The runner reads one `service.Account` JSON object on stdin, requires the selected
+acceptance account and an explicit proxy, drops refresh credentials, and listens
+only on a random loopback port. It uses the real Responses `Forward` implementation
+and HTTP repository with no database, scheduler, or token-refresh dependencies.
+`-audit` must name a new file; existing evidence cannot be overwritten. Requests,
+upstream headers, and response bytes are saved with timestamps. Known tokens and
+proxy passwords are redacted. The runner exits after 20 minutes or termination.
+
+This is an opt-in acceptance tool, not a production server. The comparison build
+fixes Codex HTTP transport and does not reproduce every production setting,
+plugin, scheduler, accounting, or WebSocket path. A passing sample is not proof
+of upstream model identity. Live tests consume the selected account's quota.
+
+The synthetic CLI 0.166.0 Astra/xhigh request fixture lives under
+`internal/pkg/codexwire/testdata/golden/0.166.0/astra_xhigh_controlled_http.json`.
+It tests typed instruction/tool/context preservation through the real forwarding
+pipeline. It is explicitly not evidence from a live account.

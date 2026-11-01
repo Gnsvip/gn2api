@@ -89,6 +89,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return err
 	}
+	wsSessionScope := resolveOpenAIWSSessionScope(c, account, firstClientMessage)
+	if wsSessionScope.Ephemeral {
+		defer s.clearOpenAIWSSessionDisabled(wsSessionScope)
+	}
+	if s.openAIWSSessionDisabledReason(wsSessionScope) != "" {
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "websocket is unavailable for this session; use HTTP", nil)
+	}
 	restoreClientSession := stageCodexHTTPClientSession(c, account, firstClientMessage)
 	defer restoreClientSession()
 	s.codexWireProfileForRequest(c, account, firstClientMessage)
@@ -796,7 +803,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		WSURL:   wsURL,
 		Headers: wsHeaders,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
-			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
+			return s.refreshOpenAIWSAuthHeaders(factoryCtx, account, headers)
 		},
 		ProxyURL: func() string {
 			if account.ProxyID != nil && account.Proxy != nil {
@@ -871,7 +878,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// 上游读写失败后的重试同样新建，避免再拿到同批陈旧的空闲连接。
 		req.ForceNewConn = dedicatedMode || forceNewConn
 		acquireCtx, acquireCancel := context.WithTimeout(ctx, acquireTimeout)
-		lease, acquireErr := pool.Acquire(acquireCtx, req)
+		lease, acquireErr := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, pool, &req)
 		acquireCancel()
 		var dialErr *openAIWSDialError
 		if acquireErr != nil && s.isAgentIdentityAccount(ctx, account) && errors.As(acquireErr, &dialErr) && isAgentIdentityTaskInvalidWSDialError(dialErr) && !agentTaskRecoveryTried {

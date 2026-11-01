@@ -1265,8 +1265,12 @@ func normalizeOpenAIOAuthResponsesCompatibilityFields(reqBody map[string]any) bo
 		delete(reqBody, "commands")
 		changed = true
 	}
-	// Codex can attach internal message metadata when a custom provider is
-	// named OpenAI. ChatGPT rejects this field on input items (#7066).
+	// Native typed Codex requests use this metadata to identify base prompts,
+	// environment context and provenance. Preserve the captured 0.166 contract;
+	// the legacy compatibility workaround (#7066) applies to untagged inputs.
+	if codexInputMapCarriesBaseInstructions(reqBody) || codexNativeContinuation(reqBody) {
+		return changed
+	}
 	input, _ := reqBody["input"].([]any)
 	for _, value := range input {
 		item, ok := value.(map[string]any)
@@ -1313,6 +1317,10 @@ func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte) ([]byte, bool, 
 		changed = true
 	}
 	// Only remove the input-item field, never same-named user content.
+	var nativeBody map[string]any
+	if codexInputCarriesBaseInstructions(normalized) || (json.Unmarshal(normalized, &nativeBody) == nil && codexNativeContinuation(nativeBody)) {
+		return normalized, changed, nil
+	}
 	input := gjson.GetBytes(normalized, "input")
 	if !input.IsArray() {
 		return normalized, changed, nil

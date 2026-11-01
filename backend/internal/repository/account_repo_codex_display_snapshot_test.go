@@ -38,7 +38,7 @@ func TestUpdateExtraCodexDisplaySnapshotsAvoidSchedulerOutbox(t *testing.T) {
 				}
 				payload, err := json.Marshal(updates)
 				require.NoError(t, err)
-				mock.ExpectExec(regexp.QuoteMeta("UPDATE accounts SET extra = COALESCE(extra, '{}'::jsonb) || $1::jsonb, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL")).
+				mock.ExpectExec(`(?s)UPDATE accounts SET extra = CASE WHEN platform = 'openai' AND type = 'oauth' THEN jsonb_set.*codex_fingerprint_seed.*gen_random_uuid\(\)::text.*ELSE COALESCE\(extra, '\{\}'::jsonb\) \|\| \$1::jsonb END, updated_at = NOW\(\) WHERE id = \$2 AND deleted_at IS NULL`).
 					WithArgs(string(payload), int64(27)).WillReturnResult(sqlmock.NewResult(0, 1))
 				if tc.schedulingChange {
 					mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).

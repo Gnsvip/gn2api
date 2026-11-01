@@ -35,7 +35,7 @@ func TestCodexSessionIdentityPinsVersionAcrossRequestsAndReconnect(t *testing.T)
 		return c
 	}
 	svc := &OpenAIGatewayService{}
-	account := newCodexSynthTestAccount(99173, AccountTypeOAuth)
+	account := newCodexSynthUnitAccount(99173)
 	SetCodexCanonicalUserAgentResolver(func() string { return buildCodexCLIUserAgent("0.163.0") })
 	first := newContext(12, "session-original", "child-original")
 	profile, ok := svc.codexWireProfileForRequest(first, account, nil)
@@ -54,7 +54,7 @@ func TestCodexSessionIdentityPinsVersionAcrossRequestsAndReconnect(t *testing.T)
 	for _, c := range []*gin.Context{newContext(13, "session-original", "child-original"), newContext(12, "new-session", "new-thread")} {
 		require.Equal(t, "0.164.0", svc.codexSessionClientVersion(c, account, nil))
 	}
-	otherAccount := newCodexSynthTestAccount(99174, AccountTypeOAuth)
+	otherAccount := newCodexSynthUnitAccount(99174)
 	otherAccount.Credentials = map[string]any{"chatgpt_account_id": "other-credential"}
 	require.Equal(t, "0.164.0", svc.codexSessionClientVersion(newContext(12, "session-original", "child-original"), otherAccount, nil))
 	// Context snapshots stay pinned even if the bounded idle cache is cleaned.

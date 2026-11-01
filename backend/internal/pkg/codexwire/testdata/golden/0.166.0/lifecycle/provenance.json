@@ -1,0 +1,17 @@
+{
+  "reference_release": "https://github.com/zuchengchen/sub2api/releases/tag/czc-v2026.10.31.3",
+  "recorder_source_commit": "81fc112416f5d91ee3707e191039bd95973fd825",
+  "adaptation": "Astra/xhigh; native system-root TLS in isolated namespace, no custom-CA environment override",
+  "inference": "synthetic loopback upstream; no paid model calls",
+  "sha256": {
+    "http_fallback_tool_loop.jsonl": "ad968a778daebb521867b9f445c56f2ea74e6f63b8154b8719ea5fa71be1d9e5",
+    "http_unauthorized_refresh.jsonl": "b544d29ce3ca599b623850886631e493685eb784e07bec3c6831be8ceb2bc548",
+    "meta.json": "a6243d704eabbb1fa4840dfc5c7753b7041794787c83dab127395ea88ce92521",
+    "tls_clienthellos.json": "8caf532449ff9769f9e51dd587ebc62730b1530d98e851d863b81b6b7c2ef763",
+    "tls_clienthellos_scenarios.json": "53aa63b6dae4af6aceb7a847f97614098f0f8ee5b24cee46fc1fd4053b6eff50",
+    "ws_compaction.jsonl": "bc4e6e001f3e9d3bb2c4da5b45d11fedcf103972b2ba206a3fcb07f553ad7003",
+    "ws_initial.jsonl": "bf72a1e402f9d720712d5df470f3a1806b18e45b6c5fded15e25d51522150984",
+    "ws_tool_loop.jsonl": "cd11e072f49398c2a6ec3eaf475b82dc16aab19a56f1405635f7a08c59d3fc2b",
+    "ws_unauthorized_refresh.jsonl": "6af8a350f16c87f094c97f642dcff5dc72c610924d907eed210354bfda5e75f4"
+  }
+}

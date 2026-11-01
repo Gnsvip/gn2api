@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -66,6 +67,8 @@ type Profile struct {
 	InsecureSkipVerify bool
 	// CodexProxyConnect selects the captured proxy handshake only for new profiles.
 	CodexProxyConnect bool
+	RootCAs           *x509.CertPool `json:"-"`
+	RootCAID          string         `json:"-"`
 }
 
 // Dialer creates TLS connections with custom fingerprints.
@@ -358,7 +361,12 @@ func performTLSHandshake(ctx context.Context, conn net.Conn, profile *Profile, a
 	}
 
 	spec := buildClientHelloSpecFromProfile(profile)
-	tlsConn := utls.UClient(conn, &utls.Config{ServerName: host, InsecureSkipVerify: profile != nil && profile.InsecureSkipVerify}, utls.HelloCustom)
+	tlsConfig := &utls.Config{ServerName: host}
+	if profile != nil {
+		tlsConfig.InsecureSkipVerify = profile.InsecureSkipVerify
+		tlsConfig.RootCAs = profile.RootCAs
+	}
+	tlsConn := utls.UClient(conn, tlsConfig, utls.HelloCustom)
 
 	var hybrid *hybridKeyShare
 	if profile != nil && profile.ReuseHybridX25519 {

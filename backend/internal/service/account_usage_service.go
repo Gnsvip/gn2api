@@ -894,7 +894,19 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	if err != nil {
 		return nil, fmt.Errorf("build openai probe client: %w", err)
 	}
-	resp, err := client.Do(req)
+	prepared, err := prepareCodexTimezoneRequest(req, account)
+	if err != nil {
+		return nil, err
+	}
+	if prepared != req {
+		defer req.Body.Close()
+	}
+	var resp *http.Response
+	if gateway, ok := s.agentIdentityWS.(*OpenAIGatewayService); ok && gateway != nil {
+		resp, err = gateway.doOpenAIUpstreamOnce(prepared, proxyURL, account)
+	} else {
+		resp, err = client.Do(prepared)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("openai codex probe request failed: %w", err)
 	}

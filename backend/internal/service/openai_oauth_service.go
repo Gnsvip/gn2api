@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -112,6 +114,7 @@ type OpenAIExchangeCodeInput struct {
 
 // OpenAITokenInfo represents the token information for OpenAI
 type OpenAITokenInfo struct {
+	refreshedAt           time.Time
 	AccessToken           string `json:"access_token"`
 	RefreshToken          string `json:"refresh_token"`
 	IDToken               string `json:"id_token,omitempty"`
@@ -190,7 +193,8 @@ func (s *OpenAIOAuthService) ExchangeCode(ctx context.Context, input *OpenAIExch
 		RefreshToken: tokenResp.RefreshToken,
 		IDToken:      tokenResp.IDToken,
 		ExpiresIn:    int64(tokenResp.ExpiresIn),
-		ExpiresAt:    time.Now().Unix() + int64(tokenResp.ExpiresIn),
+		ExpiresAt:    openAIRefreshedTokenExpiresAt(tokenResp.AccessToken, tokenResp.ExpiresIn),
+		refreshedAt:  time.Now(),
 		ClientID:     clientID,
 	}
 
@@ -235,7 +239,8 @@ func (s *OpenAIOAuthService) RefreshTokenWithClientID(ctx context.Context, refre
 		RefreshToken: tokenResp.RefreshToken,
 		IDToken:      tokenResp.IDToken,
 		ExpiresIn:    int64(tokenResp.ExpiresIn),
-		ExpiresAt:    time.Now().Unix() + int64(tokenResp.ExpiresIn),
+		ExpiresAt:    openAIRefreshedTokenExpiresAt(tokenResp.AccessToken, tokenResp.ExpiresIn),
+		refreshedAt:  time.Now(),
 	}
 	if trimmed := strings.TrimSpace(clientID); trimmed != "" {
 		tokenInfo.ClientID = trimmed
@@ -386,6 +391,14 @@ func (s *OpenAIOAuthService) RefreshAccountToken(ctx context.Context, account *A
 	}
 
 	clientID := account.GetCredential("client_id")
+	userAgent := account.GetOpenAIUserAgent()
+	if userAgent == "" {
+		if profile, ok := resolveCodexDeviceProfile(account); ok {
+			userAgent = profile.UserAgent
+		}
+	}
+	ctx = openai.WithCodexAuthAccount(ctx, account.ID)
+	ctx = openai.WithCodexClientUserAgent(ctx, userAgent)
 	return s.RefreshTokenWithClientID(ctx, refreshToken, proxyURL, clientID)
 }
 
@@ -393,6 +406,10 @@ func (s *OpenAIOAuthService) RefreshAccountToken(ctx context.Context, account *A
 func (s *OpenAIOAuthService) BuildAccountCredentials(tokenInfo *OpenAITokenInfo) map[string]any {
 	creds := map[string]any{
 		"access_token": tokenInfo.AccessToken,
+	}
+	if !tokenInfo.refreshedAt.IsZero() {
+		creds["last_refresh"] = tokenInfo.refreshedAt.Format(time.RFC3339Nano)
+		creds["expires_at"] = nil
 	}
 	if tokenInfo.ExpiresAt > 0 {
 		creds["expires_at"] = time.Unix(tokenInfo.ExpiresAt, 0).Format(time.RFC3339)
@@ -445,4 +462,58 @@ func (s *OpenAIOAuthService) Stop() {
 
 func normalizeOpenAIOAuthPlatform(platform string) string {
 	return openai.OAuthPlatformOpenAI
+}
+
+func (s *OpenAIOAuthService) retireAccountAuthClient(ctx context.Context, account *Account) {
+	if s == nil || !canRecoverOpenAIOAuth(account) {
+		return
+	}
+	client, ok := s.oauthClient.(interface {
+		RetireAuthClient(context.Context, string, string)
+	})
+	if !ok {
+		return
+	}
+	ctx = openai.WithCodexAuthAccount(ctx, account.ID)
+	if profile, ok := resolveCodexDeviceProfile(account); ok {
+		ctx = openai.WithCodexClientUserAgent(ctx, profile.UserAgent)
+	}
+	client.RetireAuthClient(ctx, account.GetOpenAIRefreshToken(), account.GetCredential("client_id"))
+}
+
+// AuthCredentialsPersisted publishes a new managed OAuth auth state only after
+// its durable write commits. A failed or rolled-back update keeps the old client.
+func (s *OpenAIOAuthService) AuthCredentialsPersisted(ctx context.Context, previous *Account) {
+	if s == nil || !canRecoverOpenAIOAuth(previous) {
+		return
+	}
+	snapshot := snapshotOAuthRefreshAccount(previous)
+	AfterAccountCommit(ctx, func(committed context.Context) {
+		s.retireAccountAuthClient(committed, snapshot)
+	})
+}
+
+func openAIRefreshedTokenExpiresAt(accessToken string, expiresIn int64) int64 {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) == 3 {
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims struct {
+			ExpiresAt int64 `json:"exp"`
+		}
+		if err == nil && json.Unmarshal(payload, &claims) == nil && claims.ExpiresAt > 0 {
+			return claims.ExpiresAt
+		}
+	}
+	if expiresIn > 0 {
+		return time.Now().Unix() + expiresIn
+	}
+	return 0
+}
+
+func openAIAccessTokenExpiresAt(account *Account) *time.Time {
+	if expiresAt := openAIRefreshedTokenExpiresAt(account.GetOpenAIAccessToken(), 0); expiresAt > 0 {
+		expiry := time.Unix(expiresAt, 0)
+		return &expiry
+	}
+	return account.GetCredentialAsTime("expires_at")
 }

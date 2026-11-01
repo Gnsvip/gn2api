@@ -234,15 +234,17 @@ func (s *adminServiceImpl) TestProxy(ctx context.Context, id int64) (*ProxyTestR
 
 	latency := latencyMs
 	s.saveProxyLatency(ctx, id, &ProxyLatencyInfo{
-		Success:     true,
-		LatencyMs:   &latency,
-		Message:     "Proxy is accessible",
-		IPAddress:   exitInfo.IP,
-		Country:     exitInfo.Country,
-		CountryCode: exitInfo.CountryCode,
-		Region:      exitInfo.Region,
-		City:        exitInfo.City,
-		UpdatedAt:   time.Now(),
+		Success:           true,
+		LatencyMs:         &latency,
+		Message:           "Proxy is accessible",
+		IPAddress:         exitInfo.IP,
+		Country:           exitInfo.Country,
+		CountryCode:       exitInfo.CountryCode,
+		Region:            exitInfo.Region,
+		City:              exitInfo.City,
+		Timezone:          NormalizeOpenAIRequestTimezone(exitInfo.Timezone),
+		EgressFingerprint: codexEgressFingerprint(proxy.URL()),
+		UpdatedAt:         time.Now(),
 	})
 	return &ProxyTestResult{
 		Success:     true,
@@ -517,6 +519,10 @@ func (s *adminServiceImpl) saveProxyQualitySnapshot(ctx context.Context, proxyID
 		info.CountryCode = exitInfo.CountryCode
 		info.Region = exitInfo.Region
 		info.City = exitInfo.City
+		info.Timezone = NormalizeOpenAIRequestTimezone(exitInfo.Timezone)
+		if proxy, err := s.proxyRepo.GetByID(ctx, proxyID); err == nil && proxy != nil {
+			info.EgressFingerprint = codexEgressFingerprint(proxy.URL())
+		}
 	}
 	s.saveProxyLatency(ctx, proxyID, info)
 }
@@ -537,15 +543,17 @@ func (s *adminServiceImpl) probeProxyLatency(ctx context.Context, proxy *Proxy) 
 
 	latency := latencyMs
 	s.saveProxyLatency(ctx, proxy.ID, &ProxyLatencyInfo{
-		Success:     true,
-		LatencyMs:   &latency,
-		Message:     "Proxy is accessible",
-		IPAddress:   exitInfo.IP,
-		Country:     exitInfo.Country,
-		CountryCode: exitInfo.CountryCode,
-		Region:      exitInfo.Region,
-		City:        exitInfo.City,
-		UpdatedAt:   time.Now(),
+		Success:           true,
+		LatencyMs:         &latency,
+		Message:           "Proxy is accessible",
+		IPAddress:         exitInfo.IP,
+		Country:           exitInfo.Country,
+		CountryCode:       exitInfo.CountryCode,
+		Region:            exitInfo.Region,
+		City:              exitInfo.City,
+		Timezone:          NormalizeOpenAIRequestTimezone(exitInfo.Timezone),
+		EgressFingerprint: codexEgressFingerprint(proxy.URL()),
+		UpdatedAt:         time.Now(),
 	})
 }
 

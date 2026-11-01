@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"strings"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"time"
 )
 
@@ -100,24 +100,16 @@ func (r *OpenAITokenRefresher) CanRefresh(account *Account) bool {
 
 // NeedsRefresh 检查token是否需要刷新
 // expires_at 缺失且处于限流状态时需要刷新，防止限流期间 token 静默过期
-func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, refreshWindow time.Duration) bool {
-	if account.IsOpenAIPersonalAccessToken() {
-		return false
-	}
-	if strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
-		return false
-	}
-	expiresAt := account.GetCredentialAsTime("expires_at")
-	if expiresAt == nil {
-		return account.IsRateLimited()
-	}
-
-	return time.Until(*expiresAt) < refreshWindow
+func (r *OpenAITokenRefresher) NeedsRefresh(account *Account, _ time.Duration) bool {
+	return canRecoverOpenAIOAuth(account) && codexManagedNeedsRefresh(account, time.Now())
 }
 
 // Refresh 执行token刷新
 // 保留原有credentials中的所有字段，只更新token相关字段
 func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (map[string]any, error) {
+	if openai.RefreshReason(ctx) == "" {
+		ctx = openai.WithRefreshReason(ctx, "scheduled")
+	}
 	tokenInfo, err := r.openaiOAuthService.RefreshAccountToken(ctx, account)
 	if err != nil {
 		return nil, err
@@ -129,4 +121,24 @@ func (r *OpenAITokenRefresher) Refresh(ctx context.Context, account *Account) (m
 	newCredentials = NormalizeOpenAIPersonalAccessTokenCredentials(account, tokenInfo, newCredentials)
 
 	return newCredentials, nil
+}
+
+func (r *OpenAITokenRefresher) AuthCredentialsPersisted(ctx context.Context, previous *Account) {
+	r.openaiOAuthService.AuthCredentialsPersisted(ctx, previous)
+}
+
+// JWT expiry is authoritative for managed auth. Imported opaque tokens keep
+// their existing explicit expiry; a successful rotation with unknown expiry
+// uses the CLI's eight-day last_refresh fallback instead of refresh-on-each-dial.
+func codexManagedNeedsRefresh(account *Account, now time.Time) bool {
+	if account == nil || account.IsOpenAIPersonalAccessToken() || account.IsOpenAIAgentIdentity() {
+		return false
+	}
+	if expires := openAIAccessTokenExpiresAt(account); expires != nil {
+		return !expires.After(now.Add(5 * time.Minute))
+	}
+	if last := account.GetCredentialAsTime("last_refresh"); last != nil {
+		return last.Before(now.Add(-8 * 24 * time.Hour))
+	}
+	return account.IsRateLimited()
 }

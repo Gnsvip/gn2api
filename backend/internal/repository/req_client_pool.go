@@ -95,8 +95,11 @@ func buildReqClientKey(opts reqClientOptions) string {
 
 // CreatePrivacyReqClient creates an HTTP client for OpenAI privacy settings API
 // This is exported for use by OpenAIPrivacyService
-// Uses Chrome TLS fingerprint impersonation to bypass Cloudflare checks
+// Uses the Codex backend-client HTTP/TLS lane; the rollback switch retains Firefox.
 func CreatePrivacyReqClient(proxyURL string) (*req.Client, error) {
+	if !codexDeviceClientDisabled() {
+		return newCodexDeviceReqClient(proxyURL, 30*time.Second)
+	}
 	return getSharedReqClient(reqClientOptions{
 		ProxyURL:    proxyURL,
 		Timeout:     30 * time.Second,

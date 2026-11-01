@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -105,10 +106,10 @@ func (s *OpenAIOAuthServiceSuite) TestExchangeCode_DefaultRedirectURI() {
 	require.Equal(s.T(), "rt", resp.RefreshToken)
 }
 
-func (s *OpenAIOAuthServiceSuite) TestRefreshToken_FormFields() {
+func (s *OpenAIOAuthServiceSuite) TestRefreshToken_JSONFields() {
 	errCh := make(chan string, 1)
 	s.setupServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
+		if err := readCodexRefreshJSON(r); err != nil {
 			errCh <- "ParseForm failed"
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -128,7 +129,7 @@ func (s *OpenAIOAuthServiceSuite) TestRefreshToken_FormFields() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		if got := r.PostForm.Get("scope"); got != openai.RefreshScopes {
+		if _, exists := r.PostForm["scope"]; exists {
 			errCh <- "scope mismatch"
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -165,7 +166,7 @@ func (s *OpenAIOAuthServiceSuite) TestRefreshToken_FormFields() {
 func (s *OpenAIOAuthServiceSuite) TestRefreshToken_DefaultsToOpenAIClientID() {
 	var seenClientIDs []string
 	s.setupServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
+		if err := readCodexRefreshJSON(r); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -346,7 +347,10 @@ func (s *OpenAIOAuthServiceSuite) TestRefreshToken_NonSuccessStatus() {
 
 	_, err := s.svc.RefreshToken(s.ctx, "rt", "")
 	require.Error(s.T(), err, "expected error for non-2xx status")
-	require.ErrorContains(s.T(), err, "status 401")
+	var rejection *openai.RefreshTokenError
+	require.ErrorAs(s.T(), err, &rejection)
+	require.Equal(s.T(), http.StatusUnauthorized, rejection.StatusCode)
+	require.True(s.T(), rejection.Permanent)
 }
 
 func TestNewOpenAIOAuthClient_DefaultTokenURL(t *testing.T) {
@@ -358,4 +362,17 @@ func TestNewOpenAIOAuthClient_DefaultTokenURL(t *testing.T) {
 
 func TestOpenAIOAuthServiceSuite(t *testing.T) {
 	suite.Run(t, new(OpenAIOAuthServiceSuite))
+}
+
+// Existing authorization-code/custom-client cases continue to exercise form encoding.
+func readCodexRefreshJSON(r *http.Request) error {
+	var fields map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+		return err
+	}
+	r.PostForm = url.Values{}
+	for key, value := range fields {
+		r.PostForm.Set(key, value)
+	}
+	return nil
 }

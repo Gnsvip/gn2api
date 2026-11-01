@@ -1292,7 +1292,7 @@ type PreviewFromCRSRequest struct {
 
 // TestCapabilities lets independent monitors detect support without paid probes.
 func (h *AccountHandler) TestCapabilities(c *gin.Context) {
-	response.Success(c, gin.H{"attribution_prompt_v1": true})
+	response.Success(c, gin.H{"attribution_prompt_v1": true, "comparison_audit_v1": true, "comparison_profiles": []string{"codex-http-xhigh-v1"}})
 }
 
 // Test handles testing account connectivity with SSE streaming.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -125,10 +126,11 @@ func snapshotOAuthRefreshAccount(account *Account) *Account {
 // OAuthRefreshAPI 统一的 OAuth Token 刷新入口
 // 封装分布式锁、进程内互斥锁、DB 重读、已刷新检查、竞争恢复等通用逻辑
 type OAuthRefreshAPI struct {
-	accountRepo AccountRepository
-	tokenCache  GeminiTokenCache // 可选，nil = 无分布式锁
-	lockTTL     time.Duration
-	localLocks  sync.Map // key: cacheKey string -> value: *contextMutex
+	openAIFailures sync.Map // account ID -> rejection of an exact credential fingerprint
+	accountRepo    AccountRepository
+	tokenCache     GeminiTokenCache // 可选，nil = 无分布式锁
+	lockTTL        time.Duration
+	localLocks     sync.Map // key: cacheKey string -> value: *contextMutex
 }
 
 // NewOAuthRefreshAPI 创建统一刷新 API
@@ -246,6 +248,10 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 		return &OAuthRefreshResult{Account: freshAccount}, nil
 	}
 
+	if failure := api.openAIRefreshFailure(freshAccount); failure != nil {
+		return &OAuthRefreshResult{Account: snapshotOAuthRefreshAccount(freshAccount)}, failure
+	}
+
 	// 3. 二次检查是否仍需刷新（另一条路径可能已刷新）
 	if !executor.NeedsRefresh(freshAccount, refreshWindow) {
 		return &OAuthRefreshResult{
@@ -279,6 +285,10 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 					Account: recoveredAccount,
 				}, nil
 			}
+		}
+		var rejection *openai.RefreshTokenError
+		if errors.As(refreshErr, &rejection) {
+			api.recordOpenAIRefreshFailure(attemptedAccount, rejection)
 		}
 		// Preserve the exact account snapshot used by the failed upstream call.
 		// Callers can then conditionally mutate only that credential version and
@@ -359,12 +369,18 @@ func (api *OAuthRefreshAPI) RefreshIfNeeded(
 		}
 	}
 
+	if newCredentials != nil {
+		if publisher, ok := executor.(interface {
+			AuthCredentialsPersisted(context.Context, *Account)
+		}); ok {
+			publisher.AuthCredentialsPersisted(ctx, attemptedAccount)
+		}
+	}
 	if requestPath && freshAccount.Platform == PlatformGrok {
 		if eligibilityErr := grokOAuthRequestAccountEligibilityError(freshAccount); eligibilityErr != nil {
 			return nil, withGrokCredentialFailureSnapshot(eligibilityErr, freshAccount)
 		}
 	}
-
 	return &OAuthRefreshResult{
 		Refreshed:      true,
 		NewCredentials: newCredentials,
@@ -410,6 +426,10 @@ func (api *OAuthRefreshAPI) loadGrokDurableAccountAfterPersist(parent context.Co
 
 // isInvalidGrantError 检查错误是否为 invalid_grant
 func isInvalidGrantError(err error) bool {
+	var rejection *openai.RefreshTokenError
+	if errors.As(err, &rejection) {
+		return rejection.Code == "invalid_grant"
+	}
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "invalid_grant")
 }
 

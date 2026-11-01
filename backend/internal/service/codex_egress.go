@@ -39,8 +39,19 @@ func codexEgressEligible(cfg *config.Config, account *Account, target *url.URL, 
 		strings.Contains(headers.Get("User-Agent"), " (Ubuntu ")
 }
 
+// The models GET has a separately captured header baseline. Do not extend this
+// to other auxiliary endpoints without their own protocol evidence.
+func codexHTTPEgressEligible(cfg *config.Config, account *Account, target *url.URL, headers http.Header) bool {
+	if target != nil && target.Scheme == "https" && (target.Path == "/backend-api/codex/models" || target.Path == "/backend-api/codex/responses/compact") {
+		candidate := *target
+		candidate.Path = "/backend-api/codex/responses"
+		return codexEgressEligible(cfg, account, &candidate, headers)
+	}
+	return codexEgressEligible(cfg, account, target, headers)
+}
+
 func doCodexEgressHTTP(cfg *config.Config, upstream HTTPUpstream, request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
-	if !codexEgressEligible(cfg, account, request.URL, request.Header) {
+	if !codexHTTPEgressEligible(cfg, account, request.URL, request.Header) {
 		return upstream.Do(request, proxyURL, account.ID, account.Concurrency)
 	}
 	prepared, err := prepareCodexEgressRequest(request)
@@ -52,7 +63,17 @@ func doCodexEgressHTTP(cfg *config.Config, upstream HTTPUpstream, request *http.
 	}
 	prepared = prepared.Clone(prepared.Context())
 	codexwire.ProjectBusinessHeaders(prepared.Header, false)
-	return upstream.DoWithTLS(prepared, proxyURL, account.ID, account.Concurrency, tlsfingerprint.BuiltinProfile("openssl36"))
+	if err := auditComparisonWire(prepared, account); err != nil {
+		return nil, err
+	}
+	profile := tlsfingerprint.BuiltinProfile("openssl36")
+	if cfg.Gateway.OpenAIWS.CodexHTTPH2Enabled || codexwire.CodexCustomCAConfigured() {
+		profile, err = codexwire.WithCodexCustomCA(tlsfingerprint.BuiltinProfile("rustls-h2"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return upstream.DoWithTLS(prepared, proxyURL, account.ID, account.Concurrency, profile)
 }
 
 // prepareCodexEgressRequest changes only the HTTP encoding, not JSON semantics.

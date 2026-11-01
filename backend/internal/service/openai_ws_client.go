@@ -291,6 +291,7 @@ func (d *coderOpenAIWSClientDialer) SnapshotTransportMetrics() OpenAIWSTransport
 type coderOpenAIWSClientConn struct {
 	conn          *coderws.Conn
 	upstreamPings atomic.Int64
+	codexTimezone string
 }
 
 func (c *coderOpenAIWSClientConn) UpstreamPingCount() int64 {
@@ -309,7 +310,11 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return wsjson.Write(ctx, c.conn, value)
+	prepared, err := prepareCodexTimezoneWSValue(value, c.codexTimezone)
+	if err != nil {
+		return err
+	}
+	return wsjson.Write(ctx, c.conn, prepared)
 }
 
 func (c *coderOpenAIWSClientConn) ReadMessage(ctx context.Context) ([]byte, error) {
@@ -352,6 +357,10 @@ func (c *coderOpenAIWSClientConn) WriteFrame(ctx context.Context, msgType coderw
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	payload, err := prepareCodexTimezoneWSFrame(payload, c.codexTimezone, msgType == coderws.MessageText)
+	if err != nil {
+		return err
 	}
 	return c.conn.Write(ctx, msgType, payload)
 }
