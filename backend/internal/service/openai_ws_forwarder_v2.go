@@ -737,17 +737,32 @@ readLoop:
 			}
 			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
 			setOpsUpstreamError(c, statusCode, errMsg, "")
+			upstreamError := gin.H{"type": errTypeRaw, "message": errMsg}
+			if errTypeRaw == "" {
+				upstreamError["type"] = "upstream_error"
+			}
+			if errCodeRaw != "" {
+				upstreamError["code"] = errCodeRaw
+			}
+			if param := gjson.GetBytes(message, "error.param"); param.Exists() {
+				upstreamError["param"] = json.RawMessage(param.Raw)
+			}
 			if reqStream && !clientDisconnected {
+				// HTTP Responses clients need a terminal response.failed, not
+				// a bare WS error followed by the handler's generic 502 fallback.
+				failure, _ := json.Marshal(gin.H{"type": "response.failed", "response": gin.H{
+					"id": responseID, "status": "failed", "error": upstreamError,
+				}})
 				flushBufferedStreamEvents("error_event")
-				emitStreamMessage(message, true)
+				emitStreamMessage(failure, true)
+				if !clientDisconnected {
+					markOpenAIWSClientVisibleFailure(c, "response.failed", failure)
+					MarkResponseCommitted(c)
+				}
 			}
 			if !reqStream {
-				c.JSON(statusCode, gin.H{
-					"error": gin.H{
-						"type":    "upstream_error",
-						"message": errMsg,
-					},
-				})
+				c.JSON(statusCode, gin.H{"error": upstreamError})
+				MarkResponseCommitted(c)
 			}
 			return nil, fmt.Errorf("openai ws error event: %s", errMsg)
 		}

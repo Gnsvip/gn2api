@@ -4734,6 +4734,6 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_InvalidEncrypted
 	for _, item := range secondInput {
 		require.False(t, item.Get("encrypted_content").Exists(), "第二轮请求不得再携带已失效密文: %s", item.Raw)
 	}
-	require.Equal(t, "rs_1", gjson.Get(secondUpstream, "input.0.id").String())
+	require.False(t, gjson.Get(secondUpstream, "input.0.id").Exists(), "失效密文不能留下旧 reasoning ID 查询")
 	require.Equal(t, "again", gjson.Get(secondUpstream, "input.2.text").String())
 }

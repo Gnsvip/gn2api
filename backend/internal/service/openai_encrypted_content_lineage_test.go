@@ -53,7 +53,7 @@ func TestStripOpenAIInvalidEncryptedContentItems(t *testing.T) {
 		require.True(t, ok)
 		_, hasEncrypted := first["encrypted_content"]
 		require.False(t, hasEncrypted, "命中项应剥离 encrypted_content")
-		require.Equal(t, "rs_1", first["id"], "reasoning 骨架应保留")
+		require.NotContains(t, first, "id", "失效密文不能回退为旧 ID 查询")
 		second, ok := input[1].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, "fresh-cipher", second["encrypted_content"], "新密文不得误删")
@@ -104,14 +104,9 @@ func TestStripOpenAIInvalidEncryptedContentFromReplayItems(t *testing.T) {
 
 		next, stripped := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
 		require.Equal(t, 2, stripped)
-		require.Len(t, next, 2, "compaction 命中项应整项删除")
-		var rewritten map[string]any
-		require.NoError(t, json.Unmarshal(next[0], &rewritten))
-		require.Equal(t, "rs_1", rewritten["id"])
-		_, hasEncrypted := rewritten["encrypted_content"]
-		require.False(t, hasEncrypted)
+		require.Len(t, next, 1, "compaction 和没有可用内容的 reasoning 骨架应删除")
 		// 未命中项正文共享；原命中项正文不被修改（整体替换语义）。
-		require.Same(t, &clean[0], &next[1][0])
+		require.Same(t, &clean[0], &next[0][0])
 		require.Contains(t, string(original), "stale-cipher")
 	})
 
@@ -144,14 +139,11 @@ func TestStripOpenAIInvalidEncryptedContentRaw(t *testing.T) {
 	require.Equal(t, "gpt-5", decoded["model"])
 	input, ok := decoded["input"].([]any)
 	require.True(t, ok)
-	require.Len(t, input, 3)
+	require.Len(t, input, 2)
 	first, ok := input[0].(map[string]any)
 	require.True(t, ok)
-	_, hasEncrypted := first["encrypted_content"]
-	require.False(t, hasEncrypted)
-	second, ok := input[1].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "fresh-cipher", second["encrypted_content"])
+	require.Equal(t, "fresh-cipher", first["encrypted_content"])
+	require.Equal(t, "rs_2", first["id"])
 
 	t.Run("miss_fast_path_returns_original", func(t *testing.T) {
 		t.Parallel()

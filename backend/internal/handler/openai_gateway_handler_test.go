@@ -3225,6 +3225,25 @@ func testStringPtr(v string) *string {
 
 func TestOpenAIForwardErrorAlreadyCommunicated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Run("committed websocket failure keeps its original classification", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, EndpointResponses, nil)
+		before := c.Writer.Size()
+		_, _ = c.Writer.WriteString("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Item rs_missing not found\"}}}\n\n")
+		service.MarkOpsStreamFailure(c, "invalid_request_error", "invalid_history", "Item rs_missing not found", http.StatusBadRequest)
+		service.MarkResponseCommitted(c)
+		err := errors.New("openai ws error event: Item rs_missing not found")
+		require.True(t, openAIForwardErrorAlreadyCommunicated(c, before, err))
+		h := &OpenAIGatewayHandler{}
+		require.False(t, h.ensureForwardErrorResponse(c, true))
+		require.Equal(t, 1, strings.Count(w.Body.String(), `"type":"response.failed"`))
+		require.NotContains(t, w.Body.String(), "Upstream request failed")
+		failure, marked := service.GetOpsStreamError(c)
+		require.True(t, marked)
+		require.Equal(t, http.StatusBadRequest, failure.IntendedStatus)
+		require.True(t, failure.CountTowardsSLA)
+	})
 
 	t.Run("upstream response failed after write", func(t *testing.T) {
 		w := httptest.NewRecorder()

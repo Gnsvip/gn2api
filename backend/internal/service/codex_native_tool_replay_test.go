@@ -22,27 +22,56 @@ const codex166NativeToolReplay = `{"model":"gpt-6-astra","stream":true,"store":f
 {"type":"custom_tool_call_output","id":"ctco_019aa001-1000-7000-8000-000000000002","call_id":"call_native","output":[{"type":"input_text","text":"synthetic"}],"internal_chat_message_metadata_passthrough":{"turn_id":"019aa001-1000-7000-8000-000000000001","create_time":1793551528.123}}
 ]}`
 
-func TestCodex166NativeToolReplayPreservesIDsAndPayload(t *testing.T) {
-	for _, passthrough := range []bool{false, true} {
-		name := "forward"
-		if passthrough {
-			name = "passthrough"
-		}
+func TestCodex166NativeToolReplayPreservesContextAndToolIDs(t *testing.T) {
+	for _, name := range []string{"forward", "passthrough", "websocket", "http_fallback"} {
 		t.Run(name, func(t *testing.T) {
-			setup := newAstraOAuthSetup(t, passthrough)
+			setup := newAstraOAuthSetup(t, name == "passthrough")
+			SetOpenAIClientTransport(setup.c, OpenAIClientTransportHTTP)
 			enabled := true
 			setup.svc.cfg.Gateway.CodexFullSynthesis = &enabled
 			setup.svc.cfg.Gateway.CodexWire.MapOrderJitter = &enabled
 			setup.c.Request.Header.Set("User-Agent", "codex_cli_rs/0.166.0")
 			setup.upstream.resp = &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
 				Body: io.NopCloser(strings.NewReader(codexCompletedSSE(`{"id":"resp_native","model":"gpt-6-astra","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)))}
-			_, err := setup.svc.Forward(context.Background(), setup.c, setup.account, []byte(codex166NativeToolReplay))
+			var conn *openAIWSCaptureConn
+			if name == "websocket" || name == "http_fallback" {
+				setup.svc.cache = &stubGatewayCache{}
+				setup.svc.cfg.Gateway.OpenAIWS = newOpenAIWSV2TestConfig().Gateway.OpenAIWS
+				setup.svc.cfg.Gateway.OpenAIWS.OAuthEnabled = true
+				setup.svc.cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+				setup.account.Extra["responses_websockets_v2_enabled"] = true
+				event := `{"type":"response.completed","response":{"id":"resp_native","model":"gpt-6-astra","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`
+				if name == "http_fallback" {
+					event = `{"type":"error","error":{"code":"websocket_not_supported","type":"invalid_request_error","message":"websocket unsupported"}}`
+				}
+				conn = &openAIWSCaptureConn{events: [][]byte{[]byte(event)}}
+				pool := newOpenAIWSConnPool(setup.svc.cfg)
+				pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: conn})
+				setup.svc.openaiWSPool = pool
+				setup.svc.openaiWSResolver = NewOpenAIWSProtocolResolver(setup.svc.cfg)
+			}
+			result, err := setup.svc.Forward(context.Background(), setup.c, setup.account, []byte(codex166NativeToolReplay))
 			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, name == "websocket", result.OpenAIWSMode)
+			outbound := setup.upstream.lastBody
+			if conn != nil {
+				require.NotEmpty(t, conn.writes, "must attempt the WS path")
+				if name == "websocket" {
+					outbound = []byte(requestToJSONString(conn.lastWrite))
+				}
+			}
+			require.Equal(t, "gpt-6-astra", gjson.GetBytes(outbound, "model").String())
+			require.Equal(t, "xhigh", gjson.GetBytes(outbound, "reasoning.effort").String())
 			want := gjson.Get(codex166NativeToolReplay, "input").Array()
-			got := gjson.GetBytes(setup.upstream.lastBody, "input").Array()
+			got := gjson.GetBytes(outbound, "input").Array()
 			require.Len(t, got, len(want))
 			for i := range want {
 				a, b := want[i].Raw, got[i].Raw
+				if i == 1 {
+					a, err = sjson.Delete(a, "id")
+					require.NoError(t, err)
+				}
 				if i == 3 {
 					a, err = sjson.Delete(a, "internal_chat_message_metadata_passthrough.turn_id")
 					require.NoError(t, err)

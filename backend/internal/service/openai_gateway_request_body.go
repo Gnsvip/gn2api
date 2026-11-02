@@ -444,6 +444,10 @@ func sanitizeEncryptedReasoningInputItem(item any) (next any, changed bool, keep
 
 	if _, has := inputItem["encrypted_content"]; has {
 		delete(inputItem, "encrypted_content")
+		// A rejected cipher cannot be replaced by a lookup of its old ID.
+		// This also covers cached WS replay items normalized before this fix.
+		delete(inputItem, "id")
+		delete(inputItem, "call_id")
 		changed = true
 	}
 

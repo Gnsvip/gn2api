@@ -127,8 +127,70 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 }
 
 func sanitizeOpenAIResponsesInputItemIDsForAccount(body []byte, account *Account) ([]byte, bool, error) {
-	if account != nil && account.UsesOpenAICodexProtocol() && codexNativeInputRaw(body) {
+	changed := false
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		native := codexNativeInputRaw(body)
+		var err error
+		body, changed, err = normalizeCodexReasoningReplayIDs(body)
+		if err != nil || native {
+			return body, changed, err
+		}
+	}
+	next, idsChanged, err := sanitizeOpenAIResponsesInputItemIDs(body)
+	return next, changed || idsChanged, err
+}
+
+// Codex OAuth uses store=false. Even native input must not replay reasoning
+// IDs as server-side lookups. Keep the self-contained reasoning and native
+// tool/metadata bytes; only remove references already supplied inline.
+func normalizeCodexReasoningReplayIDs(body []byte) ([]byte, bool, error) {
+	input := parseRawJSONView(body).Get("input")
+	if !input.IsArray() {
 		return body, false, nil
 	}
-	return sanitizeOpenAIResponsesInputItemIDs(body)
+	inlineReasoning := make(map[string]struct{})
+	items := input.Array()
+	for _, item := range items {
+		if item.Get("type").String() == "reasoning" {
+			if id := item.Get("id").String(); id != "" {
+				inlineReasoning[id] = struct{}{}
+			}
+		}
+	}
+	changed := false
+	rebuilt := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Get("type").String() == "item_reference" {
+			if _, inline := inlineReasoning[item.Get("id").String()]; inline {
+				changed = true
+				continue
+			}
+		}
+		raw := item.Raw
+		if item.Get("type").String() == "reasoning" {
+			for _, field := range []string{"id", "call_id"} {
+				if item.Get(field).Exists() {
+					var err error
+					raw, err = sjson.Delete(raw, field)
+					if err != nil {
+						return body, false, err
+					}
+					changed = true
+				}
+			}
+			if summary := item.Get("summary"); !summary.Exists() || summary.Type == gjson.Null {
+				var err error
+				raw, err = sjson.SetRaw(raw, "summary", "[]")
+				if err != nil {
+					return body, false, err
+				}
+				changed = true
+			}
+		}
+		rebuilt = append(rebuilt, raw)
+	}
+	if !changed {
+		return body, false, nil
+	}
+	return replaceOpenAIRawInput(body, input, rebuilt), true, nil
 }

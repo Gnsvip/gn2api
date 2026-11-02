@@ -6,12 +6,57 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
+
+func TestForwardOpenAIWSV2_PreservesInvalidHistoryError(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			cfg := newOpenAIWSV2TestConfig()
+			cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+			conn := &openAIWSCaptureConn{events: [][]byte{
+				[]byte(`{"type":"response.created","response":{"id":"resp_rejected"}}`),
+				[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_history","param":"input[1]","message":"Item with id 'rs_missing' not found. Items are not persisted when store is false."}}`),
+			}}
+			pool := newOpenAIWSConnPool(cfg)
+			pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: conn})
+			svc := &OpenAIGatewayService{cfg: cfg, httpUpstream: &httpUpstreamRecorder{}, cache: &stubGatewayCache{},
+				openaiWSResolver: NewOpenAIWSProtocolResolver(cfg), toolCorrector: NewCodexToolCorrector(), openaiWSPool: pool}
+			account := &Account{ID: 5884, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive,
+				Schedulable: true, Concurrency: 1, Credentials: map[string]any{"api_key": "sk-test"},
+				Extra: map[string]any{"responses_websockets_v2_enabled": true}}
+			_, err := svc.Forward(context.Background(), c, account, []byte(fmt.Sprintf(`{"model":"gpt-6-astra","stream":%t,"input":"hi"}`, stream)))
+			require.ErrorContains(t, err, "rs_missing")
+			require.True(t, IsResponseCommitted(c), "handler must not append a generic 502")
+			body := rec.Body.String()
+			require.NotContains(t, body, "Upstream request failed")
+			if stream {
+				require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
+				require.NotContains(t, body, `"type":"error"`)
+				failure, marked := GetOpsStreamError(c)
+				require.True(t, marked)
+				require.Equal(t, http.StatusBadRequest, failure.IntendedStatus)
+				require.Equal(t, "invalid_history", failure.Code)
+				require.Contains(t, failure.Message, "rs_missing")
+				require.True(t, failure.CountTowardsSLA)
+			} else {
+				require.Equal(t, http.StatusBadRequest, rec.Code)
+				require.Equal(t, "invalid_request_error", gjson.Get(body, "error.type").String())
+				require.Equal(t, "invalid_history", gjson.Get(body, "error.code").String())
+			}
+			require.Contains(t, body, `"param":"input[1]"`)
+		})
+	}
+}
 
 // HTTP POST /v1/responses -> forwardOpenAIWSV2 keeps the canonical outbound
 // tier separate from response.completed.service_tier for usage-time billing.

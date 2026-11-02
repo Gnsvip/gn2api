@@ -90,10 +90,12 @@ type codexTransformResult struct {
 }
 
 type codexOAuthTransformOptions struct {
-	IsCodexCLI                          bool
-	IsCompact                           bool
-	SkipDefaultInstructions             bool
-	PreserveToolCallIDs                 bool
+	IsCodexCLI              bool
+	IsCompact               bool
+	SkipDefaultInstructions bool
+	PreserveToolCallIDs     bool
+	// Native metadata/tool IDs stay intact; the account-scoped ingress
+	// normalizer still removes reasoning IDs before this transform.
 	PreserveNativeInput                 bool
 	OmitPromotedSystemMessagesFromInput bool
 	// ResponsesLite selects where an injected hosted tool is declared.
