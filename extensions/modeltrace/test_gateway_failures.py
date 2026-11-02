@@ -16,6 +16,9 @@ from test_single_pass import gateway_controller
     ({'error': 'Stream read error: read tcp secret-endpoint: use of closed network connection'}, 'stream_interrupted'),
     ({'error': 'Stream ended before response.completed'}, 'stream_interrupted'),
     ({'code': 'unknown', 'error': 'token secret-value'}, 'upstream_error'),
+    *[({'code': code, 'error': 'private token secret-value'}, code) for code in (
+        'proxy_connect_timeout', 'proxy_connect_error', 'tls_handshake_timeout', 'tls_handshake_error',
+        'upstream_overloaded', 'connect_timeout', 'connect_error', 'response_header_timeout')],
 ])
 def test_gateway_error_classification_does_not_expose_raw_messages(tmp_path, monkeypatch, event, code):
     control = gateway_controller(tmp_path, monkeypatch, [{'type': 'error', **event}])
@@ -25,7 +28,8 @@ def test_gateway_error_classification_does_not_expose_raw_messages(tmp_path, mon
     assert all(secret not in str(caught.value) for secret in ('private', 'secret', 'tcp', 'token'))
 
 
-@pytest.mark.parametrize('failure', ['stream_interrupted', 'gateway_timeout', 'artifact_format', 'upstream_error'])
+@pytest.mark.parametrize('failure', ['stream_interrupted', 'gateway_timeout', 'artifact_format', 'upstream_error',
+    'proxy_connect_timeout', 'tls_handshake_timeout', 'upstream_overloaded', 'response_header_timeout'])
 def test_failed_drawing_does_not_skip_tibo_or_repeat_either_question(store, failure):
     drawing = {**question('drawing', expected=''), 'kind': 'manual'}
     configure(store, [drawing, question('tibo', expected='True')], auto_pause_enabled=True, auto_pause_threshold=1)
@@ -40,6 +44,17 @@ def test_failed_drawing_does_not_skip_tibo_or_repeat_either_question(store, fail
     store.finish_prompt(job, result)
     store.apply_pending_prompt_pause(FakeAccounts(), control)
     assert not control.calls
+
+
+def test_disabled_template_can_be_saved_without_enabling_or_scheduling(store):
+    client = s.create_app(store, FakeAccounts(), lambda _: True).test_client()
+    store.configure_prompt(7, False, 'gpt-6-sol', '{{challenge}}')
+    response = client.put('/accounts/7/prompt-test', json=dict(enabled=False, test_mode='attribution',
+        model='gpt-6-sol', prompt='请回答：{{challenge}}', reasoning_effort='high'))
+    assert response.status_code == 200
+    assert store.get_prompt(7)['prompt'] == '请回答：{{challenge}}'
+    assert store.get_prompt(7)['reasoning_effort'] == 'high'
+    assert store.claim_prompt() is None
 
 
 @pytest.mark.parametrize('failure', [s.RoundTimeout(), s.ProbeError('route changed', 'comparison_changed')])

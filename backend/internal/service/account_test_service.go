@@ -3377,6 +3377,33 @@ func (s *AccountTestService) sendErrorAndEnd(c *gin.Context, errorMsg string) er
 		code = "test_timeout"
 	} else if strings.HasPrefix(errorMsg, "Stream read error:") || errorMsg == "Stream ended before response.completed" {
 		code = "stream_interrupted"
+	} else {
+		lower := strings.ToLower(errorMsg)
+		requestError := strings.TrimPrefix(lower, "request failed: ")
+		timedOut := strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded")
+		proxyError := strings.HasPrefix(requestError, "socks5 connect:") || strings.HasPrefix(requestError, "connect to proxy:") ||
+			strings.HasPrefix(requestError, "tls handshake with https proxy:") || strings.HasPrefix(requestError, "write connect request:") ||
+			strings.HasPrefix(requestError, "read connect response:") || strings.HasPrefix(requestError, "proxy connect failed:")
+		switch {
+		case proxyError && timedOut:
+			code = "proxy_connect_timeout"
+		case proxyError:
+			code = "proxy_connect_error"
+		case strings.HasPrefix(requestError, "tls handshake failed:") && timedOut:
+			code = "tls_handshake_timeout"
+		case strings.HasPrefix(requestError, "tls handshake failed:"):
+			code = "tls_handshake_error"
+		case strings.HasPrefix(requestError, "dial tcp") && timedOut:
+			code = "connect_timeout"
+		case strings.HasPrefix(requestError, "dial tcp"):
+			code = "connect_error"
+		case strings.HasPrefix(requestError, "read response:") && timedOut:
+			code = "response_header_timeout"
+		case strings.HasPrefix(requestError, "read response:"):
+			code = "stream_interrupted"
+		case strings.Contains(lower, "our servers are currently overloaded") || strings.Contains(lower, "servers are currently overloaded"):
+			code = "upstream_overloaded"
+		}
 	}
 	s.sendEvent(c, TestEvent{Type: "error", Error: errorMsg, Code: code})
 	return fmt.Errorf("%s", errorMsg)

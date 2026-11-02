@@ -724,6 +724,19 @@ def gateway_failure(event):
     code = event.get('code')
     if code == 'test_timeout':
         return ProbeError('网关测试请求超时，未收到完整回答', 'gateway_timeout')
+    failures = {
+        'connect_timeout': ('连接上游超时，题目未发送', 'connect_timeout'),
+        'connect_error': ('连接上游失败，题目未发送', 'connect_error'),
+        'response_header_timeout': ('等待上游响应超时，未收到完整回答', 'response_header_timeout'),
+        'proxy_connect_timeout': ('代理连接超时，题目未发送', 'proxy_connect_timeout'),
+        'proxy_connect_error': ('代理连接失败，题目未发送', 'proxy_connect_error'),
+        'tls_handshake_timeout': ('TLS 握手超时，题目未发送', 'tls_handshake_timeout'),
+        'tls_handshake_error': ('TLS 握手失败，题目未发送', 'tls_handshake_error'),
+        'upstream_overloaded': ('上游服务器繁忙，请稍后再试', 'upstream_overloaded'),
+    }
+    if code in failures:
+        message, outcome = failures[code]
+        return ProbeError(message, outcome)
     error = event.get('error')
     if code == 'stream_interrupted' or (isinstance(error, str) and (
             error.startswith('Stream read error:') or error == 'Stream ended before response.completed')):
@@ -1237,6 +1250,9 @@ def run_qa_round(job, store, accounts, controller):
                             message='答案符合预期' if matched else '答案与预期不符')
             except ProbeError as exc:
                 if exc.code not in ('upstream_error', 'stream_interrupted', 'gateway_timeout',
+                                    'proxy_connect_timeout', 'proxy_connect_error',
+                                    'tls_handshake_timeout', 'tls_handshake_error', 'upstream_overloaded',
+                                    'connect_timeout', 'connect_error', 'response_header_timeout',
                                     'output_limit', 'stream_limit', 'artifact_format', 'artifact_limit'):
                     raise
                 # Independent questions still run once if the shared round has time.
@@ -1249,7 +1265,7 @@ def run_qa_round(job, store, accounts, controller):
         failures = [item for item in results if item.get('outcome')]
         if failures:
             result.update(outcome=failures[0]['outcome'], round_complete=False,
-                          message='；'.join(item['name'] + '：' + item['message'] for item in failures))
+                          message='本轮有题目未完成')
     except ProbeError as exc:
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code, "round_complete": False}
         if results and results[-1]["status"] == "yellow":
@@ -1696,11 +1712,15 @@ def create_app(store, accounts, authenticate):
         challenge_count = body.get("challenge_count", previous["challenge_count"] if previous else 3)
         if not isinstance(model, str) or not model.strip() or len(model) > 160:
             return jsonify(error="测试模型无效"), 400
-        if body["enabled"] and test_mode == "attribution":
+        if test_mode == "attribution":
             try:
                 validate_prompt_template(prompt)
             except ProbeError as exc:
-                return jsonify(error=str(exc)), 400
+                if not body['enabled'] and previous:
+                    # Old clients may send invalid form text when merely disabling.
+                    prompt = previous['prompt']
+                else:
+                    return jsonify(error=str(exc)), 400
         elif previous:
             prompt = previous["prompt"]
         elif test_mode == "qa":

@@ -16,7 +16,7 @@ TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261102-timeout-1'
+VERSION = '20261102-settings-1'
 FILES = ['service.py', 'attempts.py', 'evidence.py', 'test_evidence.py', 'test_attempts.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
          'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py',
          'test_single_pass.py', 'test_lifecycle.py', 'test_gateway_failures.py', 'CALIBRATION.md']

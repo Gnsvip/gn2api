@@ -26,34 +26,36 @@
     .mt-dialog{box-sizing:border-box;border:1px solid #e2e8f0;border-radius:16px;padding:0;width:min(520px,calc(100vw - 24px));max-height:90vh;overflow:hidden;color:#334155;background:#fff;box-shadow:0 16px 60px #0003;font:14px/1.6 system-ui,sans-serif}
     .mt-dialog[open]{display:flex;flex-direction:column}.mt-dialog [hidden]{display:none!important}
     .mt-dialog::backdrop{background:#0f172a77}.dark .mt-dialog{background:#111827;color:#e2e8f0;border-color:#374151}
-    .mt-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:20px 22px 12px;flex-shrink:0}
+    .mt-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px 10px;flex-shrink:0}
+    .mt-close{appearance:none;display:grid;place-items:center;width:32px;height:32px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:22px/1 system-ui;cursor:pointer;flex-shrink:0}.mt-close:hover{background:#f1f5f9}.mt-close:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
     .mt-dialog h3{font-size:17px;font-weight:600;margin:0}.mt-dialog p{margin:8px 0}.mt-dialog p:empty{display:none}
     .mt-badge{font-size:11px;color:#64748b;background:#f1f5f9;border-radius:12px;padding:2px 9px;white-space:nowrap}.mt-badge[data-enabled=true]{background:#ecfdf5;color:#047857}
-    .mt-body{padding:0 22px;overflow:auto;min-height:0}.mt-dialog label{font-size:13px}
-    .mt-tabs{display:flex;gap:6px;padding:0 22px 12px;flex-shrink:0}.mt-tab{flex:1;padding:8px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;cursor:pointer}.mt-tab[aria-selected=true]{background:#ecfdf5;color:#047857}.dark .mt-tab[aria-selected=true]{background:#064e3b;color:#a7f3d0}.mt-tab:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}.mt-tab:disabled{opacity:.5;cursor:wait}
-    .mt-settings-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}.mt-panel-status{margin:0 0 10px!important}.mt-save-error:not(.mt-error){color:#059669}
+    .mt-body{padding:0 18px;overflow:auto;min-height:0}.mt-dialog label{font-size:13px}
+    .mt-tabs{display:flex;gap:6px;padding:0 18px 10px;flex-shrink:0}.mt-tab{position:relative;flex:1;padding:7px;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}.mt-tab[aria-selected=true]{background:#ecfdf5;color:#047857}.dark .mt-tab[aria-selected=true]{background:#064e3b;color:#a7f3d0}.mt-tab:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}.mt-tab:disabled{opacity:.5;cursor:wait}.mt-tab[data-dirty=true]::after{content:'';position:absolute;right:7px;top:7px;width:6px;height:6px;border-radius:50%;background:#dc2626}
+    .mt-settings-dialog{width:min(760px,calc(100vw - 24px))}.mt-settings-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}.mt-panel-status{margin:0 0 10px!important}.mt-save-error:not(.mt-error){color:#059669}.mt-inline-toggle{display:flex;align-items:center;gap:5px;padding-bottom:8px;white-space:nowrap}.mt-header h3{margin-right:auto}.mt-actions>.mt-note{margin-right:auto;align-self:center}.mt-tab[data-dirty=true]::after{content:'未保存';font-size:10px;position:static;display:inline;margin-left:8px;width:auto;height:auto;background:transparent;color:#b45309}
     .mt-dialog select{display:block;width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit}
     .mt-dialog select option{color:#334155;background:#fff}.mt-dialog .mt-note{font-size:12px;color:#64748b}.dark .mt-dialog .mt-note{color:#94a3b8}
-    .mt-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:14px 22px;flex-shrink:0;border-top:1px solid #e2e8f066}.mt-actions button{padding:7px 16px;border-radius:7px;border:1px solid #cbd5e1;background:transparent;color:inherit;cursor:pointer;font:inherit}
+    .mt-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:10px 18px;flex-shrink:0;border-top:1px solid #e2e8f066}.mt-actions button{padding:7px 16px;border-radius:6px;border:1px solid #cbd5e1;background:transparent;color:inherit;cursor:pointer;font:inherit}
     .mt-actions button.mt-primary{background:#059669;border-color:#059669;color:white}.mt-actions button:disabled{opacity:.5;cursor:wait}
     .mt-section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;font-size:13px;font-weight:600}
     .mt-link{appearance:none;border:0;padding:2px 0;background:transparent;color:#64748b;font:12px system-ui;cursor:pointer}.mt-link:hover{color:#059669}
     .mt-history{padding:0;list-style:none;max-height:260px;overflow:auto;margin:4px 0 0}.mt-history li{border-bottom:1px solid #e2e8f066;font-size:12px}
-    .mt-result>summary{display:flex;align-items:center;gap:9px;padding:10px 0;cursor:pointer;list-style:none}.mt-result>summary::-webkit-details-marker{display:none}
+    .mt-result>summary{display:flex;align-items:center;gap:8px;padding:10px 0;cursor:pointer;list-style:none;min-width:0}.mt-result>summary::-webkit-details-marker{display:none}
     .mt-result>summary::after{content:'›';color:#94a3b8;margin-left:auto}.mt-result[open]>summary::after{transform:rotate(90deg)}
-    .mt-result time{color:#64748b;white-space:nowrap;font-variant-numeric:tabular-nums}.mt-result-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .mt-result time{color:#64748b;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0}.mt-result-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:1;min-width:54px}.mt-result-inline{display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden;white-space:nowrap;color:#64748b}.mt-result-case{max-width:145px;overflow:hidden;text-overflow:ellipsis;flex-shrink:1}.mt-result-case button{max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}.mt-result>summary::after{flex-shrink:0}
     .mt-result pre{margin:0 0 10px 17px;white-space:pre-wrap;overflow-wrap:anywhere;color:#64748b;font:12px/1.7 system-ui}
     .mt-answer-links{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 10px 17px;gap:5px}.mt-answer-text{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 system-ui}.mt-evidence-events{max-height:45vh;overflow:auto}.mt-evidence-paging{display:flex;gap:14px;align-items:center;margin:10px 0}.mt-evidence-entry{border-bottom:1px solid #e2e8f066}
     .mt-help{margin:14px 0;font-size:12px;color:#64748b}.mt-help>summary{cursor:pointer;width:fit-content}.mt-help p{line-height:1.7}
     .dark .mt-result pre,.dark .mt-result time,.dark .mt-help,.dark .mt-link{color:#94a3b8}
-    .mt-policy{margin:16px 0 0;padding:12px;border:1px solid #e2e8f0;border-radius:9px}.mt-policy label{display:block}.dark .mt-policy{border-color:#374151}
-    .mt-policy input[type=checkbox]{margin-right:8px;accent-color:#059669;width:16px;height:16px;vertical-align:middle}
-    .mt-policy input[type=number],.mt-interval input{box-sizing:border-box;width:68px;margin:0 8px;padding:5px 7px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:inherit}
-    .mt-policy-fields{margin-top:12px}.mt-policy-fields .mt-note{margin:6px 0 0}.mt-interval{display:block;margin-top:16px}
-    .mt-prompt-label{display:block;margin-top:14px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}
+    .mt-setting-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;align-items:end}.mt-setting-grid .mt-prompt-label{display:block;min-width:0;margin:0}.mt-setting-grid select{margin-top:4px;padding:7px 8px}
+    .mt-schedule-row{display:grid;grid-template-columns:max-content max-content minmax(0,1fr);gap:9px;align-items:center;margin-top:10px}.mt-interval{display:flex;align-items:center;gap:4px;white-space:nowrap;margin:0}.mt-interval input{width:58px;margin:0 2px;padding:5px 6px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:inherit}
+    .mt-schedule-row .mt-interval select{display:inline-block;width:auto;max-width:105px;margin:0;padding:5px}.mt-schedule-qa{grid-template-columns:180px 1fr}.mt-schedule-row>.mt-prompt-label{display:flex;align-items:center;gap:5px;margin:0;white-space:nowrap}.mt-schedule-row>.mt-prompt-label select{width:55px;margin:0;padding:5px}.mt-info{display:inline-flex;position:relative;align-items:center;font-size:12px}.mt-info>summary{list-style:none;cursor:pointer}.mt-info[open]>span{position:absolute;z-index:2;right:0;top:24px;width:240px;white-space:normal;padding:10px;background:#fff;color:#475569;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 4px 12px #0002}.dark .mt-info[open]>span{background:#111827;color:#e2e8f0}
+    .mt-policy{display:flex;align-items:center;gap:8px;min-width:0;margin:0;padding:0;border:0}.mt-policy label{display:flex;align-items:center;gap:6px;white-space:nowrap}.mt-policy input[type=checkbox]{margin:0;accent-color:#059669;width:16px;height:16px;vertical-align:middle}.dark .mt-policy{border-color:#374151}
+    .mt-policy input[type=number]{box-sizing:border-box;width:54px;margin:0;padding:4px 6px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:inherit}.mt-policy-fields{display:flex;align-items:center;gap:8px;min-width:0}.mt-policy-fields[hidden]{display:none}.mt-policy-fields .mt-note{display:none}.mt-policy-explanation{margin:4px 0 0!important}.mt-estimate{margin:4px 0 0!important}.mt-prompt-label{display:block;margin-top:10px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}
     .mt-case{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:9px}.mt-case>summary{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px}.mt-case>summary span{flex:1;overflow-wrap:anywhere}.mt-case input[type=checkbox],.mt-qa-enabled input{accent-color:#059669}
     .mt-case input[type=text]{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;margin-top:5px}.mt-case-tools{display:flex;gap:14px;flex-wrap:wrap}.mt-qa-enabled{display:block;margin-top:14px}
     .mt-preview-dialog{width:min(960px,calc(100vw - 24px))}.mt-preview-dialog iframe{display:block;width:100%;height:55vh;min-height:240px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.mt-preview-dialog .mt-actions{flex-wrap:wrap}.mt-preview-dialog .mt-header h3{overflow-wrap:anywhere}.mt-preview-dialog textarea{min-height:180px;font:12px/1.5 monospace}.mt-preview-link{display:block;margin:0 0 12px 17px;color:#7c3aed}.mt-actions .mt-review-green{border-color:#059669;color:#047857}.mt-actions .mt-review-yellow{border-color:#ca8a04;color:#a16207}.mt-actions .mt-review-red{border-color:#dc2626;color:#dc2626}
+    @media(max-width:600px){.mt-header{padding:12px 12px 8px}.mt-tabs{padding:0 12px 8px}.mt-body{padding:0 12px}.mt-actions{padding:9px 12px}.mt-setting-grid{grid-template-columns:1fr 1fr}.mt-schedule-row{grid-template-columns:1fr 1fr}.mt-schedule-row .mt-policy{grid-column:1/-1;flex-wrap:wrap}.mt-result>summary{gap:5px;flex-wrap:wrap}.mt-result-inline{order:2;flex-basis:100%;flex-wrap:wrap;white-space:normal;padding-left:13px}.mt-result-case,.mt-result-case button{max-width:100%;font-size:12px}.mt-dialog{width:calc(100vw - 16px);max-height:94vh}}
   `;
   document.head.append(style);
   const onPage = () => /^\/admin\/accounts\/?$/.test(location.pathname);
@@ -93,7 +95,10 @@
     if (result.status === 'green') return result.test_mode === 'qa' ? '通过' : '与预期一致';
     if (result.status === 'red') return result.test_mode === 'qa' ? '未通过' : '复测仍不符';
     const titles = { round_timeout: '检测超时', gateway_timeout: '网关测试超时', stream_interrupted: '响应连接中断',
-      upstream_error: '上游错误', insufficient_samples: '样本不足',
+      proxy_connect_timeout: '代理连接超时', proxy_connect_error: '代理连接失败',
+      connect_timeout: '连接上游超时', connect_error: '连接上游失败', response_header_timeout: '等待上游超时',
+      tls_handshake_timeout: 'TLS 握手超时', tls_handshake_error: 'TLS 握手失败',
+      upstream_overloaded: '上游繁忙', upstream_error: '上游错误', insufficient_samples: '样本不足',
       bank_unverified: '指纹库未校准', capability_unavailable: '接口不支持此档位',
       output_limit: '回答文本超限', stream_limit: '传输数据超限', artifact_limit: '作品过大', artifact_format: '作品格式不正确' };
     if (titles[result.outcome]) return titles[result.outcome];
@@ -113,10 +118,10 @@
     date(result.checked_at), `问答测试 · 请求模型：${result.expected}`,
     `推理等级：${result.reasoning_effort || '旧记录未保存'}`,
     result.budget_seconds && `本轮时间预算：${result.budget_seconds} 秒`,
-    `本轮请求：${result.requests || 0} 次`, result.message,
+    `本轮请求：${result.requests || 0} 次`, result.cases?.length ? `本轮共 ${result.cases.length} 题` : result.message,
     ...(result.cases || []).map(item => item.kind === 'manual'
       ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
-      : `${item.name}：${item.message || '未完成'}\n预期答案：${item.expected_answer} · 本题请求：${item.requests ?? item.attempts?.length ?? 0} 次`),
+      : `${item.name}：${item.message || item.answer_preview || '未完成'}\n预期答案：${item.expected_answer} · 本题请求：${item.requests ?? item.attempts?.length ?? 0} 次`),
     result.manual_reviewed && '人工评分只更新历史记录，不追溯触发自动停调度',
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
@@ -180,38 +185,51 @@
 
   function answerControls(id, result) {
     const links = el('div', 'mt-answer-links');
-    const shortAnswers = el('div', 'mt-answer-links');
+    const inline = el('span', 'mt-result-inline');
     for (const item of result.cases || []) {
       if (item.kind === 'manual') continue;
       const answers = item.attempts?.length ? item.attempts : item.answer_preview
         ? [{ output: item.answer_preview, output_truncated: item.answer_truncated, legacy: true }] : [];
-      answers.forEach((answer, i) => {
-        const output = answer.output || '', turn = answers.length > 1 ? `第 ${i + 1} 次` : '';
-        if (!answer.output_truncated && output.trim().length <= 80 && output.trim().split('\n').length <= 3) {
-          shortAnswers.append(el('p', 'mt-note', `${item.name} · ${turn}回答：${output.trim()}`));
-          return;
-        }
-        const summaryOnly = (answer.output_truncated || answer.legacy) && !answer.evidence_saved;
-        if (summaryOnly) {
-          const summary = el('details', 'mt-answer-summary');
-          summary.append(el('summary', 'mt-note', `${item.name} · ${turn}回答摘要（本轮未重复保存原文）`),
-            el('pre', 'mt-answer-text', output),
-            el('p', 'mt-note', `仅保留前 ${output.length} 字${answer.output_chars ? `，原回答 ${answer.output_chars} 字` : ''}。已保存的正常/首次异常原文可在全部尝试记录中查看。`));
-          links.append(summary); return;
-        }
-        const title = `${item.name} · ${turn}完整回答`;
-        const button = el('button', 'mt-link', title); button.type = 'button';
+      const answer = answers[0];
+      const output = answer?.output || '';
+      const compact = output.trim() ? output.trim().replace(/\s+/g, ' ') : resultLabel({ ...item, test_mode: 'qa' });
+      const fullAnswer = answer && (!answer.output_truncated && !answer.legacy || answer.evidence_saved);
+      const title = `${item.name} · ${fullAnswer ? '完整回答' : '回答摘要'}`;
+      const value = el('span', 'mt-result-case');
+      value.title = `${item.name}：${compact.slice(0, 160)}`;
+      if (answer && (answer.output_truncated || answer.legacy || compact.length > 42)) {
+        const button = el('button', 'mt-link', `${item.name}：查看${fullAnswer ? '回答' : '摘要'}`);
+        button.type = 'button';
+        button.addEventListener('click', async event => {
+          event.preventDefault(); event.stopPropagation(); button.disabled = true;
+          try {
+            const saved = answer.evidence_saved ? await api(`/accounts/${id}/attempts/${answer.attempt_id}/answer`) : answer;
+            openAnswer(title, (saved.output || '') + (fullAnswer ? '' : '\n\n本轮只保留摘要，未重复保存原文。'));
+          } catch (error) { openAnswer('读取回答失败', error.message); }
+          finally { button.disabled = false; }
+        });
+        value.append(button);
+      } else {
+        value.textContent = `${item.name}：${compact.slice(0, 42)}`;
+      }
+      inline.append(value);
+      // Historical rounds may contain multiple attempts. Keep them accessible
+      // without rendering large answers in the settings dialog.
+      answers.slice(1).forEach((previous, index) => {
+        const button = el('button', 'mt-link', `${item.name} · 历史第 ${index + 2} 次回答`);
+        button.type = 'button';
         button.onclick = async () => {
           button.disabled = true;
           try {
-            const saved = answer.evidence_saved ? await api(`/accounts/${id}/attempts/${answer.attempt_id}/answer`) : answer;
-            openAnswer(title, saved.output || '');
+            const saved = previous.evidence_saved ? await api(`/accounts/${id}/attempts/${previous.attempt_id}/answer`) : previous;
+            openAnswer(button.textContent, (saved.output || '') + (previous.output_truncated && !previous.evidence_saved ? '\n\n本轮只保留摘要，未重复保存原文。' : ''));
           } catch (error) { openAnswer('读取回答失败', error.message); }
           finally { button.disabled = false; }
-        }; links.append(button);
+        };
+        links.append(button);
       });
     }
-    return { links, shortAnswers };
+    return { links, inline };
   }
 
   function evidenceButton(id, runId) {
@@ -493,7 +511,7 @@
   }
 
   async function saveSettings(id, path, payload, dialog, errorBox, onSaved) {
-    if (pending.has(id)) return;
+    if (pending.has(id)) return false;
     actionErrors.delete(id);
     pending.add(id); mutationRevision++; targets().filter(t => t.id === id).forEach(render);
     errorBox.textContent = ''; errorBox.classList.add('mt-error');
@@ -505,8 +523,10 @@
       states.set(id, data.account); lastError = '';
       onSaved(data.account);
       errorBox.classList.remove('mt-error'); errorBox.textContent = '当前页设置已保存';
+      return true;
     } catch (error) {
       errorBox.textContent = error.message;
+      return false;
     } finally {
       pending.delete(id); mutationRevision++; lastPoll = 0;
       controls.forEach(([node, disabled]) => { node.disabled = disabled; });
@@ -520,11 +540,38 @@
     const state = states.get(id);
     if (!state) return;
     document.querySelectorAll('.mt-dialog').forEach(node => node.remove());
-    const dialog = el('dialog', 'mt-dialog');
+    const dialog = el('dialog', 'mt-dialog mt-settings-dialog');
     const title = el('h3', '', `智商检测 · 账号 #${id}`); title.id = 'mt-settings-title';
     dialog.setAttribute('aria-labelledby', title.id);
     const header = el('div', 'mt-header');
     const badge = el('span', 'mt-badge');
+    const forms = [];
+    const footerNotice = el('span', 'mt-note');
+    const actions = el('div', 'mt-actions');
+    const saveAllButton = el('button', 'mt-primary', '保存设置'); saveAllButton.type = 'button';
+    const refreshDirty = () => {
+      for (const page of pages) {
+        const form = forms.find(entry => entry.key === page.key);
+        const dirty = !!form && form.dirty();
+        page.button.dataset.dirty = String(dirty);
+        page.button.title = dirty ? '本页有未保存修改' : '';
+      }
+      saveAllButton.dataset.dirty = String(forms.some(form => form.dirty()));
+    };
+    const registerForm = (key, panel, form) => {
+      forms.push({ ...form, key, panel });
+      panel.addEventListener('input', refreshDirty);
+      panel.addEventListener('change', refreshDirty);
+      refreshDirty();
+    };
+    const close = el('button', 'mt-close', '×'); close.type = 'button';
+    close.setAttribute('aria-label', '关闭'); close.title = '关闭';
+    close.addEventListener('click', () => {
+      if (saveAllButton.disabled) return;
+      if (forms.some(form => form.dirty()) && !window.confirm('有未保存的设置，确定放弃修改并关闭？')) return;
+      dialog.close();
+    });
+    dialog.addEventListener('cancel', event => { event.preventDefault(); close.click(); });
     const refreshStatus = () => {
       const current = states.get(id);
       const enabled = !!(current?.enabled || current?.prompt_test?.enabled);
@@ -533,10 +580,10 @@
       for (const status of dialog.querySelectorAll('[data-mode-status]')) {
         const mode = status.dataset.modeStatus === 'custom' ? current?.prompt_test : current;
         status.textContent = '此项：' + (mode?.running ? '检测中' : mode?.enabled ? '已开启' : '已关闭')
-          + ' · 当前页单独保存，切换分页保留未保存内容';
+          + ' · 分页修改会保留，保存设置一并生效';
       }
     };
-    header.append(title, badge);
+    header.append(title, badge, close);
     const tabs = el('div', 'mt-tabs'); tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', '智商检测设置');
     dialog.append(header, tabs);
     let catalog;
@@ -580,8 +627,27 @@
         selectTab(pages[next].key, true);
       });
       pages.push({ key, button, panel }); tabs.append(button); dialog.append(panel);
-      build(id, dialog, panel, loadModels);
+      build(id, dialog, panel, loadModels, form => registerForm(key, panel, form));
     }
+    actions.append(footerNotice, saveAllButton); dialog.append(actions);
+    saveAllButton.addEventListener('click', async () => {
+      const dirty = forms.filter(form => form.dirty());
+      if (!dirty.length) { footerNotice.textContent = '没有未保存修改'; return; }
+      for (const form of dirty) {
+        if (!form.validate()) { selectTab(form.key, true); refreshDirty(); return; }
+      }
+      saveAllButton.disabled = true; footerNotice.textContent = '正在保存…';
+      try {
+        for (const form of dirty) {
+          const ok = await form.save();
+          if (!ok) { selectTab(form.key, true); footerNotice.textContent = '有一页未保存成功，请检查提示'; return; }
+          form.commit(); refreshDirty();
+        }
+        footerNotice.textContent = '所有修改已保存';
+      } finally {
+        saveAllButton.disabled = false; refreshStatus(); refreshDirty();
+      }
+    });
     dialog.addEventListener('mt-save-end', refreshStatus);
     dialog.addEventListener('close', () => dialog.remove());
     activeTab ||= state.prompt_test?.enabled && !state.enabled ? 'custom' : 'attribution';
@@ -589,16 +655,16 @@
     document.body.append(dialog); dialog.showModal();
   }
 
-  function buildAttributionPanel(id, dialog, panel, loadModels) {
+  function buildAttributionPanel(id, dialog, panel, loadModels, registerForm) {
     let state = states.get(id);
     const body = el('div', 'mt-body');
     const status = el('p', 'mt-note mt-panel-status'); status.dataset.modeStatus = 'attribution';
-    const enabledLabel = el('label', 'mt-qa-enabled');
+    const enabledLabel = el('label', 'mt-inline-toggle');
     const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!state.enabled;
     enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用定时模型归因');
     enabledLabel.append(enabled, document.createTextNode('启用定时模型归因'));
     let catalogReady = false;
-    const label = el('label', '', '检测模型');
+    const label = el('label', 'mt-prompt-label', '检测模型');
     const select = el('select');
     const catalogNote = el('p', 'mt-note', '正在读取此账号的可用模型…');
     select.setAttribute('aria-label', '检测模型');
@@ -609,6 +675,7 @@
     select.disabled = !state.available;
     label.append(select);
     const effort = effortField(state.reasoning_effort, '归因推理等级');
+    const settingsGrid = el('div', 'mt-setting-grid'); settingsGrid.append(label, effort.label, enabledLabel);
     const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟，只跑一轮，不自动补采或复测。若检测超过设置的间隔，完成后再等一个间隔，避免连续补跑。修改推理等级会取消旧轮次后续请求；已发出的请求可能已计费。');
     const bankNote = el('p', 'mt-note', '当前指纹库尚未完成各档位校准，候选分数不证明实际型号。开启自动停止后，仍按你设置的连续不符轮数停止调度。');
     const mapping = el('p', 'mt-note');
@@ -623,7 +690,7 @@
     intervalLabel.append(interval, document.createTextNode('分钟'));
     const challengeLabel = el('label', 'mt-interval', '挑战次数');
     const challengeCount = el('select'); challengeCount.setAttribute('aria-label', '挑战次数');
-    for (const [value, text] of [[1, '1 次 · 省额度'], [2, '2 次 · 折中'], [3, '3 次 · 更稳定']]) {
+    for (const [value, text] of [[1, '1 次'], [2, '2 次'], [3, '3 次']]) {
       const option = el('option', '', text); option.value = String(value); challengeCount.append(option);
     }
     challengeCount.value = String(state.challenge_count || 3);
@@ -650,19 +717,27 @@
     const autoLabel = el('label');
     const auto = el('input'); auto.type = 'checkbox'; auto.checked = !!state.auto_pause_enabled;
     auto.setAttribute('role', 'switch'); auto.setAttribute('aria-label', '连续不符自动停止调度');
-    autoLabel.append(auto, document.createTextNode('连续不符自动停止调度'));
-    const thresholdLabel = el('label', '', '连续');
+    autoLabel.append(auto, document.createTextNode('连续不符停调度'));
+    const thresholdLabel = el('label');
     const threshold = el('input'); threshold.type = 'number'; threshold.min = '1'; threshold.max = '100'; threshold.step = '1';
     threshold.value = String(state.auto_pause_threshold || 3); threshold.disabled = !auto.checked;
     threshold.setAttribute('aria-label', '连续不符轮数');
     const policyFields = el('div', 'mt-policy-fields'); policyFields.hidden = !auto.checked;
-    auto.addEventListener('change', () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; });
-    thresholdLabel.append(threshold, document.createTextNode('轮不符后停止'));
+    const refreshPolicy = () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; progress.hidden = !auto.checked; };
+    auto.addEventListener('change', refreshPolicy);
+    thresholdLabel.append(document.createTextNode('连续'), threshold, document.createTextNode('轮'));
     const progress = el('p', 'mt-note', `当前连续不符 ${state.mismatch_streak || 0} / ${state.auto_pause_threshold || 3} 轮 · 仅计红点`);
-    policyFields.append(thresholdLabel, progress);
+    policyFields.append(thresholdLabel);
     policy.append(autoLabel, policyFields);
-    if (state.pause_status === 'pending' || state.pause_status === 'failed') policy.append(el('p', 'mt-error', state.message));
-    if (state.paused_at) policy.append(el('p', 'mt-note', `上次停调度：${date(state.paused_at)} · ${state.pause_message}。排查后请在 sub2api 恢复账号调度，再开启模型归因。`));
+    const policyNotes = el('div', 'mt-policy-notes'); policyNotes.append(progress);
+    const policyInfo = el('details', 'mt-info');
+    policyInfo.append(el('summary', '', 'ⓘ'), el('span', '', '每轮最多计一次不符；绿、黄清零。达到设置轮数即停止调度，校准提示不阻拦。挑战次数与连续轮数分别计算。'));
+    policyInfo.querySelector('summary').setAttribute('aria-label', '自动停止说明');
+    policy.append(policyInfo);
+    if (state.pause_status === 'pending' || state.pause_status === 'failed') policyNotes.append(el('p', 'mt-error', state.message));
+    if (state.paused_at) policyNotes.append(el('p', 'mt-note', `上次停调度：${date(state.paused_at)} · ${state.pause_message}`));
+    refreshPolicy();
+    const schedule = el('div', 'mt-schedule-row'); schedule.append(intervalLabel, challengeLabel, policy);
     const list = el('ul', 'mt-history');
     const historyHead = el('div', 'mt-section-head');
     historyHead.append(el('span', '', '最近结果'), evidenceButton(id));
@@ -692,49 +767,59 @@
     historyHead.append(more);
     const empty = el('p', 'mt-note', state.history.length ? '' : '暂无检测记录');
     const error = el('p', 'mt-error mt-save-error');
-    const actions = el('div', 'mt-actions');
-    const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
-    const submit = el('button', 'mt-primary', '保存当前页'); submit.type = 'button';
-    const disable = el('button', '', '关闭此项'); disable.type = 'button';
-    const saved = account => { state = account; enabled.checked = !!state.enabled; };
+    let baseline;
+    const formPayload = () => ({
+      enabled: enabled.checked, model: state.available ? (select.value || state.model) : state.model,
+      reasoning_effort: effort.select.value,
+      auto_pause_enabled: auto.checked, auto_pause_threshold: Number(threshold.value),
+      interval_minutes: Number(interval.value), challenge_count: Number(challengeCount.value)
+    });
+    const validate = () => {
+      error.classList.add('mt-error');
+      const count = Number(threshold.value), minutes = Number(interval.value), challenges = Number(challengeCount.value);
+      const message = !Number.isInteger(count) || count < 1 || count > 100 ? '连续轮数请填写 1–100 的整数'
+        : !Number.isInteger(minutes) || minutes < 1 || minutes > 1440 ? '检测间隔请填写 1–1440 分钟的整数'
+          : ![1, 2, 3].includes(challenges) ? '挑战次数请选择 1、2 或 3 次'
+            : enabled.checked && !select.value ? '请选择检测模型' : '';
+      error.textContent = message;
+      return !message;
+    };
+    const saved = account => {
+      state = account; enabled.checked = !!state.enabled;
+      progress.textContent = `当前连续不符 ${state.mismatch_streak || 0} / ${state.auto_pause_threshold || 3} 轮 · 仅计红点`;
+    };
     const refreshAvailability = () => {
       select.disabled = !state.available || !catalogReady || !select.options.length;
-      submit.disabled = enabled.checked && select.disabled;
-      disable.disabled = !state.enabled;
     };
     enabled.addEventListener('change', refreshAvailability);
     dialog.addEventListener('mt-save-end', refreshAvailability);
     body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
-    disable.addEventListener('click', () => saveSettings(id, '/accounts/' + id, { enabled: false }, dialog, error, saved));
-    submit.addEventListener('click', () => {
-      error.classList.add('mt-error');
-      const count = Number(threshold.value);
-      if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续轮数请填写 1–100 的整数'; return; }
-      const minutes = Number(interval.value);
-      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '检测间隔请填写 1–1440 分钟的整数'; return; }
-      const challenges = Number(challengeCount.value);
-      if (![1, 2, 3].includes(challenges)) { error.textContent = '挑战次数请选择 1、2 或 3 次'; return; }
-      saveSettings(id, '/accounts/' + id, {
-        enabled: enabled.checked, model: state.available ? (select.value || state.model) : state.model,
-        reasoning_effort: effort.select.value,
-        auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes, challenge_count: challenges
-      }, dialog, error, saved);
-    });
-    actions.append(close, disable, submit);
-    body.append(status, enabledLabel, label, catalogNote, mapping, effort.label, bankNote, intervalLabel, challengeLabel, estimate, budgetNote, reason, policy, historyHead, list, empty, help, error);
-    panel.append(body, actions); refreshAvailability();
+    help.append(bankNote, budgetNote);
+    body.append(status, settingsGrid, catalogNote, mapping, schedule, estimate, policyNotes, reason, historyHead, list, empty, help, error);
+    panel.append(body); refreshAvailability();
+    const serialize = value => JSON.stringify(value);
+    const form = {
+      dirty: () => baseline !== serialize(formPayload()), validate,
+      save: () => saveSettings(id, '/accounts/' + id, formPayload(), dialog, error, saved),
+      commit: () => { baseline = serialize(formPayload()); }
+    };
+    form.commit(); registerForm(form);
     if (state.available) {
       loadModels().then(models => {
         if (!dialog.open) return;
+        const pristine = !form.dirty();
+        const desired = select.value;
         const live = new Set(models);
         const choices = state.models.filter(model => live.has(model));
         select.replaceChildren();
         for (const model of choices) { const option = el('option', '', model); option.value = model; select.append(option); }
-        select.value = preferredModel(choices, state.model);
+        select.value = preferredModel(choices, pristine ? state.model : desired);
         refreshMapping();
         catalogReady = true;
         if (!pending.has(id)) refreshAvailability();
         catalogNote.textContent = choices.length ? '' : '此账号当前可用模型尚未被指纹库收录，暂不能开启。';
+        if (pristine) form.commit();
+        panel.dispatchEvent(new Event('change'));
       }).catch(error => {
         if (!dialog.open) return;
         catalogNote.textContent = error.name === 'TimeoutError' ? '读取模型列表超时，请关闭后重试。' : error.message;
@@ -808,7 +893,7 @@
     const add = el('button', 'mt-link', '＋ 添加自定义题'); add.type = 'button';
     const presetButtons = [];
     const tiboPreset = (presets || []).find(preset => preset.id === 'tibo');
-    const update = () => { add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; }); changed(); };
+    const update = () => { add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; }); changed(); root.dispatchEvent(new Event('change', { bubbles: true })); };
     function append(data) {
       if (rows.length >= 5) return;
       if ((data.kind || 'exact') === 'exact' && tiboPreset?.expected_answer
@@ -865,7 +950,7 @@
     return { root, values: () => rows.map(row => row.get()) };
   }
 
-  function buildPromptPanel(id, dialog, panel, loadModels) {
+  function buildPromptPanel(id, dialog, panel, loadModels, registerForm) {
     const state = states.get(id);
     let promptState = state.prompt_test;
     const body = el('div', 'mt-body');
@@ -889,6 +974,7 @@
     model.value = preferredModel(choices, promptState.model || state.model);
     model.setAttribute('aria-label', '测试模型'); modelLabel.append(model);
     const effort = effortField(promptState.reasoning_effort, '题目推理等级');
+    const settingsGrid = el('div', 'mt-setting-grid'); settingsGrid.append(modeLabel, modelLabel, effort.label);
     const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟；每题一次，数字归因按所选次数运行，不自动补采或复测。修改推理等级会取消旧轮次后续请求。数字归因仍需匹配对应档位的指纹库校准条件；问答按所设答案判断。');
     const promptLabel = el('label', 'mt-prompt-label', '测试提示词模板');
     const prompt = el('textarea'); prompt.maxLength = 4000; prompt.value = promptState.prompt || '{{challenge}}';
@@ -918,25 +1004,35 @@
     const autoLabel = el('label');
     const auto = el('input'); auto.type = 'checkbox'; auto.checked = !!promptState.auto_pause_enabled;
     auto.setAttribute('role', 'switch'); auto.setAttribute('aria-label', '连续红点自动停止调度');
-    autoLabel.append(auto, document.createTextNode('连续红点自动停止调度'));
-    const thresholdLabel = el('label', '', '连续');
+    autoLabel.append(auto, document.createTextNode('连续红点停调度'));
+    const thresholdLabel = el('label');
     const threshold = el('input'); threshold.type = 'number'; threshold.min = '1'; threshold.max = '100'; threshold.step = '1';
     threshold.value = String(promptState.auto_pause_threshold || 3); threshold.disabled = !auto.checked;
     threshold.setAttribute('aria-label', '连续红点轮数');
     const policyFields = el('div', 'mt-policy-fields'); policyFields.hidden = !auto.checked;
-    auto.addEventListener('change', () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; });
-    thresholdLabel.append(threshold, document.createTextNode('轮红点后停止'));
-    policyFields.append(thresholdLabel, el('p', 'mt-note', `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`));
+    const refreshPolicy = () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; progress.hidden = !auto.checked; };
+    auto.addEventListener('change', refreshPolicy);
+    thresholdLabel.append(document.createTextNode('连续'), threshold, document.createTextNode('轮'));
+    const progress = el('p', 'mt-note', `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`);
+    policyFields.append(thresholdLabel);
     policy.append(autoLabel, policyFields);
-    policy.append(el('p', 'mt-note', '包含人工预览题的轮次不累计自动停调度红点。后续人工评分只更新该条记录，不追溯触发停调度。'));
-    if (promptState.pause_status === 'pending' || promptState.pause_status === 'failed') policy.append(el('p', 'mt-error', promptState.message));
-    if (promptState.paused_at) policy.append(el('p', 'mt-note', `上次停调度：${date(promptState.paused_at)} · ${promptState.pause_message}`));
+    const policyNotes = el('div', 'mt-policy-notes'); policyNotes.append(progress);
+    const policyInfo = el('details', 'mt-info');
+    policyInfo.append(el('summary', '', 'ⓘ'), el('span', '', '只计完整红点；绿、黄清零。包含人工预览题的轮次不累计自动停调度红点；人工评分只更新记录。'));
+    policyInfo.querySelector('summary').setAttribute('aria-label', '自动停止说明');
+    policy.append(policyInfo);
+    if (promptState.pause_status === 'pending' || promptState.pause_status === 'failed') policyNotes.append(el('p', 'mt-error', promptState.message));
+    if (promptState.paused_at) policyNotes.append(el('p', 'mt-note', `上次停调度：${date(promptState.paused_at)} · ${promptState.pause_message}`));
+    refreshPolicy();
+    const schedule = el('div', 'mt-schedule-row'); schedule.append(intervalLabel, challengeLabel, policy);
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '测试说明'),
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
       el('p', '', '归因模式：按设置的挑战次数只跑一轮，候选分数拉开且不符标红，相符标绿；样本不足或分数未拉开标黄。候选比较不认证实际型号；开启自动停止后，连续不符达到设置轮数仍会停止调度。'),
       el('p', '', '问答模式：每道开启的题只请求一次，不符也不复测。绿表示全部符合预期；红表示至少一题不符，且本轮没有未完成题；黄表示请求失败、未完成或待人工评分。问答颜色不证明模型身份。'),
-      el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“预览并评分”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
+      el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“查看作品”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
+      el('p', '', '问答失败按题显示一次；代理连接、TLS 握手与上游繁忙分别标注。连续不符停止只统计完整红点，连接错误和黄色结果不计入。'),
+      el('p', '', '间隔、挑战次数与自动停止参数在一行设置。自动停止只统计用户选定阈值，绿、黄都会清零。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'),
       el('p', '', '删除账号后自动清理其测试记录、留证和作品；清理在检测轮次之间执行，停用或限流不会触发删除。'));
     const history = el('ul', 'mt-history mt-prompt-history');
@@ -950,7 +1046,8 @@
       const summary = el('summary');
       const resultTitle = el('span', 'mt-result-title');
       const resultDescription = el('pre');
-      summary.append(dot, el('time', '', shortDate(result.checked_at)), resultTitle);
+      const answers = result.test_mode === 'qa' ? answerControls(id, result) : null;
+      const inline = answers?.inline || el('span', 'mt-result-inline');
       const refreshResult = () => {
         const color = ['green', 'yellow', 'red'].includes(result.status) ? result.status : 'yellow';
         const manual = (result.cases || []).some(entry => entry.kind === 'manual');
@@ -959,28 +1056,33 @@
           + resultLabel(result);
         summary.title = resultLabel(result); resultDescription.textContent = description(result);
       };
+      for (const entry of result.cases || []) {
+        if (entry.kind !== 'manual') continue;
+        const value = el('span', 'mt-result-case');
+        if (entry.artifact_available && result.result_id) {
+          const preview = el('button', 'mt-link', `${entry.name}：查看作品`); preview.type = 'button';
+          preview.addEventListener('click', event => {
+            event.preventDefault(); event.stopPropagation();
+            openArtifactPreview(id, result, result.cases.find(current => current.id === entry.id),
+              updated => { result = updated; refreshResult(); });
+          });
+          value.append(preview);
+        } else value.textContent = `${entry.name}：${entry.message || '待评分'}`;
+        inline.append(value);
+      }
+      summary.append(dot, el('time', '', shortDate(result.checked_at)), resultTitle, inline);
       refreshResult(); details.append(summary, resultDescription);
-      const answers = result.test_mode === 'qa' ? answerControls(id, result) : null;
       if (answers) details.append(answers.links);
       if (result.run_id) details.append(evidenceButton(id, result.run_id));
-      for (const entry of result.cases || []) {
-        if (entry.kind !== 'manual' || !entry.artifact_available || !result.result_id) continue;
-        const preview = el('button', 'mt-link mt-preview-link', entry.name + ' · 预览并评分'); preview.type = 'button';
-        preview.addEventListener('click', () => openArtifactPreview(id, result,
-          result.cases.find(current => current.id === entry.id), updated => { result = updated; refreshResult(); }));
-        details.append(preview);
-      }
       item.append(details);
-      if (answers) item.append(answers.shortAnswers);
       history.append(item); historyItems.push(item);
     }
     const empty = el('p', 'mt-note', historyItems.length ? '' : '暂无测试记录');
     const error = el('p', 'mt-error mt-save-error');
-    const actions = el('div', 'mt-actions');
-    const close = el('button', '', '关闭'); close.type = 'button'; close.addEventListener('click', () => dialog.close());
-    const saveButton = el('button', 'mt-primary', '保存当前页'); saveButton.type = 'button';
-    const disable = el('button', '', '关闭此项'); disable.type = 'button';
-    const saved = account => { promptState = account.prompt_test; enabled.checked = !!promptState.enabled; };
+    const saved = account => {
+      promptState = account.prompt_test; enabled.checked = !!promptState.enabled;
+      progress.textContent = `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`;
+    };
     const availability = el('p', 'mt-error');
     const catalogNote = el('p', 'mt-note', '正在读取账号可用模型…');
     function refreshMode() {
@@ -994,26 +1096,24 @@
       model.disabled = !catalogReady || !choices.length;
       const available = (qa ? promptState.qa_available : promptState.attribution_available) ?? promptState.available;
       availability.textContent = available ? '' : ((qa ? promptState.qa_reason : promptState.attribution_reason) || promptState.reason);
-      saveButton.disabled = enabled.checked && (!available || !catalogReady || !choices.length);
-      disable.disabled = !promptState.enabled;
+      schedule.classList.toggle('mt-schedule-qa', qa);
       refreshEstimate();
     }
     mode.addEventListener('change', () => {
       auto.checked = mode.value === (promptState.test_mode || 'attribution') && !!promptState.auto_pause_enabled;
-      threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked;
+      refreshPolicy();
       error.textContent = ''; refreshMode();
     });
     enabled.addEventListener('change', refreshMode);
     dialog.addEventListener('mt-save-end', refreshMode);
     body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
-    saveButton.addEventListener('click', () => {
+    const validate = () => {
       error.classList.add('mt-error');
       const minutes = Number(interval.value), count = Number(threshold.value);
       const qa = mode.value === 'qa';
       if (enabled.checked && !model.value.trim()) { error.textContent = '请填写测试模型'; return; }
-      if (!qa && enabled.checked && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
-      if (!qa && enabled.checked && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
-      if (!qa && !enabled.checked && prompt.value !== promptState.prompt) { error.textContent = '修改数字归因模板需开启此页定时测试后保存；只关闭检测可点击“关闭此项”。'; return; }
+      if (!qa && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
+      if (!qa && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
       if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '测试间隔请填写 1–1440 分钟的整数'; return; }
       if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续红点轮数请填写 1–100 的整数'; return; }
       const cases = editor.values();
@@ -1021,25 +1121,36 @@
       if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || (item.kind !== 'manual' && !item.expected_answer.trim())))) {
         error.textContent = '请填写已勾选题目的名称和提示词；答案匹配题还需填写预期答案'; return;
       }
+      error.textContent = '';
+      return true;
+    };
+    const formPayload = () => {
       const payload = { enabled: enabled.checked, model: model.value || promptState.model || 'gpt-6-astra',
         reasoning_effort: effort.select.value,
         prompt: prompt.value, challenge_count: Number(challenges.value),
-        auto_pause_enabled: auto.checked, auto_pause_threshold: count, interval_minutes: minutes };
+        auto_pause_enabled: auto.checked, auto_pause_threshold: Number(threshold.value), interval_minutes: Number(interval.value) };
       payload.test_mode = mode.value;
-      if (qa) payload.cases = cases;
-      saveSettings(id, '/accounts/' + id + '/prompt-test', payload, dialog, error, saved);
-    });
-    disable.addEventListener('click', () => saveSettings(id, '/accounts/' + id + '/prompt-test', { enabled: false }, dialog, error, saved));
-    actions.append(close, disable, saveButton);
-    body.append(status, enabledLabel, modeLabel, modelLabel, catalogNote, effort.label, budgetNote, editor.root, promptLabel, templateNote, intervalLabel, challengeLabel, estimate,
-      availability, policy, historyHead, history, empty, help, error);
-    panel.append(body, actions);
+      if (mode.value === 'qa') payload.cases = editor.values();
+      return payload;
+    };
+    body.append(status, enabledLabel, settingsGrid, catalogNote, schedule, estimate, policyNotes,
+      availability, editor.root, promptLabel, templateNote, historyHead, history, empty, help, error);
+    help.append(budgetNote);
+    panel.append(body);
     refreshMode();
+    let baseline = JSON.stringify(formPayload());
+    const form = { dirty: () => baseline !== JSON.stringify(formPayload()), validate,
+      save: () => saveSettings(id, '/accounts/' + id + '/prompt-test', formPayload(), dialog, error, saved),
+      commit: () => { baseline = JSON.stringify(formPayload()); } };
+    registerForm(form);
     loadModels().then(models => {
       if (!dialog.open) return;
+      const pristine = !form.dirty();
       liveChoices = models; catalogReady = true;
       catalogNote.textContent = liveChoices.length ? '' : '账号当前没有可用模型';
       if (!pending.has(id)) refreshMode();
+      if (pristine) form.commit();
+      panel.dispatchEvent(new Event('change'));
     }).catch(error => { if (dialog.open) catalogNote.textContent = error.name === 'TimeoutError' ? '读取模型列表超时，请关闭后重试' : error.message; });
   }
 

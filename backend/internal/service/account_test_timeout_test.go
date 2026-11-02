@@ -76,6 +76,14 @@ func TestAccountTestStreamErrorCodesDistinguishDeadlineFromDisconnect(t *testing
 		{"gateway deadline", "Stream read error: use of closed network connection", "test_timeout", true},
 		{"connection lost", "Stream read error: connection reset by peer", "stream_interrupted", false},
 		{"missing completion", "Stream ended before response.completed", "stream_interrupted", false},
+		{"proxy timeout", "SOCKS5 connect: i/o timeout", "proxy_connect_timeout", false},
+		{"proxy error", "SOCKS5 connect: connection refused", "proxy_connect_error", false},
+		{"HTTP proxy timeout", "Request failed: read CONNECT response: i/o timeout", "proxy_connect_timeout", false},
+		{"direct timeout", "Request failed: dial tcp: i/o timeout", "connect_timeout", false},
+		{"header timeout", "Request failed: read response: i/o timeout", "response_header_timeout", false},
+		{"TLS timeout", "TLS handshake failed: context deadline exceeded", "tls_handshake_timeout", false},
+		{"TLS error", "TLS handshake failed: remote error", "tls_handshake_error", false},
+		{"upstream overload", "Our servers are currently overloaded. Please try again later.", "upstream_overloaded", false},
 		{"upstream failure", "OpenAI response failed", "upstream_error", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

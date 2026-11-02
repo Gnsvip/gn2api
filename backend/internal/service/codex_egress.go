@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
@@ -14,6 +15,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/klauspost/compress/zstd"
 )
+
+// CodexHTTPConnectTimeout bounds TCP, proxy tunneling and TLS before sending a turn.
+const CodexHTTPConnectTimeout = 30 * time.Second
 
 // codexEgressEligible deliberately fails closed to the existing transport when
 // any boundary is unverified. Each allowed version has its own captured fixtures.

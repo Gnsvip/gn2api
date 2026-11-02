@@ -39,6 +39,9 @@ states['7']['history'][-1].update(requests=4, valid_samples=3, insufficient_samp
 live_models = ['gpt-6-sol', 'gpt-6-astra', 'gpt-6.1-sol']
 writes = []
 errors = []
+fail_prompt_save = False
+accept_discard = True
+discard_questions = []
 evidence_requests = []
 large_events = [{'sequence':i+1, 'at':NOW, 'kind':'stream',
                  'payload':{'output':'29', 'literal':'<img src=x onerror=alert(1)>', 'line':'x' * 430}}
@@ -53,6 +56,10 @@ with sync_playwright() as p:
     # Fixture login belongs to the admin page, never the isolated artwork frame.
     page.add_init_script("if (window === window.top) localStorage.setItem('auth_token','fixture-admin');")
     page.on('pageerror', lambda e: errors.append(str(e)))
+    def handle_dialog(dialog):
+        discard_questions.append(dialog.message)
+        dialog.accept() if accept_discard else dialog.dismiss()
+    page.on('dialog', handle_dialog)
     def route(r):
         if '/api/v1/admin/accounts/' in r.request.url:
             r.fulfill(json={'code': 0, 'data': [{'id': model} for model in live_models]})
@@ -94,6 +101,9 @@ with sync_playwright() as p:
                 id = parts[-2] if parts[-1] == 'prompt-test' else parts[-1]
                 data = r.request.post_data_json
                 writes.append((id, data))
+                if parts[-1] == 'prompt-test' and fail_prompt_save:
+                    r.fulfill(status=503, json={'error': '测试保存失败，请重试'})
+                    return
                 if parts[-1] == 'prompt-test':
                     states[id]['prompt_test'].update(data)
                 else:
@@ -126,7 +136,7 @@ with sync_playwright() as p:
     page.get_by_label('归因推理等级', exact=True).select_option('medium')
     assert writes == []  # Choosing the default does not enable or write anything.
     page.get_by_role('switch', name='启用定时模型归因', exact=True).check()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('[data-row-id=\"8\"] .mt-toggle').getAttribute('aria-checked') === 'true'")
     assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-astra', auto_pause_enabled=False,
                                   auto_pause_threshold=3, interval_minutes=10, challenge_count=3, reasoning_effort='medium'))
@@ -161,7 +171,7 @@ with sync_playwright() as p:
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-settings-compact.png')))
     page.set_viewport_size({'width': 390, 'height': 844})
     assert page.locator('[role=tabpanel]:visible').locator('.mt-body').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
-    footer = page.locator('[role=tabpanel]:visible').locator('.mt-actions').bounding_box()
+    footer = page.locator('.mt-settings-dialog > .mt-actions').bounding_box()
     assert footer['y'] >= 0 and footer['y'] + footer['height'] <= 844
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-settings-mobile.png')))
     page.evaluate("document.documentElement.classList.add('dark')")
@@ -171,12 +181,12 @@ with sync_playwright() as p:
     page.get_by_role('switch', name='连续不符自动停止调度').check()
     assert page.get_by_role('spinbutton', name='连续不符轮数').input_value() == '3'
     page.get_by_role('spinbutton', name='连续不符轮数').fill('0')
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     assert page.locator('[role=tabpanel]:visible').locator('.mt-error').inner_text() == '连续轮数请填写 1–100 的整数'
     page.get_by_role('spinbutton', name='连续不符轮数').fill('3')
     assert page.get_by_role('spinbutton', name='检测间隔（分钟）').input_value() == '10'
     page.get_by_role('spinbutton', name='检测间隔（分钟）').fill('0')
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     assert page.locator('[role=tabpanel]:visible').locator('.mt-error').inner_text() == '检测间隔请填写 1–1440 分钟的整数'
     page.get_by_role('spinbutton', name='检测间隔（分钟）').fill('30')
     page.get_by_label('挑战次数', exact=True).select_option('1')
@@ -185,9 +195,9 @@ with sync_playwright() as p:
     page.get_by_label('挑战次数', exact=True).select_option('2')
     assert '每轮最多 2 次，不自动复测' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
     assert '96 次请求 / 天' in page.locator('[role=tabpanel]:visible').locator('.mt-estimate').inner_text()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert writes[-1] == ('7', dict(enabled=False, model='gpt-6-sol', auto_pause_enabled=True, auto_pause_threshold=3, interval_minutes=30, challenge_count=2, reasoning_effort='xhigh'))
@@ -214,11 +224,11 @@ with sync_playwright() as p:
     page.wait_for_function("document.querySelector('[data-row-id=\"7\"] .mt-state')?.textContent === '已停调度'")
     assert page.locator('[data-row-id="8"] .mt-state').inner_text() == '已开启'
     page.locator('[data-row-id="7"] .mt-label').click()
-    assert page.get_by_role('button', name='保存当前页', exact=True).is_enabled()
+    assert page.get_by_role('button', name='保存设置', exact=True).is_enabled()
     page.get_by_role('switch', name='连续不符自动停止调度').uncheck()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert writes[-1][1]['auto_pause_enabled'] is False
@@ -242,7 +252,7 @@ with sync_playwright() as p:
     assert page.get_by_label('测试提示词', exact=True).input_value() == '{{challenge}}'
     page.get_by_role('switch', name='启用此页定时测试', exact=True).check()
     page.get_by_label('测试提示词', exact=True).fill('hello')
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     assert '{{challenge}}' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
     page.get_by_label('测试提示词', exact=True).fill('请认真完成：\n{{challenge}}')
     page.get_by_label('测试模型', exact=True).select_option('gpt-6-sol')
@@ -252,9 +262,9 @@ with sync_playwright() as p:
     page.get_by_label('测试间隔（分钟）', exact=True).fill('15')
     page.get_by_role('switch', name='连续红点自动停止调度').check()
     page.get_by_label('连续红点轮数', exact=True).fill('2')
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-sol', prompt='请认真完成：\n{{challenge}}',
@@ -271,13 +281,13 @@ with sync_playwright() as p:
     assert page.get_by_label('题目推理等级', exact=True).input_value() == 'low'
     assert page.locator('.mt-prompt-history li').count() == 3
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-prompt-settings.png')))
-    page.get_by_label('测试提示词', exact=True).fill('')
-    page.get_by_role('button', name='关闭此项', exact=True).click()
+    page.get_by_role('switch', name='启用此页定时测试', exact=True).uncheck()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
-    assert writes[-1] == ('8', {'enabled': False})
+    assert writes[-1][0] == '8' and writes[-1][1]['enabled'] is False
     # Optional question selection is saved independently from the timer and attribution.
     attribution_before = json.dumps(states['8']['history'])
     open_custom()
@@ -300,9 +310,9 @@ with sync_playwright() as p:
     page.get_by_label('测试模型', exact=True).select_option('gpt-6.1-sol')
     page.get_by_label('题目推理等级', exact=True).select_option('high')
     assert '每轮最多 1 次' in page.locator('dialog').inner_text()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     saved = writes[-1][1]
@@ -320,16 +330,16 @@ with sync_playwright() as p:
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-settings.png')))
     page.set_viewport_size({'width': 390, 'height': 844})
     assert page.locator('[role=tabpanel]:visible').locator('.mt-body').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
-    footer = page.locator('[role=tabpanel]:visible').locator('.mt-actions').bounding_box()
+    footer = page.locator('.mt-settings-dialog > .mt-actions').bounding_box()
     assert footer['y'] >= 0 and footer['y'] + footer['height'] <= 844
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-mobile.png')))
     page.get_by_label('测试 知识题', exact=True).uncheck()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     assert '至少勾选一道题' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
     page.get_by_role('switch', name='启用此页定时测试', exact=True).uncheck()
-    page.get_by_role('button', name='保存当前页', exact=True).click()
+    page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
-    assert '当前页设置已保存' in page.locator('dialog').inner_text()
+    assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
     assert not writes[-1][1]['enabled'] and not any(item['enabled'] for item in writes[-1][1]['cases'])
@@ -388,7 +398,7 @@ with sync_playwright() as p:
     page.locator('[role=tabpanel]:visible .mt-result > summary').click()
     assert len(page.locator('[role=tabpanel]:visible .mt-result').text_content()) < 1200
     assert '7+9+8+4' not in page.locator('[role=tabpanel]:visible').inner_text()
-    page.get_by_role('button', name='糖果形状题 · 第 1 次完整回答', exact=True).click()
+    page.get_by_role('button', name='糖果形状题：查看回答', exact=True).click()
     answer_dialog = page.locator('.mt-preview-dialog')
     assert len(answer_dialog.locator('pre').inner_text()) == 4000
     answer_dialog.get_by_role('button', name='下一页', exact=True).click()
@@ -403,14 +413,14 @@ with sync_playwright() as p:
     page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js'))
     open_custom()
     page.locator('[role=tabpanel]:visible .mt-result > summary').click()
-    page.get_by_role('button', name='糖果形状题 · 第 1 次完整回答', exact=True).click()
+    page.get_by_role('button', name='糖果形状题：查看回答', exact=True).click()
     page.locator('.mt-preview-dialog .mt-answer-text').wait_for()
     assert len(page.locator('.mt-preview-dialog .mt-answer-text').inner_text()) == 4000
     page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
     before_requests = len(evidence_requests)
-    page.locator('.mt-answer-summary > summary').click()
-    assert page.locator('.mt-answer-summary .mt-answer-text').inner_text() == long_answer[:160]
-    assert page.locator('.mt-preview-dialog').count() == 0
+    page.get_by_role('button', name='糖果形状题 · 历史第 2 次回答').click()
+    assert long_answer[:160] in page.locator('.mt-preview-dialog .mt-answer-text').inner_text()
+    page.locator('.mt-preview-dialog').get_by_role('button', name='×', exact=True).click()
     assert len(evidence_requests) == before_requests
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
@@ -425,7 +435,7 @@ with sync_playwright() as p:
     page.get_by_role('button', name='查看全部 6 条', exact=True).click()
     for title in ('检测超时', '网关测试超时', '响应连接中断', '上游错误', '指纹库未校准', '样本不足'):
         assert page.locator('[role=tabpanel]:visible .mt-result-title').filter(has_text=title).count() == 1
-    assert '每轮最多 12 分钟' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert '每轮最多 12 分钟' in page.locator('[role=tabpanel]:visible').text_content()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-effort-settings.png')))
     page.get_by_role('button', name='关闭', exact=True).click()
     states['8']['history'] = [dict(status='yellow', expected='gpt-6-astra', checked_at=NOW,
@@ -449,10 +459,10 @@ with sync_playwright() as p:
         attempts=[dict(output='False', evidence_saved=True, attempt_id='short-answer')])])]
     page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
     assert not page.locator('[role=tabpanel]:visible .mt-result').evaluate('(e) => e.open')
-    assert 'Tibo 题 · 回答：False' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert 'Tibo 题：False' in page.locator('[role=tabpanel]:visible').inner_text()
     assert page.get_by_role('button', name='Tibo 题 · 完整回答', exact=True).count() == 0
     assert '次完整回答' not in page.locator('[role=tabpanel]:visible').inner_text()
-    page.get_by_text('Tibo 题 · 回答：False', exact=True).scroll_into_view_if_needed()
+    page.get_by_text('Tibo 题：False', exact=True).scroll_into_view_if_needed()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-single-answer.png')))
     page.get_by_role('button', name='关闭', exact=True).click()
     # The extracted document renders in the existing sandbox; source remains available.
@@ -460,7 +470,7 @@ with sync_playwright() as p:
         status='yellow', artifact_available=True, message='待人工评分')])
     page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
     page.locator('[role=tabpanel]:visible .mt-result > summary').click()
-    page.get_by_role('button', name='鹈鹕 · 预览并评分', exact=True).click()
+    page.get_by_role('button', name='鹈鹕：查看作品', exact=True).click()
     preview = page.locator('.mt-preview-dialog')
     preview.locator('iframe').wait_for()
     assert page.frame_locator('.mt-preview-dialog iframe').locator('svg').count() == 1
@@ -470,6 +480,90 @@ with sync_playwright() as p:
     preview.get_by_role('button', name='关闭', exact=True).click()
     page.get_by_role('button', name='关闭', exact=True).click()
     assert all(action in ('events', 'download', 'answer') for action in evidence_requests)
+    # One save covers both drafts, validates both first, and retries only the failed page.
+    page.set_viewport_size({'width': 1160, 'height': 800})
+    page.locator('[data-row-id="8"] .mt-label').click()
+    page.get_by_role('tab', name='模型归因', exact=True).click()
+    page.get_by_label('归因推理等级', exact=True).select_option('low')
+    page.get_by_role('switch', name='连续不符自动停止调度', exact=True).check()
+    page.get_by_label('连续不符轮数', exact=True).fill('4')
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-attribution-compact.png')))
+    page.get_by_role('tab', name='自定义题目', exact=True).click()
+    page.get_by_label('题目推理等级', exact=True).select_option('low')
+    page.get_by_label('测试间隔（分钟）', exact=True).fill('0')
+    before = len(writes)
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    assert '测试间隔请填写' in page.locator('[role=tabpanel]:visible').inner_text()
+    assert len(writes) == before  # The valid first tab must not be written yet.
+    page.get_by_label('测试间隔（分钟）', exact=True).fill('11')
+    fail_prompt_save = True
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.get_by_text('有一页未保存成功，请检查提示', exact=True).wait_for()
+    assert len(writes) == before + 2
+    assert states['8']['reasoning_effort'] == 'low'
+    assert page.get_by_label('题目推理等级', exact=True).input_value() == 'low'
+    assert page.get_by_label('测试间隔（分钟）', exact=True).input_value() == '11'
+    assert page.locator('#mt-tab-attribution').get_attribute('data-dirty') == 'false'
+    assert page.locator('#mt-tab-custom').get_attribute('data-dirty') == 'true'
+    fail_prompt_save = False
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.get_by_text('所有修改已保存', exact=True).wait_for()
+    assert len(writes) == before + 3 and states['8']['prompt_test']['interval_minutes'] == 11
+    assert not states['8']['prompt_test']['enabled']  # Disabled settings remain editable.
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    assert page.get_by_text('没有未保存修改', exact=True).is_visible()
+    assert len(writes) == before + 3
+    page.get_by_role('tab', name='模型归因', exact=True).click()
+    page.get_by_label('归因推理等级', exact=True).select_option('high')
+    page.get_by_role('tab', name='自定义题目', exact=True).click()
+    page.get_by_label('题目推理等级', exact=True).select_option('medium')
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.get_by_text('所有修改已保存', exact=True).wait_for()
+    assert len(writes) == before + 5
+    assert states['8']['reasoning_effort'] == 'high' and states['8']['prompt_test']['reasoning_effort'] == 'medium'
+    page.get_by_label('测试间隔（分钟）', exact=True).fill('12')
+    accept_discard = False
+    questions_before = len(discard_questions)
+    page.get_by_role('button', name='关闭', exact=True).click()
+    assert page.locator('.mt-settings-dialog').is_visible()
+    page.keyboard.press('Escape')
+    assert len(discard_questions) == questions_before + 2
+    assert page.get_by_label('测试间隔（分钟）', exact=True).input_value() == '12'
+    accept_discard = True
+    page.get_by_role('button', name='关闭', exact=True).click()
+    page.locator('.mt-settings-dialog').wait_for(state='detached')
+    assert states['8']['prompt_test']['interval_minutes'] == 11 and len(writes) == before + 5
+    # Three questions share one collapsed row. Artwork opens without expanding it.
+    states['8']['prompt_test']['history'] = [dict(status='yellow', test_mode='qa', expected='gpt-6-astra', checked_at=NOW,
+        result_id=10, requests=3, cases=[
+            dict(id='tibo', name='Tibo 题', kind='exact', status='red', expected_answer='True', attempts=[dict(output='False')]),
+            dict(id='candy', name='糖果题', kind='exact', status='green', expected_answer='21', attempts=[dict(output='21')]),
+            dict(id='drawing', name='画图题', kind='manual', status='yellow', artifact_available=True)])]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
+    summary = page.locator('[role=tabpanel]:visible .mt-result > summary')
+    assert summary.count() == 1
+    assert 'Tibo 题：False' in summary.inner_text() and '糖果题：21' in summary.inner_text()
+    for width in (1160, 390):
+        page.set_viewport_size({'width': width, 'height': 844})
+        summary.scroll_into_view_if_needed()
+        assert page.locator('[role=tabpanel]:visible .mt-body').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
+        assert summary.locator('.mt-result-inline').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
+        page.locator('dialog').screenshot(path=str(out.with_name(f'modeltrace-mixed-results-{width}.png')))
+    page.get_by_role('button', name='画图题：查看作品', exact=True).click()
+    page.locator('.mt-preview-dialog iframe').wait_for()
+    assert not page.locator('[role=tabpanel]:visible .mt-result').evaluate('(e) => e.open')
+    page.locator('.mt-preview-dialog').get_by_role('button', name='关闭', exact=True).click()
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # A failed request has a compact label and only one full error explanation.
+    failure_message = '上游繁忙，未收到完整回答'
+    states['8']['prompt_test']['history'] = [dict(status='yellow', test_mode='qa', expected='gpt-6-astra', checked_at=NOW,
+        requests=1, message=failure_message, outcome='upstream_overloaded', cases=[dict(name='Tibo 题', kind='exact',
+        status='yellow', outcome='upstream_overloaded', message=failure_message, expected_answer='True', attempts=[dict(output='')])])]
+    page.reload(); page.add_script_tag(path=str(ROOT / 'modeltrace.js')); open_custom()
+    assert 'Tibo 题：上游繁忙' in page.locator('[role=tabpanel]:visible .mt-result > summary').inner_text()
+    page.locator('[role=tabpanel]:visible .mt-result > summary').click()
+    assert page.locator('[role=tabpanel]:visible .mt-result').inner_text().count(failure_message) == 1
+    page.get_by_role('button', name='关闭', exact=True).click()
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")
     assert errors == [], errors

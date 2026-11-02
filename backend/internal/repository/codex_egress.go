@@ -49,7 +49,7 @@ func (s *httpUpstreamService) doCodexH1(req *http.Request, proxyURL string, prof
 	}
 	ctx, cancel := context.WithCancel(req.Context())
 	resp, err := codexwire.DoHTTP1(ctx, req.Method, req.URL.String(), filtered, body, proxyURL, codexwire.HTTP1Options{
-		TLSProfile: profile, DialTimeout: defaultUpstreamDialTimeout + 5*time.Second,
+		TLSProfile: profile, DialTimeout: service.CodexHTTPConnectTimeout,
 		ResponseHeaderTimeout: headerTimeout,
 	})
 	if err != nil {
@@ -65,7 +65,7 @@ func (s *httpUpstreamService) doCodexH1(req *http.Request, proxyURL string, prof
 func (s *httpUpstreamService) codexH2() *codexwire.H2Pool {
 	s.codexH2Once.Do(func() {
 		s.codexH2Pool = codexwire.NewH2Pool(codexwire.H2Options{
-			Timeout: defaultUpstreamDialTimeout + 5*time.Second,
+			Timeout: service.CodexHTTPConnectTimeout,
 		})
 	})
 	return s.codexH2Pool
