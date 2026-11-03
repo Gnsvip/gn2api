@@ -80,14 +80,16 @@ type RelayOptions struct {
 	FirstMessageSent                bool
 	StartClientAfterFirstDownstream bool
 	OnUsageParseFailure             func(eventType string, usageRaw string)
-	OnTurnComplete                  func(turn RelayTurnResult)
-	BeforeWriteClient               func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error
-	BeforeClientWrite               func(msgType coderws.MessageType, payload []byte)
-	AfterClientWrite                func(msgType coderws.MessageType, payload []byte, writeErr error)
-	BeforeRelayCancel               func(exit RelayExit)
-	ReadClientFrame                 func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
-	OnTrace                         func(event RelayTraceEvent)
-	Now                             func() time.Time
+	// StartsTTFT only controls measurement, never forwarding or retry policy.
+	StartsTTFT        func(payload []byte, eventType string) bool
+	OnTurnComplete    func(turn RelayTurnResult)
+	BeforeWriteClient func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error
+	BeforeClientWrite func(msgType coderws.MessageType, payload []byte)
+	AfterClientWrite  func(msgType coderws.MessageType, payload []byte, writeErr error)
+	BeforeRelayCancel func(exit RelayExit)
+	ReadClientFrame   func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
+	OnTrace           func(event RelayTraceEvent)
+	Now               func() time.Time
 }
 
 type RelayTraceEvent struct {
@@ -113,6 +115,7 @@ type relayState struct {
 	responseConflict        bool
 	terminalEventType       string
 	firstTokenMs            *int
+	startsTTFT              func(payload []byte, eventType string) bool
 	turnTimingByID          map[string]*relayTurnTiming
 	activeTurn              *relayTurnTiming
 	pendingBareError        *observedUpstreamEvent
@@ -181,7 +184,7 @@ func Relay(
 		firstMessageType = coderws.MessageText
 	}
 	startAt := nowFn()
-	state := &relayState{requestModel: result.RequestModel}
+	state := &relayState{requestModel: result.RequestModel, startsTTFT: options.StartsTTFT}
 	if isClientResponseCreateFrame(firstMessageType, firstClientMessage) {
 		firstTurnStartedAt := options.FirstTurnStartedAt
 		if firstTurnStartedAt.IsZero() {
@@ -768,16 +771,14 @@ func observeUpstreamMessage(
 	}
 	now := nowFn()
 
-	if state.firstTokenMs == nil && isTokenEvent(eventType) {
+	startsTTFT := isTokenEvent(eventType)
+	if state.startsTTFT != nil {
+		startsTTFT = state.startsTTFT(message, eventType)
+	}
+	if state.firstTokenMs == nil && startsTTFT {
 		ms := int(now.Sub(startAt).Milliseconds())
 		if ms >= 0 {
 			state.firstTokenMs = &ms
-		}
-		if state.activeTurn != nil && state.activeTurn.firstTokenMs == nil {
-			tms := int(now.Sub(state.activeTurn.startAt).Milliseconds())
-			if tms >= 0 {
-				state.activeTurn.firstTokenMs = &tms
-			}
 		}
 	}
 	parsedUsage := parseUsageAndAccumulate(state, message, eventType, onUsageParseFailure)
@@ -789,14 +790,16 @@ func observeUpstreamMessage(
 	var turnTiming *relayTurnTiming
 	if responseID != "" {
 		turnTiming = openAIWSRelayGetOrInitTurnTiming(state, responseID, now)
-		if turnTiming != nil && turnTiming.firstTokenMs == nil && isTokenEvent(eventType) {
-			ms := int(now.Sub(turnTiming.startAt).Milliseconds())
-			if ms >= 0 {
-				turnTiming.firstTokenMs = &ms
-			}
-		}
 	} else {
 		turnTiming = state.activeTurn
+	}
+	// Deltas and tool-done frames often omit response_id. Attribute them to
+	// the active turn even after the connection's first turn has completed.
+	if turnTiming != nil && turnTiming.firstTokenMs == nil && startsTTFT {
+		ms := int(now.Sub(turnTiming.startAt).Milliseconds())
+		if ms >= 0 {
+			turnTiming.firstTokenMs = &ms
+		}
 	}
 	observeRelayTurnResponseModel(turnTiming, firstRelayResponseModel(message), isTerminalEvent(eventType))
 	if !isTerminalEvent(eventType) {

@@ -94,6 +94,12 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 			}
 		}
 	}
+	// The native protocol models this envelope as Option<...>. Codex drops
+	// null on replay (and can add only the tracing fields removed below).
+	// Empty and absent metadata must therefore compare equally.
+	if item["internal_chat_message_metadata_passthrough"] == nil {
+		delete(item, "internal_chat_message_metadata_passthrough")
+	}
 	if metadata, ok := item["internal_chat_message_metadata_passthrough"].(map[string]any); ok {
 		delete(metadata, "turn_id")
 		delete(metadata, "create_time")
@@ -101,6 +107,11 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		delete(metadata, "content_item_metadata")
 		// Native Codex omits this upstream output token annotation on replay.
 		delete(metadata, "content_token_count")
+		for _, key := range []string{"cell_id", "executed_tool_calls", "tool_calls_complete"} {
+			if metadata[key] == nil {
+				delete(metadata, key)
+			}
+		}
 		// Keep cell_id/executed_tool_calls/tool_calls_complete and unknown
 		// metadata: late tool-result updates require a full replay.
 		if len(metadata) == 0 {

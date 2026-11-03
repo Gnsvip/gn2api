@@ -447,6 +447,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	usage := &OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
+	ttftMode := s.openAITTFTMode(ctx)
+	bufferingOutputSeen := false
 	responseID := ""
 	var finalResponse []byte
 	wroteDownstream := false
@@ -717,12 +719,13 @@ readLoop:
 		isTokenEvent := isOpenAIWSTokenEvent(eventType)
 		if isTokenEvent {
 			tokenEventCount++
+			bufferingOutputSeen = true
 		}
 		isTerminalEvent := isOpenAIWSTerminalEvent(eventType)
 		if isTerminalEvent {
 			terminalEventCount++
 		}
-		if firstTokenMs == nil && isTokenEvent {
+		if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(message), eventType, false, ttftMode) {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
 		}
@@ -862,7 +865,8 @@ readLoop:
 		if reqStream {
 			// 在首个 token 前先缓冲事件（如 response.created），
 			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
-			shouldBuffer := firstTokenMs == nil && !isTokenEvent && !isTerminalEvent
+			// Metric mode must not change buffering or safe retry boundaries.
+			shouldBuffer := !bufferingOutputSeen && !isTokenEvent && !isTerminalEvent
 			if shouldBuffer {
 				buffered := make([]byte, len(message))
 				copy(buffered, message)

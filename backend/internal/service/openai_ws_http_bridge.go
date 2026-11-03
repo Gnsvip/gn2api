@@ -634,6 +634,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	usage := OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
+	ttftMode := s.openAITTFTMode(ctx)
 	reqStream := openAIWSPayloadBoolFromRaw(body, "stream", true)
 	eventCount := 0
 	tokenEventCount := 0
@@ -784,10 +785,10 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if isOpenAIWSTokenEvent(eventType) {
 			tokenEventCount++
-			if firstTokenMs == nil {
-				ms := int(time.Since(turnStart).Milliseconds())
-				firstTokenMs = &ms
-			}
+		}
+		if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(upstreamMessage), eventType, false, ttftMode) {
+			ms := int(time.Since(turnStart).Milliseconds())
+			firstTokenMs = &ms
 		}
 		if openAIWSMessageShouldParseUsage(eventType, upstreamMessage) {
 			parseOpenAIWSResponseUsageFromCompletedEvent(upstreamMessage, &usage)

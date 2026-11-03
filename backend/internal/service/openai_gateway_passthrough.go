@@ -1352,6 +1352,14 @@ func (s *OpenAIGatewayService) openAITTFTMode(ctx context.Context) string {
 }
 
 func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode string) bool {
+	if eventType == "" {
+		eventType = strings.TrimSpace(gjson.Get(data, "type").String())
+	}
+	// A terminal-only response has no independently observed first output.
+	// Do not turn its completion time (or an error) into a fabricated TTFT.
+	if eventType == "error" || isOpenAIWSTerminalEvent(eventType) {
+		return false
+	}
 	if mode == OpenAITTFTModeVisible {
 		return openAIStreamDataStartsVisibleOutput(data, eventType)
 	}

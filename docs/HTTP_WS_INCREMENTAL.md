@@ -13,6 +13,8 @@
 
 比较保留消息正文、密文、工具名称/参数及 call_id；已有 message/reasoning/function/custom 等条目忽略输出对象 ID、status，新增原生类型保留 ID/status。忽略已知内部 turn_id/create_time/content_item_kinds/content_item_metadata 和空 annotations/logprobs 等重放元数据；工具执行元数据和未知字段继续严格比较。比较时的规范化不会修改实际发送的新 input。客户端显式提供 previous_response_id 的既有逻辑保持独立。
 
+原生回放还会省略输出的 `metadata.turn_id`、`internal_chat_message_metadata_passthrough.content_token_count` 及空元数据包。摘要比较将内部元数据包的 null、空对象和省略视为等价；其中 cell_id、executed_tool_calls、tool_calls_complete 仅将 null 视为省略，非空值及未知字段继续严格比较。v0.2.47 的原生 app-server 受控实验与实际 Forward 回归确认，空元数据不再导致工具续传误判为 prefix_mismatch。
+
 Codex 原生 input 中的 `additional_tools` 与 `configuration_update` 也完整参与比较。此前白名单遗漏了这两种类型，导致真实客户端请求在比较前缀前便返回 `non_self_contained_input`，无法建立检查点。工具声明或配置变化仍会回到全量。
 
 原生 remote compaction v2 的 `compaction_summary` 必须含非空 `encrypted_content`，整项参与比较（包括 ID 和未知扩展字段），不能删除摘要或忽略密文变化。`compaction_trigger` 明确标记上下文切换：本轮不推断增量锚点、不按普通追加回合建立检查点，原因记为 `compaction_boundary`。压缩后的新输入须先完整完成一次 WS，再为后续回合建立增量检查点。其他未知条目、未解析引用继续安全采用全量。
