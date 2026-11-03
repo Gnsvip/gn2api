@@ -1126,6 +1126,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		wsDecision = openAIWSHTTPDecision("ws_session_fallback:" + action.reason)
 		c.Set("openai_ws_transport_decision", string(wsDecision.Transport))
 		c.Set("openai_ws_transport_reason", wsDecision.Reason)
+		c.Set("openai_ws_auto_incremental", false)
+		c.Set("openai_ws_auto_incremental_reason", "http_fallback")
 		logOpenAIWSModeInfo("http_bridge_fallback account_id=%d reason=%s", account.ID, normalizeOpenAIWSLogValue(action.reason))
 	}
 

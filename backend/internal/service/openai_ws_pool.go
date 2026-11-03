@@ -309,6 +309,9 @@ type openAIWSConn struct {
 	createdAtNano atomic.Int64
 	lastUsedNano  atomic.Int64
 	prewarmed     atomic.Bool
+	// Invalidated on every upstream write, installed only after a completed
+	// HTTP bridge turn. Socket ownership prevents cross-connection continuation.
+	autoContinuation atomic.Pointer[openAIWSAutoContinuation]
 }
 
 func newOpenAIWSConn(id string, _ int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
@@ -592,6 +595,7 @@ func (c *openAIWSConn) writeJSONWithTimeout(parent context.Context, value any, t
 func (c *openAIWSConn) writeJSON(value any, writeCtx context.Context) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.autoContinuation.Store(nil)
 	if c.ws == nil {
 		return errOpenAIWSConnClosed
 	}

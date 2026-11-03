@@ -131,6 +131,10 @@ func openAIWSSessionFallbackActionFor(reason string) openAIWSSessionFallbackActi
 	switch reason {
 	case "upgrade_required", "ws_unsupported":
 		return openAIWSSessionFallbackAction{fallbackHTTP: true, markDisable: true, capability: true, reason: reason}
+	case "auto_continuation_miss":
+		// Only a gateway-inferred anchor was rejected. The original full
+		// client request remains available for a safe HTTP replay.
+		return openAIWSSessionFallbackAction{fallbackHTTP: true, reason: reason}
 	case "message_too_big":
 		// WS 帧上限问题；HTTP 无帧上限可重试，但非账号健康问题。
 		return openAIWSSessionFallbackAction{fallbackHTTP: true, reason: reason}
