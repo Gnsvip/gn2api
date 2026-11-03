@@ -43,16 +43,10 @@ var explicitOpenAIHeaderSessionNames = []string{
 // fields: request/message IDs rotate every turn and would defeat sticky routing
 // and upstream prompt caching.
 func explicitOpenAIHeaderSessionID(c *gin.Context) string {
-	if c == nil {
+	if c == nil || c.Request == nil {
 		return ""
 	}
-
-	for _, header := range explicitOpenAIHeaderSessionNames {
-		if sessionID := strings.TrimSpace(c.GetHeader(header)); sessionID != "" {
-			return sessionID
-		}
-	}
-	return ""
+	return extractClientSessionID(c.Request.Header)
 }
 
 // ExtractSessionID extracts the raw session ID from headers or body without hashing.

@@ -59,6 +59,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 	}
 	setCodexToolNameReverse(c, nil)
+	stageCodexFingerprintIDs(c, nil)
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return nil, err
 	}
@@ -226,6 +227,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		if err := json.Unmarshal(responsesBody, &reqBody); err != nil {
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
 		}
+		// Keep the synthesis prefix and final headers/body on one identity,
+		// resolved from the original conversation before account isolation.
+		fpIDs := resolveCodexFingerprintIDsForDecodedBody(c, account, nil, reqBody)
 		// Codex OAuth scope: rebuild generic/compatible messages requests into
 		// the full Codex CLI shape so upstream recognises them as official.
 		var synthResult *codexSynthResult
@@ -236,11 +240,6 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 				wireMode = s.cfg.Gateway.CodexWire.Profile
 			}
 			wireProfile, _ := resolveCodexWireProfile(CodexCanonicalClientVersion(), wireMode)
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			fpIDs := resolveCodexFingerprintIDsForDecodedBody(c, account, clientHeaders, reqBody)
 			synthOptions := codexSynthOptions{
 				ResponsesLite: false,
 				WireProfile:   wireProfile,
@@ -310,6 +309,8 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 			reqBody["prompt_cache_key"] = promptCacheKey
 		}
 		applyCodexAccountIdentityClientMetadataMap(reqBody, codexAccountIdentitySource(c, account), apiKeyID)
+		applyCodexFingerprintClientMetadata(reqBody, fpIDs)
+		stageCodexFingerprintIDs(c, fpIDs)
 		if shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) {
 			compatTurnState = s.getOpenAICompatSessionTurnState(ctx, c, account, promptCacheKey)
 		}
@@ -444,6 +445,11 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	}
 	if compatTurnState != "" && upstreamReq.Header.Get("x-codex-turn-state") == "" {
 		upstreamReq.Header.Set("x-codex-turn-state", compatTurnState)
+	}
+	if ids := stagedCodexFingerprintIDs(c, account); ids != nil && ids.sessionID != "" {
+		// Keep legacy bridge overrides from adding conflicting session aliases
+		// after the body and canonical headers share the staged identity.
+		projectCodexOutboundHeaders(upstreamReq.Header, false)
 	}
 
 	// 7. Send request

@@ -80,6 +80,7 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 	}
 	setCodexToolNameReverse(c, nil)
+	stageCodexFingerprintIDs(c, nil)
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return nil, err
 	}
@@ -174,6 +175,12 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	}
 
 	promptCacheKey = strings.TrimSpace(promptCacheKey)
+	// The handler's session hint is for account affinity. An explicit body
+	// cache key can intentionally differ from that conversation and must survive
+	// the typed Chat Completions conversion, which does not carry this field.
+	if clientKey := gjson.GetBytes(body, "prompt_cache_key"); clientKey.Type == gjson.String && strings.TrimSpace(clientKey.Str) != "" {
+		promptCacheKey = strings.TrimSpace(clientKey.Str)
+	}
 	compatPromptCacheInjected := false
 	if promptCacheKey == "" && !isResponsesShape && (account.UsesOpenAICodexProtocol() || account.IsOpenAIApiKey()) && shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) {
 		promptCacheKey = deriveCompatPromptCacheKey(&chatReq, upstreamModel)
@@ -268,6 +275,9 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			return nil, fmt.Errorf("unmarshal for codex transform: %w", err)
 		}
 		isJSONObjectFormat := strings.EqualFold(strings.TrimSpace(gjson.GetBytes(responsesBody, "text.format.type").String()), "json_object")
+		// Resolve before synthesis or account isolation, then share this attempt's
+		// identity with the synthesized prefix, body metadata and header builder.
+		fpIDs := resolveCodexFingerprintIDsForDecodedBody(c, account, nil, reqBody)
 		// Codex OAuth scope: rebuild generic/compatible chat-completions requests
 		// into the full Codex CLI shape so upstream recognises them as official.
 		var synthResult *codexSynthResult
@@ -278,11 +288,6 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 				wireMode = s.cfg.Gateway.CodexWire.Profile
 			}
 			wireProfile, _ := resolveCodexWireProfile(CodexCanonicalClientVersion(), wireMode)
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			fpIDs := resolveCodexFingerprintIDsForDecodedBody(c, account, clientHeaders, reqBody)
 			synthOptions := codexSynthOptions{
 				ResponsesLite: false,
 				WireProfile:   wireProfile,
@@ -331,6 +336,8 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			reqBody["prompt_cache_key"] = promptCacheKey
 		}
 		applyCodexAccountIdentityClientMetadataMap(reqBody, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+		applyCodexFingerprintClientMetadata(reqBody, fpIDs)
+		stageCodexFingerprintIDs(c, fpIDs)
 		responsesBody, err = json.Marshal(reqBody)
 		if err != nil {
 			return nil, fmt.Errorf("remarshal after codex transform: %w", err)
@@ -399,6 +406,11 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			sessionKey = isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey)
 		}
 		upstreamReq.Header.Set("session_id", generateSessionUUID(sessionKey))
+	}
+	if ids := stagedCodexFingerprintIDs(c, account); ids != nil && ids.sessionID != "" {
+		// The legacy override above must not reintroduce a second session
+		// identity after the body and canonical headers have been aligned.
+		projectCodexOutboundHeaders(upstreamReq.Header, false)
 	}
 
 	// 7. Send request

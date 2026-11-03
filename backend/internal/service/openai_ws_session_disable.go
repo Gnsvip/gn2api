@@ -135,7 +135,7 @@ func openAIWSSessionFallbackActionFor(reason string) openAIWSSessionFallbackActi
 		// Only a gateway-inferred anchor was rejected. The original full
 		// client request remains available for a safe HTTP replay.
 		return openAIWSSessionFallbackAction{fallbackHTTP: true, reason: reason}
-	case "message_too_big":
+	case "message_too_big", "payload_too_large":
 		// WS 帧上限问题；HTTP 无帧上限可重试，但非账号健康问题。
 		return openAIWSSessionFallbackAction{fallbackHTTP: true, reason: reason}
 	case "acquire_timeout", "acquire_conn", "conn_queue_full", "preferred_conn_unavailable":

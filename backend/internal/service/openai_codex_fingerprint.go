@@ -415,14 +415,17 @@ func resolveCodexFingerprintIdentity(account, source *Account, apiKeyID int64, c
 	return ids
 }
 
-// extractClientSessionID 从请求头中提取客户端原始的会话标识。
-// 优先取 session-id（连字符形式，Codex CLI 标准），回退到 session_id（下划线形式）。
-// 返回的值尚未被 isolateOpenAISessionID 改写，是客户端的真实标识。
+// extractClientSessionID shares the scheduler's explicit conversation headers.
+// Codex headers take precedence over compatible-client aliases. Reading only
+// session-id/session_id here would recognize OpenCode for routing but mint a
+// new anonymous upstream session on every request during OAuth reconstruction.
 func extractClientSessionID(h http.Header) string {
-	if v := strings.TrimSpace(h.Get("session-id")); v != "" {
-		return v
+	for _, name := range explicitOpenAIHeaderSessionNames {
+		if value := strings.TrimSpace(h.Get(name)); value != "" {
+			return value
+		}
 	}
-	return strings.TrimSpace(h.Get("session_id"))
+	return ""
 }
 
 // resolveCodexFingerprintIDsFromRequest 从客户端原始请求头中提取 session-id，

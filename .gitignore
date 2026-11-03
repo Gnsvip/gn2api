@@ -145,6 +145,7 @@ docs/*
 !docs/channel-monitor-v2-safe-defaults.md
 !docs/codex-credits.md
 !docs/HTTP_WS_INCREMENTAL.md
+!docs/OPENAI_COMPAT_SESSION_IDENTITY.md
 !docs/legal/
 !docs/legal/*.md
 !docs/screenshots/

@@ -1404,9 +1404,9 @@ type GatewayOpenAIWSConfig struct {
 	PrewarmGenerateEnabled bool `mapstructure:"prewarm_generate_enabled"`
 	// ClientReadLimitBytes: 入站客户端 WS 单帧读取上限。
 	ClientReadLimitBytes int64 `mapstructure:"client_read_limit_bytes"`
-	// HTTPBridgeEnabled: 首包过大时，保持客户端 WS，改用 HTTP Responses 上游。
+	// HTTPBridgeEnabled: WS 首包或 HTTP→WS 增量后的出站包过大时，改用 HTTP Responses 上游。
 	HTTPBridgeEnabled bool `mapstructure:"http_bridge_enabled"`
-	// HTTPBridgeThresholdBytes: 触发 HTTP bridge 的入站 WS payload 阈值。
+	// HTTPBridgeThresholdBytes: 触发 HTTP bridge 的未压缩 JSON 阈值；HTTP→WS 在增量后检查。
 	HTTPBridgeThresholdBytes int64 `mapstructure:"http_bridge_threshold_bytes"`
 
 	// Feature 开关：v2 优先于 v1

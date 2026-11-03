@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
@@ -171,6 +172,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if err := normalizeCodexRequestMetadataMap(payload, wsHeaders, account); err != nil {
 		return nil, fmt.Errorf("normalize websocket metadata: %w", err)
 	}
+	payloadBytes = -1
 	// normalizeCodexRequestMetadataMap 会按旧习惯把 session_id 重新写回头部，
 	// 因此 WS 握手必须在归一化之后重新执行终态线序收口，与 HTTP 路径同一规则。
 	if account.UsesOpenAICodexProtocol() {
@@ -265,7 +267,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 		return nil, wrapOpenAIWSFallback(classifyOpenAIWSAcquireError(err), err)
 	}
-	// cleanExit 标记正常终端事件退出，此时上游不会再发送帧，连接可安全归还复用。
+	// cleanExit 标记正常终端事件或尚未写入的本地退出，连接可安全归还复用。
 	// 所有异常路径（读写错误、error 事件等）已在各自分支中提前调用 MarkBroken，
 	// 因此 defer 中只需处理正常退出时不 MarkBroken 即可。
 	cleanExit := false
@@ -361,6 +363,29 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			c.Set("openai_ws_auto_incremental_reason", continuationReason)
 		}
 		logOpenAIWSModeDebug("auto_continuation account_id=%d conn_id=%s incremental=%v reason=%s", account.ID, connID, autoContinuation, continuationReason)
+	}
+
+	// Decide after continuation: a huge full history can still have a tiny
+	// delta. Measure the serialized Codex message before compression, including
+	// wire defaults and the exit timezone, before ANY prewarm/business write.
+	// HTTP must replay reqBody (the full history), never this reduced payload.
+	if s.openAIWSHTTPBridgeEnabled() && GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP &&
+		account.IsOpenAI() && account.IsOpenAIOAuthLike() && !account.IsOpenAIPassthroughEnabled() &&
+		openAIWSPayloadString(reqBody, "previous_response_id") == "" {
+		wirePayload, sizeErr := codexwire.PrepareWSMessage(payload)
+		if sizeErr == nil {
+			wirePayload, sizeErr = applyCodexTimezone(wirePayload, codexAccountTimezone(account), time.Now())
+		}
+		if sizeErr != nil {
+			cleanExit = true // No write occurred; the leased connection is healthy.
+			return nil, fmt.Errorf("measure websocket payload: %w", sizeErr)
+		}
+		payloadBytes = len(wirePayload)
+		if int64(payloadBytes) >= s.openAIWSHTTPBridgeThresholdBytes() {
+			cleanExit = true
+			logOpenAIWSModeInfo("http_bridge_preflight account_id=%d payload_bytes=%d threshold_bytes=%d incremental=%v", account.ID, payloadBytes, s.openAIWSHTTPBridgeThresholdBytes(), autoContinuation)
+			return nil, wrapOpenAIWSFallback("payload_too_large", errors.New("outgoing WS payload exceeds HTTP bridge threshold"))
+		}
 	}
 
 	if err := s.performOpenAIWSGeneratePrewarm(

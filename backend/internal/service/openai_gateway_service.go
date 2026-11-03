@@ -817,6 +817,7 @@ func classifyOpenAIWSReconnectReason(err error) (string, bool) {
 	switch baseReason {
 	case "policy_violation",
 		"message_too_big",
+		"payload_too_large",
 		"upgrade_required",
 		"ws_unsupported",
 		"auth_failed",

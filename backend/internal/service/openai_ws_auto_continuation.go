@@ -34,7 +34,21 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 	}
 	kind, _ := item["type"].(string)
 	switch kind {
-	case "", "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "compaction":
+	case "", "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "compaction",
+		"additional_tools", "configuration_update":
+		// Native Codex keeps tool declarations and configuration updates in
+		// input history. Their complete contents must participate in the hash;
+		// dropping them would incorrectly reuse a changed context.
+	case "compaction_summary":
+		// Native remote compaction v2 replays its encrypted summary as the
+		// new context window. Require the actual self-contained ciphertext and
+		// compare the entire item, including its ID and opaque extensions.
+		ciphertext, ok := item["encrypted_content"].(string)
+		if !ok || ciphertext == "" {
+			return [sha256.Size]byte{}, false
+		}
+		normalized, err := json.Marshal(item)
+		return sha256.Sum256(normalized), err == nil
 	default:
 		// Unknown/hosted item types may use id semantically. Full replay is
 		// safer than guessing their serialization and continuation contract.
@@ -143,6 +157,11 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 	}
 	var prefix [sha256.Size]byte
 	for i, item := range items {
+		if item.Get("type").String() == "compaction_trigger" {
+			// Compaction replaces the context window. Do not infer an anchor
+			// or cache input+output as if this were an ordinary append-only turn.
+			return nil, false, "compaction_boundary"
+		}
 		digest, ok := openAIWSContinuationItemDigest([]byte(item.Raw))
 		if !ok {
 			return nil, false, "non_self_contained_input"
