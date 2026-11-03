@@ -145,7 +145,7 @@ func TestOpenAIWSContinuationDiagnosticsAndBounds(t *testing.T) {
 	require.Equal(t, -1, diagnostic.Index, "each attempt clears stale diagnostics")
 
 	payload = autoContinuationPayload(t)
-	items := make([]json.RawMessage, openAIWSContinuationOutputLimit+1)
+	items := make([]json.RawMessage, openAIWSContinuationHistoryLimit+1)
 	for i := range items {
 		items[i] = json.RawMessage(autoContinuationUser)
 	}
@@ -154,7 +154,7 @@ func TestOpenAIWSContinuationDiagnosticsAndBounds(t *testing.T) {
 	require.Nil(t, draft)
 	require.False(t, used)
 	require.Equal(t, "history_too_large_for_checkpoint", reason)
-	payload["input"] = items[:openAIWSContinuationOutputLimit]
+	payload["input"] = items[:openAIWSContinuationHistoryLimit]
 	draft, _, _ = prepareOpenAIWSAutoContinuation(payload, "scope", nil, now)
 	require.NotNil(t, draft)
 	require.Nil(t, completeOpenAIWSAutoContinuation(draft, autoContinuationEvent("resp_overflow", autoContinuationAnswer), now))

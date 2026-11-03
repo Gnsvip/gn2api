@@ -9,7 +9,15 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const openAIWSAutoContinuationTTL = 10 * time.Minute
+const (
+	openAIWSAutoContinuationTTL = 10 * time.Minute
+	// Bound comparison work independently from a single response's output.
+	openAIWSContinuationHistoryLimit = 32768
+	// Keep a diagnostic/replay tail, not one fingerprint per historical item.
+	// This must cover every item in the immediately preceding output so its
+	// verified native replay alternatives remain available.
+	openAIWSContinuationFingerprintLimit = openAIWSContinuationOutputLimit
+)
 
 // One checkpoint belongs to one leased upstream socket, not merely a session
 // name. Only hashes/counts are retained; no prompt or response text is cached.
@@ -21,7 +29,7 @@ type openAIWSAutoContinuation struct {
 	parameters       [sha256.Size]byte
 	prefix           [sha256.Size]byte
 	items            int
-	itemFingerprints []openAIWSContinuationFingerprint
+	itemFingerprints []openAIWSContinuationFingerprint // tail starting at items-len(itemFingerprints)
 	pendingTools     map[[sha256.Size]byte]string
 	expiresAt        time.Time
 }
@@ -185,7 +193,7 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 	if len(items) == 0 {
 		return nil, false, "no_input_sequence"
 	}
-	if len(items) > openAIWSContinuationOutputLimit {
+	if len(items) > openAIWSContinuationHistoryLimit {
 		return nil, false, "history_too_large_for_checkpoint"
 	}
 	// Do not decode the full multi-megabyte history a second time just to
@@ -207,6 +215,7 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 	}
 	draft := &openAIWSAutoContinuation{
 		scope: scope, windowID: sha256.Sum256([]byte(openAIWSPayloadCodexWindowID(raw))), parameters: sha256.Sum256(parameters),
+		itemFingerprints: make([]openAIWSContinuationFingerprint, 0, min(len(items), openAIWSContinuationFingerprintLimit)),
 	}
 	reason := "no_checkpoint"
 	eligible := previous != nil
@@ -227,6 +236,7 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 		}
 		eligible = reason == "prefix_mismatch"
 	}
+	fingerprintStart := max(0, len(items)-openAIWSContinuationFingerprintLimit)
 	var prefix, comparedPrefix [sha256.Size]byte
 	for i, item := range items {
 		if item.Get("type").String() == "compaction_trigger" {
@@ -243,21 +253,28 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 			return nil, false, "non_self_contained_input"
 		}
 		kind := openAIWSContinuationDiagnosticType(item)
-		draft.itemFingerprints = append(draft.itemFingerprints, openAIWSContinuationFingerprint{Digest: digest, Kind: kind})
+		if i >= fingerprintStart {
+			draft.itemFingerprints = append(draft.itemFingerprints, openAIWSContinuationFingerprint{Digest: digest, Kind: kind})
+		}
 		comparedDigest := digest
-		if eligible && i < len(previous.itemFingerprints) && digest != previous.itemFingerprints[i].Digest {
-			old := previous.itemFingerprints[i]
-			if old.ReplayDigest != [sha256.Size]byte{} && digest == old.ReplayDigest {
-				// Only the previous upstream output has a verified Codex replay
-				// alternative. The next checkpoint still hashes the actual input.
-				comparedDigest = old.Digest
-			} else {
-				diagnostic.set(i, kind, old.Kind)
-				if diagnostic != nil && diagnostic.Index == i {
-					diagnostic.Fields = openAIWSContinuationChangedFields(old.Fields, []byte(item.Raw))
+		if eligible {
+			previousIndex := i - (previous.items - len(previous.itemFingerprints))
+			if previousIndex >= 0 && previousIndex < len(previous.itemFingerprints) && digest != previous.itemFingerprints[previousIndex].Digest {
+				old := previous.itemFingerprints[previousIndex]
+				if old.ReplayDigest != [sha256.Size]byte{} && digest == old.ReplayDigest {
+					// Only the previous upstream output has a verified Codex replay
+					// alternative. The next checkpoint still hashes the actual input.
+					comparedDigest = old.Digest
+				} else {
+					diagnostic.set(i, kind, old.Kind)
+					if diagnostic != nil && diagnostic.Index == i {
+						diagnostic.Fields = openAIWSContinuationChangedFields(old.Fields, []byte(item.Raw))
+					}
 				}
 			}
 		}
+		// The rolling prefix still includes EVERY historical item, including
+		// those outside the retained diagnostic tail. Never skip their equality.
 		prefix = appendOpenAIWSContinuationDigest(prefix, digest)
 		comparedPrefix = appendOpenAIWSContinuationDigest(comparedPrefix, comparedDigest)
 		if eligible && i+1 == previous.items && comparedPrefix != previous.prefix {
@@ -302,10 +319,12 @@ func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAu
 		return nil
 	}
 	completed := *draft
-	if len(output)+draft.items > openAIWSContinuationOutputLimit {
+	if len(output)+draft.items > openAIWSContinuationHistoryLimit {
 		return nil
 	}
-	completed.itemFingerprints = append([]openAIWSContinuationFingerprint(nil), draft.itemFingerprints...)
+	retainedInput := min(len(draft.itemFingerprints), openAIWSContinuationFingerprintLimit-len(output))
+	completed.itemFingerprints = make([]openAIWSContinuationFingerprint, retainedInput, retainedInput+len(output))
+	copy(completed.itemFingerprints, draft.itemFingerprints[len(draft.itemFingerprints)-retainedInput:])
 	completed.responseID = strings.Clone(strings.TrimSpace(response.Get("id").String()))
 	if completed.responseID == "" || len(completed.responseID) > 256 {
 		return nil
