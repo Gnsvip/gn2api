@@ -239,6 +239,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		},
 		PreferredConnID: preferredConnID,
 		ForceNewConn:    forceNewConn,
+		LifetimeReserve: s.openAIWSLifetimeReserve(ctx),
 		ProxyURL: func() string {
 			if account.ProxyID != nil && account.Proxy != nil {
 				return account.Proxy.URL()

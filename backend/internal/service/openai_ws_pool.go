@@ -81,6 +81,8 @@ type openAIWSAcquireRequest struct {
 	ForceNewConn bool
 	// ForcePreferredConn: 强制本次只使用 PreferredConnID，禁止漂移到其它连接。
 	ForcePreferredConn bool
+	// Calculated from the turn context, not the short connection-acquire deadline.
+	LifetimeReserve time.Duration
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
@@ -1116,7 +1118,28 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 		p.metrics.acquireTotal.Add(1)
 	}
 	queueWait := &openAIWSAcquireQueueWait{}
-	lease, err := p.acquire(ctx, cloneOpenAIWSAcquireRequest(req), 0, queueWait)
+	if req.LifetimeReserve <= 0 {
+		req.LifetimeReserve = openAIWSConnTurnReserve + openAIWSConnExpiryMargin
+	}
+	var lease *openAIWSConnLease
+	var err error
+	for {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+		lease, err = p.acquire(ctx, cloneOpenAIWSAcquireRequest(req), 0, queueWait)
+		// Check after taking the lease as well: a queued connection can cross
+		// the cutoff while waiting. No business request has been written yet.
+		if err != nil || lease == nil || !lease.Reused() || !lease.conn.needsLifetimeRotation(time.Now(), req.LifetimeReserve) {
+			break
+		}
+		logOpenAIWSModeInfo("connection_lifetime_rotate account_id=%d conn_id=%s age_ms=%d reserve_ms=%d", req.Account.ID, lease.ConnID(), lease.conn.age(time.Now()).Milliseconds(), req.LifetimeReserve.Milliseconds())
+		lease.MarkBroken()
+		lease.Release()
+		if req.ForcePreferredConn && !req.ForceNewConn {
+			return nil, errOpenAIWSConnLifetime
+		}
+	}
 	if lease != nil && queueWait.rewoken {
 		// 广播重选经 tryAcquire 拿令牌，不像排队分支那样在取得令牌后检查取消，
 		// 这里补上复查：上下文已取消就归还令牌并按取消返回。
