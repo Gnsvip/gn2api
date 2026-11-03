@@ -63,6 +63,12 @@ func shouldStripOpenAIResponsesNonPairCallID(itemType string) bool {
 }
 
 func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
+	return sanitizeOpenAIResponsesInputItemIDsForReplay(body, false)
+}
+
+// Native tool IDs have their own replay contract. Validate message IDs on
+// native HTTP too, while leaving native tool identity and call pairing intact.
+func sanitizeOpenAIResponsesInputItemIDsForReplay(body []byte, native bool) ([]byte, bool, error) {
 	input := parseRawJSONView(body).Get("input")
 	if !input.IsArray() {
 		return body, false, nil
@@ -81,6 +87,16 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 			itemType := item.Get("type")
 			id := item.Get("id")
 			trimmedItemType := strings.TrimSpace(itemType.String())
+			if !itemType.Exists() && item.Get("content").Exists() {
+				switch item.Get("role").String() {
+				case "system", "developer", "user", "assistant":
+					trimmedItemType = "message"
+				}
+			}
+			if native && trimmedItemType != "message" {
+				items = append(items, parsed)
+				return true
+			}
 			parsed.stripCallID = item.Get("call_id").Exists() && shouldStripOpenAIResponsesNonPairCallID(trimmedItemType)
 			if id.Type == gjson.String {
 				parsed.stripID = shouldStripOpenAIResponsesInputItemID(trimmedItemType, id.String())
@@ -128,15 +144,16 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 
 func sanitizeOpenAIResponsesInputItemIDsForAccount(body []byte, account *Account) ([]byte, bool, error) {
 	changed := false
+	native := false
 	if account != nil && account.UsesOpenAICodexProtocol() {
-		native := codexNativeInputRaw(body)
+		native = codexNativeInputRaw(body)
 		var err error
 		body, changed, err = normalizeCodexReasoningReplayIDs(body)
-		if err != nil || native {
+		if err != nil {
 			return body, changed, err
 		}
 	}
-	next, idsChanged, err := sanitizeOpenAIResponsesInputItemIDs(body)
+	next, idsChanged, err := sanitizeOpenAIResponsesInputItemIDsForReplay(body, native)
 	return next, changed || idsChanged, err
 }
 

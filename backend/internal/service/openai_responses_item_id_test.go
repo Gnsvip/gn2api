@@ -173,3 +173,35 @@ func TestSanitizeOpenAIResponsesInputItemIDsStripsOnlyNonPairCallIDs(t *testing.
 		require.True(t, gjson.GetBytes(sanitized, "input."+strconv.Itoa(i)+".call_id").Exists())
 	}
 }
+
+func TestSanitizeNativeMessageIDsWithoutChangingToolIdentity(t *testing.T) {
+	for _, accountType := range []string{AccountTypeOAuth, AccountTypeSetupToken} {
+		t.Run(accountType, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-6-astra","reasoning":{"effort":"xhigh"},"input":[
+			{"type":"message","id":"item_bad","role":"developer","content":[{"type":"input_text","text":"keep"}],"internal_chat_message_metadata_passthrough":{"content_item_kinds":["model.base_instructions"]}},
+			{"id":"item_implicit","role":"user","content":[{"type":"input_text","text":"continue"}]},
+			{"type":"message","id":"msg_valid","role":"assistant","content":"valid"},
+			{"type":"custom_tool_call","id":"ctc_valid","call_id":"call_one","name":"exec","input":"test"},
+			{"type":"custom_tool_call_output","id":"ctco_native","call_id":"call_one","output":"result"},
+			{"type":"future_item","id":"item_opaque","role":"user","content":"opaque"}]}`)
+			require.True(t, codexNativeInputRaw(body))
+			account := &Account{Platform: PlatformOpenAI, Type: accountType}
+			next, changed, err := sanitizeOpenAIResponsesInputItemIDsForAccount(body, account)
+			require.NoError(t, err)
+			require.True(t, changed)
+			require.False(t, gjson.GetBytes(next, "input.0.id").Exists())
+			require.False(t, gjson.GetBytes(next, "input.1.id").Exists())
+			require.Equal(t, "keep", gjson.GetBytes(next, "input.0.content.0.text").String())
+			require.Equal(t, "msg_valid", gjson.GetBytes(next, "input.2.id").String())
+			for i := 3; i < 6; i++ {
+				path := "input." + strconv.Itoa(i)
+				require.JSONEq(t, gjson.GetBytes(body, path).Raw, gjson.GetBytes(next, path).Raw)
+			}
+			require.Equal(t, "xhigh", gjson.GetBytes(next, "reasoning.effort").String())
+			again, changed, err := sanitizeOpenAIResponsesInputItemIDsForAccount(next, account)
+			require.NoError(t, err)
+			require.False(t, changed)
+			require.Equal(t, next, again)
+		})
+	}
+}

@@ -109,3 +109,30 @@ func TestCodex166NativeDeltaIDPreservationIsOAuthOnly(t *testing.T) {
 	require.True(t, changed)
 	require.False(t, gjson.GetBytes(sanitized, "input.0.id").Exists())
 }
+
+func TestCodexNativeHTTPStripsInvalidMessageIDs(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, implicit := range []bool{false, true} {
+			setup := newAstraOAuthSetup(t, passthrough)
+			SetOpenAIClientTransport(setup.c, OpenAIClientTransportHTTP)
+			setup.upstream.resp = &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(codexCompletedSSE(`{"id":"resp_native","model":"gpt-6-astra","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)))}
+			body, err := sjson.Set(codex166NativeToolReplay, "input.0.id", "item_invalid_message")
+			require.NoError(t, err)
+			if implicit {
+				body, err = sjson.Delete(body, "input.0.type")
+				require.NoError(t, err)
+			}
+			require.True(t, codexNativeInputRaw([]byte(body)))
+			_, err = setup.svc.Forward(context.Background(), setup.c, setup.account, []byte(body))
+			require.NoError(t, err)
+			outbound := setup.upstream.lastBody
+			require.NotEmpty(t, outbound)
+			require.False(t, gjson.GetBytes(outbound, "input.0.id").Exists())
+			require.Equal(t, "Keep the native tool contract.", gjson.GetBytes(outbound, "input.0.content.0.text").String())
+			require.Equal(t, "ctc_native", gjson.GetBytes(outbound, "input.2.id").String())
+			require.Equal(t, "call_native", gjson.GetBytes(outbound, "input.3.call_id").String())
+			require.Equal(t, "xhigh", gjson.GetBytes(outbound, "reasoning.effort").String())
+		}
+	}
+}

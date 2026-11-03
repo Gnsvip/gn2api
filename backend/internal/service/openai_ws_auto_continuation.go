@@ -99,10 +99,20 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		delete(metadata, "create_time")
 		delete(metadata, "content_item_kinds")
 		delete(metadata, "content_item_metadata")
+		// Native Codex omits this upstream output token annotation on replay.
+		delete(metadata, "content_token_count")
 		// Keep cell_id/executed_tool_calls/tool_calls_complete and unknown
 		// metadata: late tool-result updates require a full replay.
 		if len(metadata) == 0 {
 			delete(item, "internal_chat_message_metadata_passthrough")
+		}
+	}
+	if metadata, ok := item["metadata"].(map[string]any); ok {
+		// This is the output's tracing turn, not the request's turn metadata.
+		// Native HTTP replay omits it. Keep every unknown metadata field.
+		delete(metadata, "turn_id")
+		if len(metadata) == 0 {
+			delete(item, "metadata")
 		}
 	}
 	if content, ok := item["content"].([]any); ok {
