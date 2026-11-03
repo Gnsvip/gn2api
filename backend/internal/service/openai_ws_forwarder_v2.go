@@ -36,6 +36,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	lastFailureReason string,
 	agentTaskRecoveryTried *bool,
 ) (*OpenAIForwardResult, error) {
+	clearOpenAIWSLatency(c)
+	SetOpsLatencyMs(c, OpsOpenAIWSAttemptKey, int64(attempt))
+	SetOpsLatencyMs(c, OpsOpenAIWSAttemptStartMsKey, time.Since(startTime).Milliseconds())
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
@@ -226,6 +229,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	acquireCtx, acquireCancel := context.WithTimeout(ctx, s.openAIWSAcquireTimeout())
 	defer acquireCancel()
 
+	acquireStarted := time.Now()
 	lease, err := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, s.getOpenAIWSConnPool(), &openAIWSAcquireRequest{
 		Account: account,
 		WSURL:   wsURL,
@@ -242,6 +246,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return ""
 		}(),
 	})
+	SetOpsLatencyMs(c, OpsOpenAIWSAcquireMsKey, time.Since(acquireStarted).Milliseconds())
 	if err != nil {
 		var agentDialErr *openAIWSDialError
 		if s.isAgentIdentityAccount(ctx, account) && errors.As(err, &agentDialErr) && isAgentIdentityTaskInvalidWSDialError(agentDialErr) && agentTaskRecoveryTried != nil && !*agentTaskRecoveryTried {
@@ -424,7 +429,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, err
 	}
 
-	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
+	writeStarted := time.Now()
+	writeErr := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout())
+	SetOpsLatencyMs(c, OpsOpenAIWSWriteMsKey, time.Since(writeStarted).Milliseconds())
+	if err := writeErr; err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
 			"write_request_fail account_id=%d conn_id=%s cause=%s payload_bytes=%d",
@@ -435,6 +443,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		)
 		return nil, wrapOpenAIWSFallback("write_request", err)
 	}
+	SetOpsLatencyMs(c, OpsOpenAIWSRequestSentMsKey, time.Since(startTime).Milliseconds())
 	if debugEnabled {
 		logOpenAIWSModeDebug(
 			"write_request_sent account_id=%d conn_id=%s stream=%v payload_bytes=%d previous_response_id=%s",
@@ -449,6 +458,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	usage := &OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
+	firstVisibleSeen := false
 	ttftMode := s.openAITTFTMode(ctx)
 	bufferingOutputSeen := false
 	responseID := ""
@@ -711,6 +721,7 @@ readLoop:
 		eventCount++
 		if firstEventType == "" {
 			firstEventType = eventType
+			SetOpsLatencyMs(c, OpsOpenAIWSFirstEventMsKey, time.Since(startTime).Milliseconds())
 		}
 		lastEventType = eventType
 
@@ -730,6 +741,18 @@ readLoop:
 		if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(message), eventType, false, ttftMode) {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
+		}
+		visibleStarted := !firstVisibleSeen && ttftMode == OpenAITTFTModeVisible && firstTokenMs != nil
+		if !firstVisibleSeen && ttftMode != OpenAITTFTModeVisible {
+			visibleStarted = openAIStreamDataStartsTTFT(string(message), eventType, false, OpenAITTFTModeVisible)
+		}
+		if visibleStarted {
+			firstVisibleSeen = true
+			ms := time.Since(startTime).Milliseconds()
+			if ttftMode == OpenAITTFTModeVisible && firstTokenMs != nil {
+				ms = int64(*firstTokenMs)
+			}
+			SetOpsLatencyMs(c, OpsOpenAIWSFirstVisibleMsKey, ms)
 		}
 		if debugEnabled && shouldLogOpenAIWSEvent(eventCount, eventType) {
 			logOpenAIWSModeDebug(

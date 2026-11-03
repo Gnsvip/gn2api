@@ -95,6 +95,25 @@ func Logger() gin.HandlerFunc {
 				fields = append(fields, zap.Bool(key, value == true))
 			}
 		}
+		// Only bounded numeric milestones of the final WS attempt are added to
+		// the existing access record. No request bodies or tool values are logged.
+		for _, key := range []string{
+			"ops_openai_ws_attempt", "ops_openai_ws_attempt_start_ms",
+			"ops_openai_ws_acquire_ms", "ops_openai_ws_queue_wait_ms", "ops_openai_ws_conn_pick_ms",
+			"ops_openai_ws_write_ms", "ops_openai_ws_request_sent_ms",
+			"ops_openai_ws_first_event_ms", "ops_openai_ws_first_visible_ms",
+		} {
+			if value, exists := c.Get(key); exists {
+				if ms, ok := value.(int64); ok && ms >= 0 {
+					fields = append(fields, zap.Int64(key, ms))
+				}
+			}
+		}
+		if value, exists := c.Get("ops_openai_ws_conn_reused"); exists {
+			if reused, ok := value.(bool); ok {
+				fields = append(fields, zap.Bool("ops_openai_ws_conn_reused", reused))
+			}
+		}
 
 		l := logger.FromContext(c.Request.Context()).With(fields...)
 		l.Info("http request completed", zap.Time("completed_at", endTime))

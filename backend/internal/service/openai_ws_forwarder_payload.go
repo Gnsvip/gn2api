@@ -277,8 +277,17 @@ func codexInputCarriesBaseInstructions(body []byte) bool {
 // Recognize native full history and incremental turns without decoding large
 // tool results. Their item IDs and call IDs already belong to the Codex wire
 // protocol and must not be rewritten by legacy Responses compatibility rules.
-func codexNativeInputRaw(body []byte) bool {
+func codexNativeInputRaw(body []byte, officialClient ...bool) bool {
 	view := parseRawJSONView(body)
+	if len(officialClient) > 0 && officialClient[0] {
+		if instructions := view.Get("instructions"); instructions.Type == gjson.String && strings.TrimSpace(instructions.String()) != "" {
+			return true
+		}
+		first := view.Get("input.0")
+		if first.Get("role").String() == "developer" && first.Get("type").String() != openAIAdditionalToolsItemType {
+			return true
+		}
+	}
 	turn := view.Get("client_metadata.turn_id").String()
 	continuation := view.Get("previous_response_id").String() != "" && turn != ""
 	native := false

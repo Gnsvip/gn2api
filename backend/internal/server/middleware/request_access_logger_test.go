@@ -328,6 +328,47 @@ func TestLogger_HealthPathSkipped(t *testing.T) {
 	}
 }
 
+func TestLogger_WSStageTimingsAreNumericAndOptional(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sink := initMiddlewareTestLogger(t)
+	r := gin.New()
+	r.Use(Logger())
+	r.GET("/timing", func(c *gin.Context) {
+		c.Set("ops_openai_ws_attempt", int64(2))
+		c.Set("ops_openai_ws_request_sent_ms", int64(45))
+		c.Set("ops_openai_ws_first_event_ms", int64(80))
+		c.Set("ops_openai_ws_first_visible_ms", int64(2300))
+		c.Set("ops_openai_ws_queue_wait_ms", int64(0))
+		c.Set("ops_openai_ws_conn_reused", false)
+		c.Set("ops_openai_ws_acquire_ms", "must-not-log")
+		c.Set("ops_openai_ws_write_ms", nil)
+		c.Set("ops_openai_ws_conn_pick_ms", int64(-1))
+		c.Set("ops_openai_ws_payload", "private-body")
+		c.Status(http.StatusOK)
+	})
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/timing", nil))
+	for _, event := range sink.list() {
+		if event == nil || event.Message != "http request completed" {
+			continue
+		}
+		for key, want := range map[string]int64{"ops_openai_ws_attempt": 2, "ops_openai_ws_request_sent_ms": 45, "ops_openai_ws_first_event_ms": 80, "ops_openai_ws_first_visible_ms": 2300, "ops_openai_ws_queue_wait_ms": 0} {
+			if event.Fields[key] != want {
+				t.Fatalf("%s=%v, want %d", key, event.Fields[key], want)
+			}
+		}
+		if event.Fields["ops_openai_ws_conn_reused"] != false {
+			t.Fatal("missing reuse flag")
+		}
+		for _, key := range []string{"ops_openai_ws_acquire_ms", "ops_openai_ws_write_ms", "ops_openai_ws_conn_pick_ms", "ops_openai_ws_payload"} {
+			if _, exists := event.Fields[key]; exists {
+				t.Fatalf("unexpected field %s", key)
+			}
+		}
+		return
+	}
+	t.Fatal("access log event not found")
+}
+
 func TestLogger_AccessLogDroppedWhenLevelWarn(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	sink := initMiddlewareTestLoggerWithLevel(t, "warn")

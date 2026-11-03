@@ -873,10 +873,10 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthSanitizesInvalidNativeToolItemID
 	require.Equal(t, "response.create", gjson.Get(requestJSON, "type").String())
 	toolCall := gjson.Get(requestJSON, `input.#(type=="custom_tool_call")`)
 	require.False(t, toolCall.Get("id").Exists(), "stale fc_* ID must not be replayed as a native custom_tool_call ID")
-	require.Equal(t, "ctc_hotfix", toolCall.Get("call_id").String())
+	require.Equal(t, "fc_hotfix", toolCall.Get("call_id").String(), "native call_id pairs are opaque and must not be renamed")
 	toolOutput := gjson.Get(requestJSON, `input.#(type=="custom_tool_call_output")`)
 	require.True(t, toolOutput.Exists())
-	require.Equal(t, "ctc_hotfix", toolOutput.Get("call_id").String())
+	require.Equal(t, "fc_hotfix", toolOutput.Get("call_id").String())
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_OAuthOriginatorCompatibility(t *testing.T) {

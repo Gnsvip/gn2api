@@ -39,6 +39,10 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 
 v0.2.48 为前缀不一致诊断额外保留最多 64 项上游输出的固定字段摘要，随连接检查点替换及过期，不累计保存各轮历史。日志中的 `openai_ws_auto_incremental_changed_fields` 只来自固定字段枚举，不输出字段值、摘要或客户端自定义字段名称。
 
+v0.2.49 统一官方客户端无 base-instructions 标签时的原生识别，保留工具 `call_id`，避免网关自身将 `call_` 改写为 `fc_` / `ctc_` 而造成前缀不匹配。消息及错误类型的工具条目 `id` 过滤保持独立；增量比较仍严格核对工具关联和参数。
+
+HTTP → WS 的已有访问记录增加最后一次尝试的数字诊断：`ops_openai_ws_attempt`、`ops_openai_ws_attempt_start_ms`、`ops_openai_ws_acquire_ms`、`ops_openai_ws_queue_wait_ms`、`ops_openai_ws_conn_pick_ms`、`ops_openai_ws_write_ms`、`ops_openai_ws_request_sent_ms`、`ops_openai_ws_first_event_ms`、`ops_openai_ws_first_visible_ms`，以及布尔字段 `ops_openai_ws_conn_reused`。start/sent/first_event/first_visible 是相对 Forward 内现有 startTime 的偏移，其余 ms 字段是本次尝试的阶段耗时；queue/pick 与 acquire 可能重叠，不应相加。发送后至可见内容的间隔包含上游和网络等等待，不等于纯模型推理时间或客户端渲染时间。重试清除未到达阶段的旧值；原生 WS 尚未增加同等逐轮分段记录。
+
 取得租约后才判断增量，因此不会把某连接的增量发送到另一连接。连接繁忙而调度到其他连接时发送全量；同一会话的并发分支也须重新比较历史。任何上游写操作（包括原生 WS、预热）都会清除旧检查点；只有成功 completed 且下游仍连接时才建立下一检查点。
 
 自动补入的响应锚点失效时，未输出给客户端的请求可在现有重试预算内重新发送原始完整上下文，工具调用与工具结果均保留。WS 不支持等允许 HTTP 回退的条件，同样使用完整请求。已经开始向客户端输出时不自动重放，避免重复执行或重复回答。

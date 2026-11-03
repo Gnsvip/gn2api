@@ -1251,7 +1251,7 @@ func extractOpenAIRequestMetaFromBody(body []byte) (model string, stream bool, p
 	return view.Model, view.Stream, view.PromptCacheKey
 }
 
-func normalizeOpenAIOAuthResponsesCompatibilityFields(reqBody map[string]any) bool {
+func normalizeOpenAIOAuthResponsesCompatibilityFields(reqBody map[string]any, preserveNativeInput ...bool) bool {
 	if reqBody == nil {
 		return false
 	}
@@ -1272,7 +1272,7 @@ func normalizeOpenAIOAuthResponsesCompatibilityFields(reqBody map[string]any) bo
 	// Native typed Codex requests use this metadata to identify base prompts,
 	// environment context and provenance. Preserve the captured 0.166 contract;
 	// the legacy compatibility workaround (#7066) applies to untagged inputs.
-	if codexInputMapCarriesBaseInstructions(reqBody) || codexNativeContinuation(reqBody) {
+	if (len(preserveNativeInput) > 0 && preserveNativeInput[0]) || codexNativeRequestInput(reqBody, false) {
 		return changed
 	}
 	input, _ := reqBody["input"].([]any)
@@ -1289,7 +1289,7 @@ func normalizeOpenAIOAuthResponsesCompatibilityFields(reqBody map[string]any) bo
 	return changed
 }
 
-func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte) ([]byte, bool, error) {
+func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte, officialClient ...bool) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
 	}
@@ -1321,8 +1321,7 @@ func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte) ([]byte, bool, 
 		changed = true
 	}
 	// Only remove the input-item field, never same-named user content.
-	var nativeBody map[string]any
-	if codexInputCarriesBaseInstructions(normalized) || (json.Unmarshal(normalized, &nativeBody) == nil && codexNativeContinuation(nativeBody)) {
+	if codexNativeInputRaw(normalized, officialClient...) {
 		return normalized, changed, nil
 	}
 	input := gjson.GetBytes(normalized, "input")
@@ -1444,13 +1443,16 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 	return normalizeOpenAIResponsesCompatibilityBodyWithOptions(body, account, openAIResponsesCompatibilityOptions{ResponsesLite: responsesLite})
 }
 
-func normalizeOpenAIResponsesWebSocketCompatibilityBodyWithConfig(cfg *config.Config, body []byte, account *Account, responsesLite bool) ([]byte, bool, error) {
-	return normalizeOpenAIResponsesCompatibilityBodyWithOptions(body, account, openAIResponsesCompatibilityOptions{Config: cfg, ResponsesLite: responsesLite})
+func normalizeOpenAIResponsesWebSocketCompatibilityBodyWithConfig(cfg *config.Config, body []byte, account *Account, responsesLite bool, officialClient ...bool) ([]byte, bool, error) {
+	return normalizeOpenAIResponsesCompatibilityBodyWithOptions(body, account, openAIResponsesCompatibilityOptions{
+		Config: cfg, ResponsesLite: responsesLite, OfficialClient: len(officialClient) > 0 && officialClient[0],
+	})
 }
 
 type openAIResponsesCompatibilityOptions struct {
-	Config        *config.Config
-	ResponsesLite bool
+	Config         *config.Config
+	ResponsesLite  bool
+	OfficialClient bool
 	// Compact marks the /responses/compact wire shape, which is left as-is
 	// by request-shape compatibility rewrites such as web_search history.
 	Compact bool
@@ -1490,7 +1492,7 @@ func normalizeOpenAIResponsesCompatibilityBodyWithOptions(body []byte, account *
 			changed = true
 		}
 	}
-	if sanitized, idsChanged, err := sanitizeOpenAIResponsesInputItemIDsForAccount(normalized, account); err != nil {
+	if sanitized, idsChanged, err := sanitizeOpenAIResponsesInputItemIDsForAccount(normalized, account, opts.OfficialClient); err != nil {
 		return body, false, fmt.Errorf("sanitize websocket Responses input item IDs: %w", err)
 	} else if idsChanged {
 		normalized = sanitized
@@ -1505,7 +1507,7 @@ func normalizeOpenAIResponsesCompatibilityBodyWithOptions(body []byte, account *
 		}
 	}
 	if account != nil && account.IsOpenAIOAuthLike() {
-		oauthBody, oauthChanged, err := normalizeOpenAIOAuthResponsesCompatibilityBody(normalized)
+		oauthBody, oauthChanged, err := normalizeOpenAIOAuthResponsesCompatibilityBody(normalized, opts.OfficialClient)
 		if err != nil {
 			return body, false, err
 		}
@@ -1602,12 +1604,12 @@ func normalizeOpenAIResponsesCompatibilityBodyWithOptions(body []byte, account *
 // normalizeOpenAIPassthroughOAuthBody 将透传 OAuth 请求体收敛为旧链路关键行为：
 // 1) 删除 ChatGPT internal API 不支持的顶层 Responses 参数
 // 2) store=false 3) 非 compact 保持 stream=true；compact 强制 stream=false
-func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, bool, error) {
+func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool, officialClient ...bool) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
 	}
 
-	normalized, changed, err := normalizeOpenAIOAuthResponsesCompatibilityBody(body)
+	normalized, changed, err := normalizeOpenAIOAuthResponsesCompatibilityBody(body, officialClient...)
 	if err != nil {
 		return body, false, err
 	}

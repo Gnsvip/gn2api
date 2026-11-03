@@ -86,7 +86,7 @@ func TestOAuthInputInternalMetadataCompatibility(t *testing.T) {
 func TestOAuthNativeToolContinuationMetadataSurvives(t *testing.T) {
 	const body = `{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_first","client_metadata":{"turn_id":"turn-current"},"input":[{"type":"function_call_output","id":"fco_123","call_id":"call_123","output":"result","internal_chat_message_metadata_passthrough":{"turn_id":"turn-current","create_time":123}}]}`
 	for _, normalize := range []func([]byte) ([]byte, bool, error){
-		normalizeOpenAIOAuthResponsesCompatibilityBody,
+		func(body []byte) ([]byte, bool, error) { return normalizeOpenAIOAuthResponsesCompatibilityBody(body) },
 		func(b []byte) ([]byte, bool, error) {
 			return normalizeOpenAIResponsesWebSocketCompatibilityBody(b, &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}, false)
 		},

@@ -68,7 +68,7 @@ func sanitizeOpenAIResponsesInputItemIDs(body []byte) ([]byte, bool, error) {
 
 // Native tool IDs have their own replay contract. Validate message IDs on
 // native HTTP too, while leaving native tool identity and call pairing intact.
-func sanitizeOpenAIResponsesInputItemIDsForReplay(body []byte, native bool) ([]byte, bool, error) {
+func sanitizeOpenAIResponsesInputItemIDsForReplay(body []byte, native bool, validateNativeToolIDs ...bool) ([]byte, bool, error) {
 	input := parseRawJSONView(body).Get("input")
 	if !input.IsArray() {
 		return body, false, nil
@@ -93,13 +93,20 @@ func sanitizeOpenAIResponsesInputItemIDsForReplay(body []byte, native bool) ([]b
 					trimmedItemType = "message"
 				}
 			}
-			if native && trimmedItemType != "message" {
+			if native && trimmedItemType != "message" && !(len(validateNativeToolIDs) > 0 && validateNativeToolIDs[0]) {
 				items = append(items, parsed)
 				return true
 			}
 			parsed.stripCallID = item.Get("call_id").Exists() && shouldStripOpenAIResponsesNonPairCallID(trimmedItemType)
 			if id.Type == gjson.String {
 				parsed.stripID = shouldStripOpenAIResponsesInputItemID(trimmedItemType, id.String())
+				// Older official requests lack native prompt tags, but their
+				// custom output IDs can still use Codex's ctco namespace. Keep
+				// that valid native form while filtering wrong-type IDs (e.g.
+				// an fc_* custom call). Never rewrite the pairing call_id.
+				if native && trimmedItemType == "custom_tool_call_output" && strings.HasPrefix(id.String(), "ctco_") && len(id.String()) <= 64 {
+					parsed.stripID = false
+				}
 			}
 		}
 		items = append(items, parsed)
@@ -142,18 +149,20 @@ func sanitizeOpenAIResponsesInputItemIDsForReplay(body []byte, native bool) ([]b
 	return replaceOpenAIRawInput(body, input, rebuiltItems), true, nil
 }
 
-func sanitizeOpenAIResponsesInputItemIDsForAccount(body []byte, account *Account) ([]byte, bool, error) {
+func sanitizeOpenAIResponsesInputItemIDsForAccount(body []byte, account *Account, officialClient ...bool) ([]byte, bool, error) {
 	changed := false
 	native := false
+	validateNativeToolIDs := false
 	if account != nil && account.UsesOpenAICodexProtocol() {
-		native = codexNativeInputRaw(body)
+		native = codexNativeInputRaw(body, officialClient...)
+		validateNativeToolIDs = native && !codexNativeInputRaw(body)
 		var err error
 		body, changed, err = normalizeCodexReasoningReplayIDs(body)
 		if err != nil {
 			return body, changed, err
 		}
 	}
-	next, idsChanged, err := sanitizeOpenAIResponsesInputItemIDsForReplay(body, native)
+	next, idsChanged, err := sanitizeOpenAIResponsesInputItemIDsForReplay(body, native, validateNativeToolIDs)
 	return next, changed || idsChanged, err
 }
 

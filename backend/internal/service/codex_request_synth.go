@@ -160,18 +160,8 @@ func synthesizeCodexOAuthRequest(reqBody map[string]any, account *Account, upstr
 func classifyCodexCapability(reqBody map[string]any, account *Account, officialClient bool) codexCapability {
 	// An existing base prompt always wins over account defaults. This only
 	// controls prompt synthesis; it never grants an undeclared tool executor.
-	if codexInputMapCarriesBaseInstructions(reqBody) {
+	if codexNativeRequestInput(reqBody, officialClient) {
 		return codexCapabilityNative
-	}
-	if officialClient {
-		if instructions, _ := reqBody["instructions"].(string); strings.TrimSpace(instructions) != "" {
-			return codexCapabilityNative
-		}
-		if input, _ := reqBody["input"].([]any); len(input) > 0 {
-			if first, ok := decodeCodexSynthItem(input[0]); ok && first["role"] == "developer" && first["type"] != openAIAdditionalToolsItemType {
-				return codexCapabilityNative
-			}
-		}
 	}
 	if account != nil {
 		switch strings.ToLower(strings.TrimSpace(account.GetExtraString(codexClientCapabilityExtraKey))) {
@@ -182,6 +172,26 @@ func classifyCodexCapability(reqBody map[string]any, account *Account, officialC
 		}
 	}
 	return codexCapabilityGeneric
+}
+
+// Keep synthesis and legacy input filtering on the same request-derived
+// contract. Account defaults and a forced outbound CLI identity alone do not
+// prove that an incoming request carries native tool history.
+func codexNativeRequestInput(reqBody map[string]any, officialClient bool) bool {
+	if codexInputMapCarriesBaseInstructions(reqBody) || codexNativeContinuation(reqBody) {
+		return true
+	}
+	if officialClient {
+		if instructions, _ := reqBody["instructions"].(string); strings.TrimSpace(instructions) != "" {
+			return true
+		}
+		if input, _ := reqBody["input"].([]any); len(input) > 0 {
+			if first, ok := decodeCodexSynthItem(input[0]); ok && first["role"] == "developer" && first["type"] != openAIAdditionalToolsItemType {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func codexSynthesisBaseInstructions(model string, descriptor openai.CodexCatalogModel, hasDescriptor bool, profile codexWireProfile) string {
