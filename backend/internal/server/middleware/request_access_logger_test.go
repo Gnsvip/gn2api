@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -393,4 +394,30 @@ func TestLogger_AccessLogDroppedWhenLevelWarn(t *testing.T) {
 			t.Fatalf("access log should not be indexed when level=warn: %+v", event)
 		}
 	}
+}
+
+func TestLoggerCorrelatesResponsesID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sink := initMiddlewareTestLogger(t)
+	router := gin.New()
+	router.Use(RequestLogger(), Logger(), ClientRequestID())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		requesttiming.Context(c, c.Request.Context())
+		a := requesttiming.FromGin(c).Begin(123, "websocket")
+		a.Event("resp_correlated", "text", "completed", 100, true, true)
+		c.Status(http.StatusOK)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	request.Header.Set("X-Request-ID", "gateway-correlated")
+	router.ServeHTTP(httptest.NewRecorder(), request)
+	for _, event := range sink.list() {
+		if event.Message != "http request completed" {
+			continue
+		}
+		if event.Fields["openai_response_id"] != "resp_correlated" || event.Fields["request_id"] != "gateway-correlated" {
+			t.Fatalf("missing direct correlation: %+v", event.Fields)
+		}
+		return
+	}
+	t.Fatal("missing access record")
 }

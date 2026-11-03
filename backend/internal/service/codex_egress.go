@@ -12,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/klauspost/compress/zstd"
 )
@@ -77,6 +78,7 @@ func doCodexEgressHTTP(cfg *config.Config, upstream HTTPUpstream, request *http.
 			return nil, err
 		}
 	}
+	requesttiming.AttemptFromContext(prepared.Context()).EncodedSize(prepared.ContentLength)
 	return upstream.DoWithTLS(prepared, proxyURL, account.ID, account.Concurrency, profile)
 }
 
@@ -100,6 +102,7 @@ func prepareCodexEgressRequest(request *http.Request) (*http.Request, error) {
 	if ordered, changed := codexwire.ReorderCodexRequestBody(raw); changed {
 		raw = ordered
 	}
+	requesttiming.AttemptFromContext(request.Context()).PayloadSize(int64(len(raw)))
 	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
 	if err != nil {
 		return nil, fmt.Errorf("codex request encoder: %w", err)

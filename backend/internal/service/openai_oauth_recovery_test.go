@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"io"
 	"net/http"
 	"strings"
@@ -114,8 +115,16 @@ func TestOpenAIUnauthorizedHTTPRecovery(t *testing.T) {
 			request, err := http.NewRequest("POST", "https://example.test/responses", strings.NewReader(`{"input":"test"}`))
 			require.NoError(t, err)
 			request.Header.Set("Authorization", "Bearer rejected")
+			timing := requesttiming.New(time.Now(), "recovery-request", "", 0)
+			request = request.WithContext(timing.Context(request.Context()))
 			response, err := s.doOpenAIUpstream(request, "", a)
 			require.NoError(t, err)
+			summary, ok := timing.Finish(response.StatusCode)
+			require.True(t, ok)
+			require.Equal(t, tc.reads, summary.AttemptCount)
+			for i, attempt := range summary.Attempts {
+				require.Equal(t, tc.statuses[i], attempt.Status)
+			}
 			require.Len(t, u.headers, tc.reads)
 			require.Equal(t, tc.refresh, e.calls.Load())
 			require.Equal(t, int(tc.refresh), r.writes)

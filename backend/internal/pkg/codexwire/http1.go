@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"time"
@@ -214,6 +215,10 @@ func doHTTP1OnConn(ctx context.Context, method, path, host string, ordered []Hea
 // streaming response. The socket is closed when ctx is cancelled or the
 // response body is closed, whichever comes first.
 func writeHTTP1Request(ctx context.Context, conn net.Conn, method, path, host string, ordered []HeaderKV, body []byte, headerTimeout time.Duration) (*http.Response, error) {
+	trace := httptrace.ContextClientTrace(ctx)
+	if trace != nil && trace.GotConn != nil {
+		trace.GotConn(httptrace.GotConnInfo{Conn: conn})
+	}
 	var req strings.Builder
 	fmt.Fprintf(&req, "%s %s HTTP/1.1\r\n", method, path)
 	hasCL := false
@@ -261,6 +266,9 @@ func writeHTTP1Request(ctx context.Context, conn net.Conn, method, path, host st
 	wire = append(wire, body...)
 	if _, err := conn.Write(wire); err != nil {
 		return fail(err)
+	}
+	if trace != nil && trace.WroteRequest != nil {
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: method})

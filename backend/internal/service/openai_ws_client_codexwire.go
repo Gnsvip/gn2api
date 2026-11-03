@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
@@ -65,6 +66,7 @@ func (c *codexWireClientConn) WriteJSON(ctx context.Context, value any) error {
 	if err != nil {
 		return err
 	}
+	requesttiming.AttemptFromContext(ctx).PayloadSize(int64(len(payload)))
 	c.auditMessage("ws_test_request", payload)
 	return c.conn.WriteMessage(ctx, payload)
 }
@@ -114,6 +116,7 @@ func (c *codexWireClientConn) WriteFrame(ctx context.Context, msgType coderws.Me
 		return err
 	}
 	if msgType == coderws.MessageBinary {
+		requesttiming.AttemptFromContext(ctx).PayloadSize(int64(len(payload)))
 		c.auditMessage("ws_test_request", payload)
 		return c.conn.WriteMessageBinary(ctx, payload)
 	}
@@ -121,6 +124,7 @@ func (c *codexWireClientConn) WriteFrame(ctx context.Context, msgType coderws.Me
 	if err != nil {
 		return err
 	}
+	requesttiming.AttemptFromContext(ctx).PayloadSize(int64(len(ordered)))
 	c.auditMessage("ws_test_request", ordered)
 	return c.conn.WriteMessage(ctx, ordered)
 }

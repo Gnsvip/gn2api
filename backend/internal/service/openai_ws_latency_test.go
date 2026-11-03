@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -64,6 +65,22 @@ func TestHTTPToWSLatencySeparatesConnectionAndVisibleContent(t *testing.T) {
 		result, err := s.Forward(context.Background(), c, account, autoContinuationBody(true))
 		require.NoError(t, err)
 		require.True(t, result.OpenAIWSMode)
+		summary, ok := requesttiming.FromGin(c).Finish(200)
+		require.True(t, ok)
+		require.Len(t, summary.Attempts, 1)
+		diagnostic := summary.Attempts[0]
+		require.Equal(t, "resp_timing", diagnostic.ResponseID)
+		require.NotNil(t, diagnostic.SentMS)
+		require.NotNil(t, diagnostic.FirstEventMS)
+		if turn == 0 {
+			require.Equal(t, "text", diagnostic.FirstVisibleType)
+			require.NotNil(t, diagnostic.FirstWriteMS)
+			require.NotNil(t, diagnostic.FirstFlushMS)
+		} else {
+			require.Nil(t, diagnostic.FirstVisibleMS)
+			require.Nil(t, diagnostic.FirstWriteMS)
+			require.Nil(t, diagnostic.FirstFlushMS)
+		}
 		require.Equal(t, int64(1), c.GetInt64(OpsOpenAIWSAttemptKey))
 		sent := c.GetInt64(OpsOpenAIWSRequestSentMsKey)
 		firstEvent := c.GetInt64(OpsOpenAIWSFirstEventMsKey)

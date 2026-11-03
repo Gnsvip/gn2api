@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"sync"
 	"time"
@@ -624,6 +625,7 @@ func (b *h2StreamBody) Close() error {
 // RoundTrip sends one request on this connection and returns the response head
 // with a streaming body.
 func (c *h2Conn) RoundTrip(ctx context.Context, method, scheme, authority, path string, fields []HeaderKV, body []byte) (*http.Response, error) {
+	trace := httptrace.ContextClientTrace(ctx)
 	c.headersMu.Lock()
 	st, err := c.openStream()
 	if err != nil {
@@ -636,6 +638,12 @@ func (c *h2Conn) RoundTrip(ctx context.Context, method, scheme, authority, path 
 		return nil, err
 	}
 	c.headersMu.Unlock()
+	if trace != nil && trace.GotConn != nil {
+		trace.GotConn(httptrace.GotConnInfo{Conn: c.nc, Reused: st.id > 1})
+	}
+	if len(body) == 0 && trace != nil && trace.WroteRequest != nil {
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+	}
 	stopCancel := context.AfterFunc(ctx, func() {
 		c.mu.Lock()
 		c.failStreamLocked(st, ctx.Err())
@@ -651,7 +659,13 @@ func (c *h2Conn) RoundTrip(ctx context.Context, method, scheme, authority, path 
 	if len(body) > 0 {
 		// Body write waits on flow control; run it concurrently with head wait.
 		bodyDone := make(chan error, 1)
-		go func() { bodyDone <- c.writeBody(st, body) }()
+		go func() {
+			err := c.writeBody(st, body)
+			if trace != nil && trace.WroteRequest != nil {
+				trace.WroteRequest(httptrace.WroteRequestInfo{Err: err})
+			}
+			bodyDone <- err
+		}()
 		defer func() {
 			select {
 			case <-bodyDone:

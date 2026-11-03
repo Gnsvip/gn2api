@@ -159,3 +159,10 @@ func parseStacktraceLevel(level string) (Level, bool) {
 func samplingTick() time.Duration {
 	return time.Second
 }
+
+// FilePath returns the resolved path without changing logging configuration.
+func FilePath() string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return resolveLogFilePath(initOptions.Output.FilePath)
+}

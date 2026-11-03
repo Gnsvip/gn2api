@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	openaiwsv2 "github.com/Wei-Shaw/sub2api/internal/service/openai_ws_v2"
 	coderws "github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -313,6 +315,9 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
 	prepared, err := prepareCodexTimezoneWSValue(value, c.codexTimezone)
 	if err != nil {
 		return err
+	}
+	if raw, ok := prepared.(json.RawMessage); ok {
+		requesttiming.AttemptFromContext(ctx).PayloadSize(int64(len(raw)))
 	}
 	return wsjson.Write(ctx, c.conn, prepared)
 }

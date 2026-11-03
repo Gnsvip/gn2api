@@ -6,6 +6,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -15,12 +16,14 @@ func Logger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 开始时间
 		startTime := time.Now()
+		requesttiming.Attach(c, startTime, 0)
 
 		// 请求路径
 		path := c.Request.URL.Path
 
 		// 处理请求
 		c.Next()
+		requesttiming.Finish(c, c.Writer.Status())
 
 		// 跳过健康检查等高频探针路径的日志
 		if path == "/health" || path == "/setup/status" {
@@ -77,7 +80,7 @@ func Logger() gin.HandlerFunc {
 		if model != "" {
 			fields = append(fields, zap.String("model", model))
 		}
-		for _, key := range []string{"openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type", "openai_ws_auto_incremental_changed_fields"} {
+		for _, key := range []string{"openai_response_id", "openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type", "openai_ws_auto_incremental_changed_fields"} {
 			if value := c.GetString(key); value != "" {
 				fields = append(fields, zap.String(key, value))
 			}

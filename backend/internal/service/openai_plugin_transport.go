@@ -3,6 +3,9 @@ package service
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 )
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
@@ -15,7 +18,28 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 	return s.doOpenAIUpstreamWithAuthRecovery(request, proxyURL, account)
 }
 
-func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxyURL string, account *Account) (response *http.Response, resultErr error) {
+	var timing *requesttiming.Attempt
+	if recorder := requesttiming.FromContext(request.Context()); recorder != nil {
+		timing = recorder.Begin(account.ID, "http")
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { timing.Connection("", info.Reused, -1, -1, -1) },
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
+				if info.Err == nil {
+					timing.Sent(-1)
+				}
+			},
+		}
+		request = request.WithContext(httptrace.WithClientTrace(timing.Context(request.Context()), trace))
+	}
+	defer func() {
+		if resultErr != nil {
+			timing.Fail("transport_error")
+		}
+		if response != nil {
+			timing.Headers(response.StatusCode, response.Header.Get("x-request-id"))
+		}
+	}()
 	account = s.accountWithEgressTimezone(request.Context(), account, proxyURL)
 	prepared, err := prepareCodexTimezoneRequest(request, account)
 	if err != nil {
@@ -25,6 +49,14 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxy
 		defer request.Body.Close()
 		request = prepared
 	}
+	if request.Header.Get("Content-Encoding") == "" {
+		timing.PayloadSize(request.ContentLength)
+	} else {
+		// A caller may already have encoded the body. Do not label its
+		// compressed length as an observed JSON size.
+		timing.EncodedSize(request.ContentLength)
+	}
+	timing.Stage("send_http")
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)
 		if handled {

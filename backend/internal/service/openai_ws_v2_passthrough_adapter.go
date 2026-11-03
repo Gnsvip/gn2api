@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"net/http"
 	"net/url"
 	"strings"
@@ -685,6 +686,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	requesttiming.BeginTurn(c, 1)
+	ctx = requesttiming.Context(c, ctx)
+	timingRecorder := requesttiming.FromGin(c)
+	timingAttempt := timingRecorder.Begin(account.ID, "websocket_passthrough")
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
@@ -868,6 +873,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	oauthRecoveryStep := 0
 	var oauthCredentialOwner *Account
 	oauthRefreshReplayed := false
+	timingDialStarted := time.Now()
+	timingAttempt.Stage("acquire_websocket")
 	var upstreamConn openAIWSClientConn
 	statusCode := 0
 	var handshakeHeaders http.Header
@@ -937,12 +944,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"),
 	)
 
+	timingAttempt.Connection("", false, 0, time.Since(timingDialStarted).Milliseconds(), 0)
 	upstreamFrameConn, ok := upstreamConn.(openaiwsv2.FrameConn)
 	if !ok {
 		return errors.New("openai ws passthrough upstream connection does not support frame relay")
 	}
+	timingFrames := &openAITimingFrameConn{inner: upstreamFrameConn, c: c, recorder: timingRecorder, attempt: timingAttempt, account: account.ID, turn: 1, connectedAt: time.Now()}
+	defer timingFrames.finish()
 	relayUpstreamFrameConn := &openAIWSPassthroughFirstOutputFrameConn{
-		inner:             upstreamFrameConn,
+		inner:             timingFrames,
 		activeReadTimeout: s.openAIWSPassthroughIdleTimeout(),
 		deadlineChanged:   make(chan struct{}, 1),
 		resolveDeadline: func(payload []byte) openAIWSPassthroughFirstOutputDeadline {
@@ -1136,6 +1146,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				SetOpsUpstreamModel(c, actualModel)
 				responseCreateAtCopy := responseCreateAt
 				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
+				timingFrames.nextStart.Store(&responseCreateAtCopy)
 				acceptedTurn = true
 			}
 			return out, blocked, policyErr
@@ -1276,6 +1287,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			AfterClientWrite: func(msgType coderws.MessageType, payload []byte, writeErr error) {
+				timingFrames.afterClientWrite(msgType, payload, writeErr)
 				if msgType == coderws.MessageText && writeErr == nil {
 					eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 					markOpenAIWSClientVisibleFailure(c, eventType, payload)

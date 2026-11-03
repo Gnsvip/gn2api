@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/codexwire"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -42,6 +43,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if s == nil || account == nil {
 		return nil, wrapOpenAIWSFallback("invalid_state", errors.New("service or account is nil"))
 	}
+	ctx = requesttiming.Context(c, ctx)
+	timing := requesttiming.FromGin(c).Begin(account.ID, "websocket")
+	timing.Retry(lastFailureReason)
+	ctx = timing.Context(ctx)
+	defer timing.End()
 	responseModelObserver := &upstreamResponseModelObserver{}
 
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -229,6 +235,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	acquireCtx, acquireCancel := context.WithTimeout(ctx, s.openAIWSAcquireTimeout())
 	defer acquireCancel()
 
+	timing.Stage("acquire_websocket")
 	acquireStarted := time.Now()
 	lease, err := s.acquireOpenAIWSWithAuthRecovery(acquireCtx, s.getOpenAIWSConnPool(), &openAIWSAcquireRequest{
 		Account: account,
@@ -296,6 +303,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 		lease.Release()
 	}()
+	timing.Connection(lease.ConnID(), lease.Reused(), lease.AgeBefore().Milliseconds(), time.Since(acquireStarted).Milliseconds(), lease.QueueWaitDuration().Milliseconds())
 	connID := strings.TrimSpace(lease.ConnID())
 	if c != nil {
 		c.Set("openai_upstream_transport", "websocket")
@@ -390,6 +398,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 				c.Set("openai_ws_auto_incremental_changed_fields", diagnostic.Fields)
 			}
 		}
+		timing.Incremental(autoContinuation, continuationReason)
 		logOpenAIWSModeDebug("auto_continuation account_id=%d conn_id=%s incremental=%v reason=%s", account.ID, connID, autoContinuation, continuationReason)
 	}
 
@@ -430,6 +439,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, err
 	}
 
+	timing.Stage("write_websocket")
 	writeStarted := time.Now()
 	writeErr := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout())
 	SetOpsLatencyMs(c, OpsOpenAIWSWriteMsKey, time.Since(writeStarted).Milliseconds())
@@ -444,6 +454,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		)
 		return nil, wrapOpenAIWSFallback("write_request", err)
 	}
+	timing.Sent(-1)
 	SetOpsLatencyMs(c, OpsOpenAIWSRequestSentMsKey, time.Since(startTime).Milliseconds())
 	if debugEnabled {
 		logOpenAIWSModeDebug(
@@ -480,6 +491,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	lastEventType := ""
 	upstreamTerminalEvent := ""
 	clientDisconnected := false
+	defer func() {
+		if clientDisconnected {
+			timing.Fail("downstream_disconnected")
+		}
+	}()
 	clientDisconnectDrainStartedAt := time.Time{}
 	readTimeout := s.openAIWSReadTimeout()
 	upstreamReadCtx := ctx
@@ -564,6 +580,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			}
 		}
 		flusher.Flush()
+		timing.Flushed()
 		pendingFlushEvents = 0
 		lastFlushAt = time.Now()
 	}
@@ -577,11 +594,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		frame = append(frame, '\n', '\n')
 		_, wErr := c.Writer.Write(frame)
 		if wErr == nil {
+			timing.Written(timingVisible(message))
 			wroteDownstream = true
 			pendingFlushEvents++
 			flushStreamWriter(forceFlush)
 			return
 		}
+		timing.Fail("downstream_write_error")
 		markClientDisconnected("downstream_write_error")
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI WS Mode] client disconnected, continue draining upstream: account=%d", account.ID)
 	}
@@ -708,6 +727,7 @@ readLoop:
 		if eventType == "" {
 			continue
 		}
+		observeOpenAIRequestTiming(timing, message, eventType)
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		if eventType == "response.completed" {
 			status := gjson.GetBytes(message, "response.status").String()
