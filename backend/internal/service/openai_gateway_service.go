@@ -821,6 +821,7 @@ func classifyOpenAIWSReconnectReason(err error) (string, bool) {
 		"upgrade_required",
 		"ws_unsupported",
 		"auth_failed",
+		"upstream_forbidden",
 		"invalid_encrypted_content",
 		"previous_response_not_found":
 		return reason, false
@@ -975,6 +976,9 @@ func (s *OpenAIGatewayService) writeOpenAIWSFallbackErrorResponse(c *gin.Context
 			"message": clientMessage,
 		},
 	})
+	// The handler must not append a generic SSE failure after this final JSON
+	// error, even when the original request asked for a streaming response.
+	MarkResponseCommitted(c)
 	return true
 }
 

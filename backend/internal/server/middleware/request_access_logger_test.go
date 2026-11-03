@@ -263,6 +263,37 @@ func TestLogger_AccessLogUsesForwardedClientIPFromTrustedProxy(t *testing.T) {
 	t.Fatalf("access log event not found")
 }
 
+func TestLogger_AccessLogSeparatesIncrementalAttemptFromSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sink := initMiddlewareTestLogger(t)
+	r := gin.New()
+	r.Use(Logger())
+	r.GET("/api/test", func(c *gin.Context) {
+		c.Set("openai_ws_auto_incremental", true)
+		c.Set("openai_ws_auto_incremental_succeeded", false)
+		c.Set("openai_ws_auto_incremental_replay", true)
+		c.Status(http.StatusOK) // A streaming 200 alone does not prove success.
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/test", nil))
+	for _, event := range sink.list() {
+		if event == nil || event.Message != "http request completed" {
+			continue
+		}
+		for key, want := range map[string]bool{
+			"openai_ws_auto_incremental":           true,
+			"openai_ws_auto_incremental_succeeded": false,
+			"openai_ws_auto_incremental_replay":    true,
+		} {
+			if got := event.Fields[key]; got != want {
+				t.Fatalf("%s=%v, want %v", key, got, want)
+			}
+		}
+		return
+	}
+	t.Fatal("access log event not found")
+}
+
 func TestLogger_HealthPathSkipped(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	sink := initMiddlewareTestLogger(t)

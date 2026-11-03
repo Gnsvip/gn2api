@@ -32,7 +32,8 @@ func autoContinuationBody(stream bool, items ...string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"model": "gpt-6-astra", "stream": stream, "store": false,
 		"reasoning": map[string]any{"effort": "xhigh"}, "input": input,
-		"tools": []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object", "properties": map[string]any{"key": map[string]any{"type": "string"}}}}},
+		"include": []string{"reasoning.encrypted_content"},
+		"tools":   []any{map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object", "properties": map[string]any{"key": map[string]any{"type": "string"}}}}},
 	})
 	return body
 }
@@ -129,8 +130,8 @@ func TestOpenAIWSAutoContinuationCheckpointSafety(t *testing.T) {
 }
 
 func TestHTTPToWSAutoContinuationToolAndText(t *testing.T) {
-	for _, test := range []struct{ stream, custom bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
-		t.Run(fmt.Sprintf("stream_%t/custom_%t", test.stream, test.custom), func(t *testing.T) {
+	for _, test := range []struct{ stream, custom, sparse bool }{{false, false, false}, {true, false, false}, {false, true, false}, {true, true, false}, {true, false, true}, {true, true, true}} {
+		t.Run(fmt.Sprintf("stream_%t/custom_%t/sparse_%t", test.stream, test.custom, test.sparse), func(t *testing.T) {
 			toolCall, toolResult := autoContinuationCall, autoContinuationTool
 			if test.custom {
 				toolCall = `{"type":"custom_tool_call","id":"ctc_test","call_id":"call_lookup","name":"exec","input":"lookup()","status":"completed"}`
@@ -165,6 +166,12 @@ func TestHTTPToWSAutoContinuationToolAndText(t *testing.T) {
 					if turn == 1 {
 						output = toolCall
 					}
+					if test.sparse {
+						if conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.output_item.done","output_index":0,"item":%s}`, output))) != nil {
+							return
+						}
+						output = ""
+					}
 					if conn.WriteMessage(websocket.TextMessage, autoContinuationEvent(fmt.Sprintf("resp_%d", turn), output)) != nil {
 						return
 					}
@@ -184,6 +191,7 @@ func TestHTTPToWSAutoContinuationToolAndText(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, result.OpenAIWSMode)
 				require.Equal(t, i > 0, c.GetBool("openai_ws_auto_incremental"), c.GetString("openai_ws_auto_incremental_reason"))
+				require.Equal(t, i > 0, c.GetBool("openai_ws_auto_incremental_succeeded"))
 				raw := <-requests
 				require.Equal(t, "gpt-6-astra", gjson.GetBytes(raw, "model").String())
 				require.Equal(t, "xhigh", gjson.GetBytes(raw, "reasoning.effort").String())
@@ -204,7 +212,7 @@ func TestHTTPToWSAutoContinuationToolAndText(t *testing.T) {
 }
 
 func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
-	for _, mode := range []string{"anchor_miss", "failed_anchor_miss", "http_fallback"} {
+	for _, mode := range []string{"anchor_miss", "failed_anchor_miss", "http_fallback", "missing_tool", "failed_missing_tool"} {
 		t.Run(mode, func(t *testing.T) {
 			requests := make(chan []byte, 8)
 			var calls atomic.Int32
@@ -222,6 +230,14 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 					requests <- raw
 					n := calls.Add(1)
 					if n == 2 {
+						if mode == "missing_tool" || mode == "failed_missing_tool" {
+							event := `{"type":"error","error":{"type":"invalid_request_error","param":"input","message":"No tool output found for function call call_lookup."}}`
+							if mode == "failed_missing_tool" {
+								event = `{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","param":"input","message":"No tool output found for function call call_lookup."}}}`
+							}
+							_ = conn.WriteMessage(websocket.TextMessage, []byte(event))
+							return
+						}
 						if mode == "failed_anchor_miss" {
 							_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.failed","response":{"id":"resp_failed","error":{"code":"previous_response_not_found","message":"previous response not found"}}}`))
 							return
@@ -255,6 +271,11 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 			second, _ := httpBridgeContext("recover-incremental")
 			_, err = s.Forward(context.Background(), second, a, autoContinuationBody(true, autoContinuationCall, autoContinuationTool))
 			require.NoError(t, err)
+			if mode != "http_fallback" {
+				require.Equal(t, int32(3), calls.Load(), "one delta followed by one full replay")
+				require.True(t, second.GetBool("openai_ws_auto_incremental_replay"))
+			}
+			require.False(t, second.GetBool("openai_ws_auto_incremental_succeeded"), "a full replay is not a successful delta")
 			delta := <-requests
 			require.Equal(t, "resp_1", gjson.GetBytes(delta, "previous_response_id").String())
 			require.Len(t, gjson.GetBytes(delta, "input").Array(), 1)
@@ -271,6 +292,7 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 			require.Equal(t, "call_lookup", gjson.GetBytes(replay, "input.2.call_id").String())
 			require.Equal(t, "call_lookup", gjson.GetBytes(replay, "input.3.call_id").String())
 			require.Equal(t, "xhigh", gjson.GetBytes(replay, "reasoning.effort").String())
+			require.Equal(t, "reasoning.encrypted_content", gjson.GetBytes(replay, "include.0").String())
 		})
 	}
 }

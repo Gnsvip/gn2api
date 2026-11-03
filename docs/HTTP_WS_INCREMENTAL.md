@@ -8,7 +8,8 @@
 - 分组、API key、原始线程/会话执行作用域一致。
 - 最终出站模型、推理等级、工具定义及其他非传输参数一致，上下文窗口未变化。
 - 本轮完整历史的前缀等于上一轮完整输入加上游输出，且存在新增 input。
-- 历史可自行还原。未解析的 item_reference、未知输出类型或缺少完整 terminal output 时采用全量。
+- 历史可自行还原，上一响应的全部 function/custom tool 调用在新增输入中都有类型和 call_id 相符的真实结果。缺项、重复、孤立结果或新工具调用未闭合时采用全量，不编造结果。
+- 上游输出可由 `response.output_item.done` 与 `response.completed.output` 确认完整。末帧缺项可用流中已完成的项补齐检查点；未解析的 item_reference、未知类型、输出索引缺洞或冲突时采用全量。
 
 比较保留消息正文、密文、工具名称/参数及 call_id；忽略输出对象 ID、status、已知内部 turn_id/create_time 和空 annotations/logprobs 等重放元数据。比较时的规范化不会修改实际发送的新 input。客户端显式提供 previous_response_id 的既有逻辑保持独立。
 
@@ -32,15 +33,21 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 
 检查点直接属于连接，只含 SHA-256 摘要、条目数、响应标识与过期时间，不保存问答正文，不写数据库或 Redis。连接数量仍由现有账号连接池与并发限制管理。自动续传成功后的 session→connection 关联最多保留 10 分钟；原有其他用途的 response/account 索引 TTL 不做全局修改。
 
+工具续传额外保留调用编号的 SHA-256 摘要与预期结果类型；流中临时收集的输出指纹最多 2,048 项，超出时放弃检查点。不会因此持久保存工具内容、图片或推理密文，也不修改客户端收到的流事件。
+
 取得租约后才判断增量，因此不会把某连接的增量发送到另一连接。连接繁忙而调度到其他连接时发送全量；同一会话的并发分支也须重新比较历史。任何上游写操作（包括原生 WS、预热）都会清除旧检查点；只有成功 completed 且下游仍连接时才建立下一检查点。
 
 自动补入的响应锚点失效时，未输出给客户端的请求可在现有重试预算内重新发送原始完整上下文，工具调用与工具结果均保留。WS 不支持等允许 HTTP 回退的条件，同样使用完整请求。已经开始向客户端输出时不自动重放，避免重复执行或重复回答。
+
+自动增量收到 `No tool output found for function call ...` 或 `custom tool call ...` 时，只有完整原请求确实包含被拒调用及配对结果、其他工具链也完整且客户端仍连接，才丢弃错误连接并恢复完整请求。恢复后不再次套用旧增量锚点；若完整请求仍报同样错误，直接返回错误。恢复全程保留 `include`（包括 `reasoning.encrypted_content`），模型、推理等级、工具和历史仍按原请求发送。
 
 这项改动作用于已有 HTTP Responses→WS 路径，不将所有端点强制改为 WS；Chat Completions 兼容端点、compact、显式禁用 WS、透传等保留各自传输规则。它优化传输与续传，不保证上游 prompt cache 命中率或模型能力。
 
 ## 可观察字段
 
 现有 `http request completed` 日志增加 `openai_ws_auto_incremental` 和 `openai_ws_auto_incremental_reason`。字段反映本请求最终 WS 尝试；退回 HTTP 时为 false/http_fallback。无问答正文、缓存键原文或密文日志。
+
+工具续传修复增加 `openai_ws_auto_incremental_succeeded`（增量收到成功 completed，且正常完成下游交付）和 `openai_ws_auto_incremental_replay`（本请求触发过自动锚点恢复）。不能把 `auto_incremental=true` 或 SSE 的 HTTP 200 单独视为增量成功；完整回放成功也不计作增量成功。
 
 ## 验证（2026-11-03）
 
@@ -54,3 +61,23 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 - 原生 v2 压缩按 CLI 形态使用 `/responses` 的 `compaction_trigger`，超限包经 HTTP 成功返回真实 `compaction`。保留该压缩结果并在其后声明当前配置，随后两轮 WS 均完成，第二轮 `prefix_matched`，实际发送 1,245 字节、仅一条新增消息；协商压缩后 103 字节。两轮均保留测试中的记忆信息（只记录判断布尔值，不保存答案）。未将旧 `/responses/compact` 的 404 或错误测试条目顺序产生的拒绝计入通过结果。
 - 加密 `compaction_summary` 的整项比较、密文/ID/扩展变化以及触发边界有单元和本地转发回归；上述真实上游返回的条目类型是 `compaction`，不将其冒称为 `compaction_summary` 的线上验证。
 - 隔离进程无数据库写入、调度或刷新依赖；仅保留大小、条目类型、响应 ID 哈希等元数据，未保存问答正文或图片。测试程序已从服务器清理，生产服务未更新。部署后仍需观察真实桌面长会话的命中率，不能把这四轮试验称作所有客户端/场景完整验收。
+
+## 工具续传修复验证（v0.2.43）
+
+- 修复前用本地 WebSocket 服务复现：流事件已经发出 function/custom tool 调用，终态 `output` 为空时，下一轮错误地发送两项增量（旧调用＋结果），预期应仅发送一项真实工具结果。两类工具的失败用例在修复后通过。
+- 新增覆盖末帧空/缺失/部分输出、乱序与重复 done、冲突和缺洞、2048 项边界、并行工具结果配对，以及 `error` / `response.failed` 两种拒绝形式。
+- 本地真实 WebSocket 转发测试确认：缺工具结果拒绝可换连接完整回放；已向客户端输出、原请求缺结果、无关调用错误均不进行该恢复；完整回放再次报错不会循环。回放保留推理密文的 `include` 声明。
+- 相关 service、handler、middleware unit 回归共 953 项测试及子用例通过，0 失败、0 跳过。命令：`go test -json -tags unit ./internal/service ./internal/handler ./internal/server/middleware -run 'Test.*(WS|WebSocket|HTTPToWS|Codex.*Replay|RequestAccessLogger|Logger_)' -count=1 -timeout=240s`。
+- 以上是本地受控上游与回归结果。验证阶段未更新生产，未使用账号发起新的真实上游验收；不能据此断言此前全部线上工具错误均由同一原因产生，也不能据此承诺首字时间。
+
+## 握手 403 与重复错误响应修复（v0.2.43）
+
+生产排查发现 WS 握手 403 被和 401 一起归为 `auth_failed`，导致已有的 `upstream_forbidden` HTTP 回退分支无法命中。修复将无结构化账号/权限拒绝信号的握手 403，以及已识别的 Cloudflare 拦截响应，归入 `upstream_forbidden`。不重复尝试 WS，在尚未向客户端输出、请求未取消、没有显式续传锚点且原请求可完整回放时，按已有 HTTP→WS 桥接规则回退到 HTTP。
+
+401、明确的凭据失效/账号状态错误、认证挑战和结构化权限/策略拒绝不使用这条回退。单次握手拦截也不会永久禁用会话 WS 或直接封停账号；若 HTTP 同样拒绝，继续进入既有 HTTP 错误处理，不能假装成功。
+
+最终握手错误通过 JSON 返回后标记响应已交付，handler 不再追加通用 SSE `response.failed`。客户端收到一份完整错误，保留握手阶段和状态信息。
+
+本地真实握手测试覆盖 service 和完整 Responses handler：流式/非流式 403→HTTP 成功、HTTP 也拒绝、401、结构化凭据/权限 403、显式锚点和已写下游。回放断言保留模型、`xhigh`、完整工具调用/结果及 `reasoning.encrypted_content`，不依靠孤立的分类器单元测试代替转发验证。测试仅重定向本地网络目的地，未请求生产账号或修改线上配置。
+
+最终相关回归共 1,007 项测试及子用例通过，0 失败、0 跳过，包含前述工具增量修复。命令：`go test -json -tags unit ./internal/service ./internal/handler ./internal/server/middleware -run 'Test.*(WS|WebSocket|HTTPToWS|Codex.*Replay|RequestAccessLogger|Logger_|OpenAIEnsureForwardErrorResponse|OpenAIForwardErrorAlreadyCommunicated)' -count=1 -timeout=240s`。线上效果须发布部署后核对，HTTP 回退成功不能当成消除了上游握手拒绝的根因。

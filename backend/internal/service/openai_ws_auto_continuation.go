@@ -15,13 +15,14 @@ const openAIWSAutoContinuationTTL = 10 * time.Minute
 // name. Only hashes/counts are retained; no prompt or response text is cached.
 // Any subsequent write (including native WS and prewarm) invalidates it.
 type openAIWSAutoContinuation struct {
-	scope      string
-	windowID   [sha256.Size]byte
-	responseID string
-	parameters [sha256.Size]byte
-	prefix     [sha256.Size]byte
-	items      int
-	expiresAt  time.Time
+	scope        string
+	windowID     [sha256.Size]byte
+	responseID   string
+	parameters   [sha256.Size]byte
+	prefix       [sha256.Size]byte
+	items        int
+	pendingTools map[[sha256.Size]byte]string
+	expiresAt    time.Time
 }
 
 // Canonicalize replay-only fields, without changing the outgoing request.
@@ -172,8 +173,14 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 		}
 	}
 	draft.prefix, draft.items = prefix, len(items)
+	if !openAIWSContinuationToolsComplete(items, nil) {
+		return nil, false, "incomplete_tool_pairs"
+	}
 	if !eligible {
 		return draft, false, reason
+	}
+	if !openAIWSContinuationToolsComplete(items[previous.items:], previous.pendingTools) {
+		return draft, false, "incomplete_tool_delta"
 	}
 	delta := make([]json.RawMessage, 0, len(items)-previous.items)
 	for _, item := range items[previous.items:] {
@@ -187,6 +194,10 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 // Use the original upstream output before model/tool-name rewriting. If the
 // client replays different content, the next prefix check safely fails closed.
 func completeOpenAIWSAutoContinuation(draft *openAIWSAutoContinuation, event []byte, now time.Time) *openAIWSAutoContinuation {
+	return (&openAIWSContinuationOutputCollector{}).complete(draft, event, now)
+}
+
+func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAutoContinuation, event []byte, now time.Time) *openAIWSAutoContinuation {
 	if draft == nil || gjson.GetBytes(event, "type").String() != "response.completed" {
 		return nil
 	}
@@ -194,8 +205,8 @@ func completeOpenAIWSAutoContinuation(draft *openAIWSAutoContinuation, event []b
 	if status := response.Get("status").String(); status != "" && status != "completed" {
 		return nil
 	}
-	output := response.Get("output")
-	if !output.IsArray() {
+	output, ok := collector.finish(response.Get("output"))
+	if !ok {
 		return nil
 	}
 	completed := *draft
@@ -203,12 +214,15 @@ func completeOpenAIWSAutoContinuation(draft *openAIWSAutoContinuation, event []b
 	if completed.responseID == "" || len(completed.responseID) > 256 {
 		return nil
 	}
-	for _, item := range output.Array() {
-		digest, ok := openAIWSContinuationItemDigest([]byte(item.Raw))
-		if !ok {
-			return nil
+	completed.pendingTools = make(map[[sha256.Size]byte]string)
+	for _, item := range output {
+		if item.toolType != "" {
+			if _, duplicate := completed.pendingTools[item.callID]; duplicate {
+				return nil
+			}
+			completed.pendingTools[item.callID] = item.toolType
 		}
-		completed.prefix = appendOpenAIWSContinuationDigest(completed.prefix, digest)
+		completed.prefix = appendOpenAIWSContinuationDigest(completed.prefix, item.digest)
 		completed.items++
 	}
 	completed.expiresAt = now.Add(openAIWSAutoContinuationTTL)

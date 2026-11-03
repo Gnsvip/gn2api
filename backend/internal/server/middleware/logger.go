@@ -85,8 +85,10 @@ func Logger() gin.HandlerFunc {
 		if connected, exists := c.Get("openai_upstream_ws_connected"); exists {
 			fields = append(fields, zap.Bool("openai_upstream_ws_connected", connected == true))
 		}
-		if incremental, exists := c.Get("openai_ws_auto_incremental"); exists {
-			fields = append(fields, zap.Bool("openai_ws_auto_incremental", incremental == true))
+		for _, key := range []string{"openai_ws_auto_incremental", "openai_ws_auto_incremental_succeeded", "openai_ws_auto_incremental_replay"} {
+			if value, exists := c.Get(key); exists {
+				fields = append(fields, zap.Bool(key, value == true))
+			}
 		}
 
 		l := logger.FromContext(c.Request.Context()).With(fields...)

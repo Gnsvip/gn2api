@@ -645,8 +645,27 @@ func classifyOpenAIWSAcquireError(err error) string {
 		switch dialErr.StatusCode {
 		case 426:
 			return "upgrade_required"
-		case 401, 403:
+		case http.StatusUnauthorized:
 			return "auth_failed"
+		case http.StatusForbidden:
+			// A rejected WS upgrade is not necessarily a credential failure.
+			// Preserve explicit provider auth/policy denials; an opaque/edge
+			// rejection can use the existing uncommitted HTTP replay path.
+			body := dialErr.ResponseBody
+			if openAIStream403AccountFailure(body, "") || dialErr.ResponseHeaders.Get("WWW-Authenticate") != "" {
+				return "auth_failed"
+			}
+			if isCloudflareBotBlockResponse(body) {
+				return "upstream_forbidden"
+			}
+			if gjson.ValidBytes(body) {
+				for _, path := range []string{"error", "response.error", "detail", "code", "type"} {
+					if gjson.GetBytes(body, path).Exists() {
+						return "policy_violation"
+					}
+				}
+			}
+			return "upstream_forbidden"
 		case 429:
 			return "upstream_rate_limited"
 		}

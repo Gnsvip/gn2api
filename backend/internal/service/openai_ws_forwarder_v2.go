@@ -64,7 +64,16 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 
 	payload := s.buildOpenAIWSCreatePayload(reqBody, account)
-	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, attempt)
+	strategyAttempt := attempt
+	if c != nil {
+		c.Set("openai_ws_auto_incremental_succeeded", false)
+		if c.GetBool("openai_ws_auto_incremental_replay") {
+			// Replaying a rejected inferred anchor must retain the original
+			// include (notably reasoning.encrypted_content) on every retry.
+			strategyAttempt = 1
+		}
+	}
+	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, strategyAttempt)
 	turnState := ""
 	turnMetadata := ""
 	if c != nil && c.Request != nil {
@@ -344,7 +353,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 
 	var continuationDraft, continuationCompleted *openAIWSAutoContinuation
+	var continuationOutput openAIWSContinuationOutputCollector
 	autoContinuation := false
+	continuationSucceeded := false
 	if storeDisabled && getAPIKeyIDFromContext(c) > 0 && sessionHash != "" {
 		var previous *openAIWSAutoContinuation
 		if attempt == 1 {
@@ -675,7 +686,14 @@ readLoop:
 		}
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		if eventType == "response.completed" {
-			continuationCompleted = completeOpenAIWSAutoContinuation(continuationDraft, message, time.Now())
+			status := gjson.GetBytes(message, "response.status").String()
+			continuationSucceeded = status == "" || status == "completed"
+		}
+		if continuationDraft != nil {
+			continuationOutput.observe(message, eventType)
+			if eventType == "response.completed" {
+				continuationCompleted = continuationOutput.complete(continuationDraft, message, time.Now())
+			}
 		}
 		eventCount++
 		if firstEventType == "" {
@@ -713,11 +731,18 @@ readLoop:
 			)
 		}
 
-		if autoContinuation && !wroteDownstream && eventType == "response.failed" {
-			responseError := gjson.GetBytes(message, "response.error")
+		if autoContinuation && !wroteDownstream && !clientDisconnected && ctx.Err() == nil && (eventType == "response.failed" || eventType == "error") {
+			path := "response.error"
+			if eventType == "error" {
+				path = "error"
+			}
+			responseError := gjson.GetBytes(message, path)
 			reason, _ := classifyOpenAIWSErrorEventFromRaw(responseError.Get("code").String(), responseError.Get("type").String(), responseError.Get("message").String())
-			if reason == "previous_response_not_found" {
+			if reason == "previous_response_not_found" || openAIWSCanReplayMissingToolOutput(responseError, reqBody) {
 				lease.MarkBroken()
+				if c != nil {
+					c.Set("openai_ws_auto_incremental_replay", true)
+				}
 				return nil, wrapOpenAIWSFallback("auto_continuation_miss", errors.New(responseError.Get("message").String()))
 			}
 		}
@@ -791,11 +816,6 @@ readLoop:
 			// error 事件后连接不再可复用，避免回池后污染下一请求。
 			lease.MarkBroken()
 			if !wroteDownstream && canFallback {
-				if autoContinuation && fallbackReason == "previous_response_not_found" {
-					// The client supplied a complete request. Retry that original
-					// context, including tool calls, without the inferred anchor.
-					return nil, wrapOpenAIWSFallback("auto_continuation_miss", errors.New(errMsg))
-				}
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
 			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
@@ -924,6 +944,9 @@ readLoop:
 	}
 	if cleanExit && !clientDisconnected {
 		lease.conn.autoContinuation.Store(continuationCompleted)
+		if c != nil && autoContinuation && continuationSucceeded {
+			c.Set("openai_ws_auto_incremental_succeeded", true)
+		}
 	}
 	firstTokenMsValue := -1
 	if firstTokenMs != nil {
