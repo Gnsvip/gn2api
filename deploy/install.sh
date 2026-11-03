@@ -730,6 +730,9 @@ WorkingDirectory=/opt/sub2api
 ExecStart=/opt/sub2api/sub2api
 Restart=always
 RestartSec=5
+# Let the application finish pg_dump/psql; enforce a final bound on the whole group.
+KillMode=mixed
+TimeoutStopSec=33min
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sub2api

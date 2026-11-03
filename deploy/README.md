@@ -429,6 +429,21 @@ sudo ./install.sh uninstall
 
 ### Service Management
 
+Use `KillMode=mixed` and `TimeoutStopSec=33min` for the systemd service. The
+initial stop signal then reaches the gateway process, which waits for active
+database backups/restores before closing its database connections; systemd can
+still kill the whole process group if shutdown exceeds its bound. Operations
+have a 30-minute budget, with a further two minutes allowed for backup-object
+cleanup. A stop with no active operations returns normally without waiting for
+the full timeout.
+
+Before a planned upgrade, wait for running backups/restores to finish while the
+gateway is still serving requests. Scheduled backups publish `running/dumping`
+before invoking `pg_dump`, then `uploading` until the remote copy completes.
+For an existing systemd installation, update these two service settings and run
+`systemctl daemon-reload`; replacing only the application binary does not update
+the service unit.
+
 ```bash
 # Start the service
 sudo systemctl start sub2api

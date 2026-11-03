@@ -31,6 +31,10 @@ const (
 	settingKeyBackupRecords  = "backup_records"
 
 	backupObjectCleanupTimeout = 2 * time.Minute
+	backupOperationTimeout     = 30 * time.Minute
+	// A stop must cover an operation's remaining budget and object cleanup.
+	// systemd TimeoutStopSec must also allow the final 10-second cancellation wait.
+	backupShutdownGracePeriod = backupOperationTimeout + backupObjectCleanupTimeout
 
 	// backupScheduledLeaderLockKey gates the scheduled full-database backup so
 	// that only one instance in a clustered deployment performs the
@@ -332,6 +336,10 @@ func (s *BackupService) cleanupStaleBackupObjects(ctx context.Context, record *B
 
 // Stop 停止定时备份并等待活跃操作完成
 func (s *BackupService) Stop() {
+	s.stopWithTimeout(backupShutdownGracePeriod)
+}
+
+func (s *BackupService) stopWithTimeout(grace time.Duration) {
 	s.shuttingDown.Store(true)
 
 	var cronStopped context.Context
@@ -341,7 +349,7 @@ func (s *BackupService) Stop() {
 	}
 	s.cronMu.Unlock()
 
-	// 等待活跃备份/恢复完成（最多 5 分钟）
+	// Keep database/object-store dependencies alive until active operations finish.
 	done := make(chan struct{})
 	go func() {
 		if cronStopped != nil {
@@ -353,8 +361,8 @@ func (s *BackupService) Stop() {
 	select {
 	case <-done:
 		logger.LegacyPrintf("service.backup", "[Backup] all active operations finished")
-	case <-time.After(5 * time.Minute):
-		logger.LegacyPrintf("service.backup", "[Backup] shutdown timeout after 5min, cancelling active operations")
+	case <-time.After(grace):
+		logger.LegacyPrintf("service.backup", "[Backup] shutdown timeout after %s, cancelling active operations", grace)
 		if s.bgCancel != nil {
 			s.bgCancel() // 取消所有后台操作
 		}
@@ -547,7 +555,7 @@ func (s *BackupService) runScheduledBackup() {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupOperationTimeout)
 	defer cancel()
 
 	// 多实例保护: 集群部署时只让 leader 执行定时备份, 避免每个实例各自对同一个
@@ -601,6 +609,8 @@ func (s *BackupService) CreateBackup(ctx context.Context, triggeredBy string, ex
 }
 
 func (s *BackupService) createBackup(ctx context.Context, triggeredBy string, expireDays int, schedule *BackupScheduleConfig) (*BackupRecord, error) {
+	ctx, cancel := context.WithTimeout(ctx, backupOperationTimeout)
+	defer cancel()
 	if s.shuttingDown.Load() {
 		return nil, infraerrors.ServiceUnavailable("SERVER_SHUTTING_DOWN", "server is shutting down")
 	}
@@ -650,30 +660,45 @@ func (s *BackupService) createBackup(ctx context.Context, triggeredBy string, ex
 		TriggeredBy: triggeredBy,
 		StartedAt:   now.Format(time.RFC3339),
 		ExpiresAt:   expiresAt,
+		Progress:    "dumping",
+	}
+
+	// Publish running state before pg_dump so operators can safely defer restart.
+	if err := s.saveRecord(ctx, record); err != nil {
+		return nil, fmt.Errorf("save initial record: %w", err)
 	}
 
 	archivePath, sizeBytes, err := s.createCompressedBackupFile(ctx)
 	if err != nil {
 		record.Status = "failed"
+		record.Progress = ""
 		record.ErrorMsg = err.Error()
 		record.FinishedAt = time.Now().Format(time.RFC3339)
-		_ = s.saveRecord(ctx, record)
+		_ = s.saveRecord(context.Background(), record)
 		return record, err
 	}
 	defer func() { _ = cleanupBackupFiles(archivePath) }()
 	record.SizeBytes = sizeBytes
+	record.Progress = "uploading"
 	if err := s.saveRecord(ctx, record); err != nil {
-		return nil, fmt.Errorf("save initial record: %w", err)
+		record.Status = "failed"
+		record.Progress = ""
+		record.ErrorMsg = fmt.Sprintf("save upload progress: %v", err)
+		record.FinishedAt = time.Now().Format(time.RFC3339)
+		_ = s.saveRecord(context.Background(), record)
+		return record, fmt.Errorf("save upload progress: %w", err)
 	}
 	if err := s.uploadBackupArchive(ctx, record, objectStore, s3Cfg, archivePath); err != nil {
 		record.Status = "failed"
+		record.Progress = ""
 		record.ErrorMsg = err.Error()
 		record.FinishedAt = time.Now().Format(time.RFC3339)
-		_ = s.saveRecord(ctx, record)
+		_ = s.saveRecord(context.Background(), record)
 		return record, err
 	}
 
 	record.Status = "completed"
+	record.Progress = ""
 	record.FinishedAt = time.Now().Format(time.RFC3339)
 	if err := s.saveRecordWithArchive(ctx, record, schedule); err != nil {
 		return record, fmt.Errorf("save completed backup: %w", err)
@@ -776,7 +801,7 @@ func (s *BackupService) StartBackup(ctx context.Context, triggeredBy string, exp
 
 // executeBackup 后台执行备份（独立于 HTTP context）
 func (s *BackupService) executeBackup(record *BackupRecord, objectStore BackupObjectStore, s3Cfg *BackupS3Config) {
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupOperationTimeout)
 	defer cancel()
 
 	// 阶段1: pg_dump -> gzip 临时文件
@@ -1055,7 +1080,7 @@ func (s *BackupService) StartRestore(ctx context.Context, backupID string) (*Bac
 
 // executeRestore 后台执行恢复
 func (s *BackupService) executeRestore(record *BackupRecord, objectStore BackupObjectStore) {
-	ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.bgCtx, backupOperationTimeout)
 	defer cancel()
 
 	if len(record.Parts) > 0 {
