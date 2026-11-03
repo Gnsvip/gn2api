@@ -272,6 +272,9 @@ func TestLogger_AccessLogSeparatesIncrementalAttemptFromSuccess(t *testing.T) {
 		c.Set("openai_ws_auto_incremental", true)
 		c.Set("openai_ws_auto_incremental_succeeded", false)
 		c.Set("openai_ws_auto_incremental_replay", true)
+		c.Set("openai_ws_auto_incremental_item_index", 7)
+		c.Set("openai_ws_auto_incremental_item_type", "message")
+		c.Set("openai_ws_auto_incremental_previous_item_type", "reasoning")
 		c.Status(http.StatusOK) // A streaming 200 alone does not prove success.
 	})
 	w := httptest.NewRecorder()
@@ -288,6 +291,12 @@ func TestLogger_AccessLogSeparatesIncrementalAttemptFromSuccess(t *testing.T) {
 			if got := event.Fields[key]; got != want {
 				t.Fatalf("%s=%v, want %v", key, got, want)
 			}
+		}
+		if got := event.Fields["openai_ws_auto_incremental_item_index"]; got != int64(7) {
+			t.Fatalf("unexpected diagnostic index: %v", got)
+		}
+		if event.Fields["openai_ws_auto_incremental_item_type"] != "message" || event.Fields["openai_ws_auto_incremental_previous_item_type"] != "reasoning" {
+			t.Fatal("missing diagnostic item types")
 		}
 		return
 	}

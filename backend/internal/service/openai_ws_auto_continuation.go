@@ -15,14 +15,15 @@ const openAIWSAutoContinuationTTL = 10 * time.Minute
 // name. Only hashes/counts are retained; no prompt or response text is cached.
 // Any subsequent write (including native WS and prewarm) invalidates it.
 type openAIWSAutoContinuation struct {
-	scope        string
-	windowID     [sha256.Size]byte
-	responseID   string
-	parameters   [sha256.Size]byte
-	prefix       [sha256.Size]byte
-	items        int
-	pendingTools map[[sha256.Size]byte]string
-	expiresAt    time.Time
+	scope            string
+	windowID         [sha256.Size]byte
+	responseID       string
+	parameters       [sha256.Size]byte
+	prefix           [sha256.Size]byte
+	items            int
+	itemFingerprints []openAIWSContinuationFingerprint
+	pendingTools     map[[sha256.Size]byte]string
+	expiresAt        time.Time
 }
 
 // Canonicalize replay-only fields, without changing the outgoing request.
@@ -34,12 +35,21 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		return [sha256.Size]byte{}, false
 	}
 	kind, _ := item["type"].(string)
+	preserveIdentity := false
 	switch kind {
 	case "", "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "compaction",
 		"additional_tools", "configuration_update":
 		// Native Codex keeps tool declarations and configuration updates in
 		// input history. Their complete contents must participate in the hash;
 		// dropping them would incorrectly reuse a changed context.
+	case "agent_message", "local_shell_call", "tool_search_call", "tool_search_output",
+		"web_search_call", "image_generation_call", "context_compaction":
+		// Native Codex durable items. Compare their complete payload, including
+		// IDs/status; never infer hosted state from an ID-only reference.
+		if !openAIWSNativeContinuationItemComplete(item) {
+			return [sha256.Size]byte{}, false
+		}
+		preserveIdentity = true
 	case "compaction_summary":
 		// Native remote compaction v2 replays its encrypted summary as the
 		// new context window. Require the actual self-contained ciphertext and
@@ -58,17 +68,39 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 	if kind == "" && item["role"] != nil {
 		item["type"] = "message"
 	}
-	delete(item, "id")
-	delete(item, "status")
+	if !preserveIdentity {
+		delete(item, "id")
+		delete(item, "status")
+	}
+	// Only nullable fields in the pinned Codex protocol are equivalent to
+	// omission. Unknown extensions, non-empty values and ciphertext still count.
+	for _, key := range openAIWSContinuationNullableFields(kind) {
+		if value, exists := item[key]; exists && value == nil {
+			delete(item, key)
+		}
+	}
 	if kind == "reasoning" {
 		delete(item, "call_id")
 		if item["summary"] == nil {
 			item["summary"] = []any{}
 		}
+		if content, ok := item["content"].([]any); item["content"] == nil || (ok && len(content) == 0) {
+			delete(item, "content")
+		} else if encrypted, ok := item["encrypted_content"].(string); ok && encrypted != "" {
+			// Match normalizeOpenAIResponsesReasoningContentReplay on the
+			// next full request. The exact portable cipher and summary remain.
+			if content, ok := item["content"].([]any); ok && len(content) > 0 {
+				delete(item, "content")
+			}
+		}
 	}
 	if metadata, ok := item["internal_chat_message_metadata_passthrough"].(map[string]any); ok {
 		delete(metadata, "turn_id")
 		delete(metadata, "create_time")
+		delete(metadata, "content_item_kinds")
+		delete(metadata, "content_item_metadata")
+		// Keep cell_id/executed_tool_calls/tool_calls_complete and unknown
+		// metadata: late tool-result updates require a full replay.
 		if len(metadata) == 0 {
 			delete(item, "internal_chat_message_metadata_passthrough")
 		}
@@ -98,7 +130,14 @@ func appendOpenAIWSContinuationDigest(prefix, item [sha256.Size]byte) [sha256.Si
 // The caller already owns the connection lease. A different socket, expired
 // checkpoint, changed parameters or edited history always sends the full input.
 // reqBody is deliberately untouched so WS retries and HTTP fallback retain it.
-func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previous *openAIWSAutoContinuation, now time.Time) (*openAIWSAutoContinuation, bool, string) {
+func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previous *openAIWSAutoContinuation, now time.Time, diagnostics ...*openAIWSContinuationDiagnostic) (*openAIWSAutoContinuation, bool, string) {
+	var diagnostic *openAIWSContinuationDiagnostic
+	if len(diagnostics) > 0 {
+		diagnostic = diagnostics[0]
+	}
+	if diagnostic != nil {
+		*diagnostic = openAIWSContinuationDiagnostic{Index: -1}
+	}
 	if scope == "" || openAIWSPayloadString(payload, "previous_response_id") != "" {
 		return nil, false, "explicit_anchor_or_missing_scope"
 	}
@@ -116,6 +155,9 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 	items := input.Array()
 	if len(items) == 0 {
 		return nil, false, "no_input_sequence"
+	}
+	if len(items) > openAIWSContinuationOutputLimit {
+		return nil, false, "history_too_large_for_checkpoint"
 	}
 	// Do not decode the full multi-megabyte history a second time just to
 	// compare its small parameter envelope. Keep the existing WS comparison
@@ -165,7 +207,16 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 		}
 		digest, ok := openAIWSContinuationItemDigest([]byte(item.Raw))
 		if !ok {
+			if diagnostic != nil {
+				diagnostic.Index = -1
+			}
+			diagnostic.set(i, openAIWSContinuationDiagnosticType(item), "")
 			return nil, false, "non_self_contained_input"
+		}
+		kind := openAIWSContinuationDiagnosticType(item)
+		draft.itemFingerprints = append(draft.itemFingerprints, openAIWSContinuationFingerprint{Digest: digest, Kind: kind})
+		if eligible && i < len(previous.itemFingerprints) && digest != previous.itemFingerprints[i].Digest {
+			diagnostic.set(i, kind, previous.itemFingerprints[i].Kind)
 		}
 		prefix = appendOpenAIWSContinuationDigest(prefix, digest)
 		if eligible && i+1 == previous.items && prefix != previous.prefix {
@@ -210,6 +261,10 @@ func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAu
 		return nil
 	}
 	completed := *draft
+	if len(output)+draft.items > openAIWSContinuationOutputLimit {
+		return nil
+	}
+	completed.itemFingerprints = append([]openAIWSContinuationFingerprint(nil), draft.itemFingerprints...)
 	completed.responseID = strings.Clone(strings.TrimSpace(response.Get("id").String()))
 	if completed.responseID == "" || len(completed.responseID) > 256 {
 		return nil
@@ -223,6 +278,7 @@ func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAu
 			completed.pendingTools[item.callID] = item.toolType
 		}
 		completed.prefix = appendOpenAIWSContinuationDigest(completed.prefix, item.digest)
+		completed.itemFingerprints = append(completed.itemFingerprints, openAIWSContinuationFingerprint{Digest: item.digest, Kind: item.kind})
 		completed.items++
 	}
 	completed.expiresAt = now.Add(openAIWSAutoContinuationTTL)

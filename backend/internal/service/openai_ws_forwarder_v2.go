@@ -67,6 +67,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	strategyAttempt := attempt
 	if c != nil {
 		c.Set("openai_ws_auto_incremental_succeeded", false)
+		c.Set("openai_ws_auto_incremental_item_index", -1)
+		c.Set("openai_ws_auto_incremental_item_type", "")
+		c.Set("openai_ws_auto_incremental_previous_item_type", "")
 		if c.GetBool("openai_ws_auto_incremental_replay") {
 			// Replaying a rejected inferred anchor must retain the original
 			// include (notably reasoning.encrypted_content) on every retry.
@@ -363,7 +366,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 		scope := fmt.Sprintf("%d:%d:%s", groupID, getAPIKeyIDFromContext(c), sessionHash)
 		var continuationReason string
-		continuationDraft, autoContinuation, continuationReason = prepareOpenAIWSAutoContinuation(payload, scope, previous, time.Now())
+		var diagnostic openAIWSContinuationDiagnostic
+		continuationDraft, autoContinuation, continuationReason = prepareOpenAIWSAutoContinuation(payload, scope, previous, time.Now(), &diagnostic)
 		if autoContinuation {
 			previousResponseID = openAIWSPayloadString(payload, "previous_response_id")
 			previousResponseIDKind = ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
@@ -372,6 +376,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		if c != nil {
 			c.Set("openai_ws_auto_incremental", autoContinuation)
 			c.Set("openai_ws_auto_incremental_reason", continuationReason)
+			if diagnostic.Index >= 0 {
+				c.Set("openai_ws_auto_incremental_item_index", diagnostic.Index)
+				c.Set("openai_ws_auto_incremental_item_type", diagnostic.Kind)
+				c.Set("openai_ws_auto_incremental_previous_item_type", diagnostic.PreviousKind)
+			}
 		}
 		logOpenAIWSModeDebug("auto_continuation account_id=%d conn_id=%s incremental=%v reason=%s", account.ID, connID, autoContinuation, continuationReason)
 	}

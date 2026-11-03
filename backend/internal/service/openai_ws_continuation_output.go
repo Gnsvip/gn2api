@@ -17,6 +17,7 @@ type openAIWSContinuationOutputItem struct {
 	id       [sha256.Size]byte
 	callID   [sha256.Size]byte
 	toolType string
+	kind     string
 	done     bool
 }
 
@@ -37,14 +38,27 @@ func openAIWSContinuationOutputFingerprint(item gjson.Result) (openAIWSContinuat
 	if !ok {
 		return openAIWSContinuationOutputItem{}, false
 	}
-	result := openAIWSContinuationOutputItem{digest: digest, id: openAIWSContinuationOutputIdentity(item), done: true}
+	result := openAIWSContinuationOutputItem{digest: digest, id: openAIWSContinuationOutputIdentity(item), kind: openAIWSContinuationDiagnosticType(item), done: true}
 	switch kind := item.Get("type").String(); kind {
-	case "function_call", "custom_tool_call":
+	case "function_call", "custom_tool_call", "local_shell_call", "tool_search_call":
+		if kind == "tool_search_call" && item.Get("execution").String() == "server" {
+			break // Server-owned search does not require a client tool result.
+		}
 		id := item.Get("call_id").String()
 		if strings.TrimSpace(id) == "" {
 			return result, false
 		}
 		result.callID, result.toolType = sha256.Sum256([]byte(id)), kind+"_output"
+		if kind == "local_shell_call" {
+			result.toolType = "function_call_output"
+		}
+		if kind == "tool_search_call" {
+			result.toolType = "tool_search_output"
+		}
+	case "tool_search_output":
+		if item.Get("execution").String() != "server" {
+			return result, false
+		}
 	case "function_call_output", "custom_tool_call_output":
 		// Tool results belong to input; do not infer a continuation contract
 		// for unexpected output-side results.
@@ -152,7 +166,10 @@ func openAIWSContinuationToolsComplete(items []gjson.Result, pending map[[sha256
 	for _, item := range items {
 		kind := item.Get("type").String()
 		switch kind {
-		case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output":
+		case "function_call", "custom_tool_call", "local_shell_call", "tool_search_call", "tool_search_output", "function_call_output", "custom_tool_call_output":
+			if (kind == "tool_search_call" || kind == "tool_search_output") && item.Get("execution").String() == "server" {
+				continue
+			}
 			id := item.Get("call_id").String()
 			if item.Get("call_id").Type != gjson.String || strings.TrimSpace(id) == "" {
 				return false
@@ -160,7 +177,11 @@ func openAIWSContinuationToolsComplete(items []gjson.Result, pending map[[sha256
 			key := sha256.Sum256([]byte(id))
 			if strings.HasSuffix(kind, "_output") {
 				output := item.Get("output")
-				if expected[key] != kind || (output.Type != gjson.String && !output.IsArray()) {
+				validOutput := output.Type == gjson.String || output.IsArray()
+				if kind == "tool_search_output" {
+					validOutput = item.Get("execution").String() == "client" && item.Get("tools").IsArray()
+				}
+				if expected[key] != kind || !validOutput {
 					return false
 				}
 				delete(expected, key)
@@ -168,7 +189,14 @@ func openAIWSContinuationToolsComplete(items []gjson.Result, pending map[[sha256
 				if seen[key] {
 					return false
 				}
-				expected[key], seen[key] = kind+"_output", true
+				resultKind := kind + "_output"
+				if kind == "local_shell_call" {
+					resultKind = "function_call_output"
+				}
+				if kind == "tool_search_call" {
+					resultKind = "tool_search_output"
+				}
+				expected[key], seen[key] = resultKind, true
 			}
 		}
 	}

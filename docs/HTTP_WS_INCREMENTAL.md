@@ -8,10 +8,10 @@
 - 分组、API key、原始线程/会话执行作用域一致。
 - 最终出站模型、推理等级、工具定义及其他非传输参数一致，上下文窗口未变化。
 - 本轮完整历史的前缀等于上一轮完整输入加上游输出，且存在新增 input。
-- 历史可自行还原，上一响应的全部 function/custom tool 调用在新增输入中都有类型和 call_id 相符的真实结果。缺项、重复、孤立结果或新工具调用未闭合时采用全量，不编造结果。
+- 历史可自行还原，上一响应的全部 function/custom tool、local shell 和客户端 tool search 调用在新增输入中都有类型和 call_id 相符的真实结果。服务端 tool search 不要求客户端提交结果。缺项、重复、孤立结果或新工具调用未闭合时采用全量，不编造结果。
 - 上游输出可由 `response.output_item.done` 与 `response.completed.output` 确认完整。末帧缺项可用流中已完成的项补齐检查点；未解析的 item_reference、未知类型、输出索引缺洞或冲突时采用全量。
 
-比较保留消息正文、密文、工具名称/参数及 call_id；忽略输出对象 ID、status、已知内部 turn_id/create_time 和空 annotations/logprobs 等重放元数据。比较时的规范化不会修改实际发送的新 input。客户端显式提供 previous_response_id 的既有逻辑保持独立。
+比较保留消息正文、密文、工具名称/参数及 call_id；已有 message/reasoning/function/custom 等条目忽略输出对象 ID、status，新增原生类型保留 ID/status。忽略已知内部 turn_id/create_time/content_item_kinds/content_item_metadata 和空 annotations/logprobs 等重放元数据；工具执行元数据和未知字段继续严格比较。比较时的规范化不会修改实际发送的新 input。客户端显式提供 previous_response_id 的既有逻辑保持独立。
 
 Codex 原生 input 中的 `additional_tools` 与 `configuration_update` 也完整参与比较。此前白名单遗漏了这两种类型，导致真实客户端请求在比较前缀前便返回 `non_self_contained_input`，无法建立检查点。工具声明或配置变化仍会回到全量。
 
@@ -33,7 +33,7 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 
 检查点直接属于连接，只含 SHA-256 摘要、条目数、响应标识与过期时间，不保存问答正文，不写数据库或 Redis。连接数量仍由现有账号连接池与并发限制管理。自动续传成功后的 session→connection 关联最多保留 10 分钟；原有其他用途的 response/account 索引 TTL 不做全局修改。
 
-工具续传额外保留调用编号的 SHA-256 摘要与预期结果类型；流中临时收集的输出指纹最多 2,048 项，超出时放弃检查点。不会因此持久保存工具内容、图片或推理密文，也不修改客户端收到的流事件。
+工具续传额外保留调用编号的 SHA-256 摘要与预期结果类型；流中临时收集的输出指纹最多 2,048 项。检查点保留每项的 SHA-256 与固定类型用于定位首个差异，完整输入加输出最多 2,048 项，超出时放弃检查点并继续全量转发。不会因此持久保存工具内容、图片或推理密文，也不修改客户端收到的流事件。
 
 取得租约后才判断增量，因此不会把某连接的增量发送到另一连接。连接繁忙而调度到其他连接时发送全量；同一会话的并发分支也须重新比较历史。任何上游写操作（包括原生 WS、预热）都会清除旧检查点；只有成功 completed 且下游仍连接时才建立下一检查点。
 
@@ -48,6 +48,8 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 现有 `http request completed` 日志增加 `openai_ws_auto_incremental` 和 `openai_ws_auto_incremental_reason`。字段反映本请求最终 WS 尝试；退回 HTTP 时为 false/http_fallback。无问答正文、缓存键原文或密文日志。
 
 工具续传修复增加 `openai_ws_auto_incremental_succeeded`（增量收到成功 completed，且正常完成下游交付）和 `openai_ws_auto_incremental_replay`（本请求触发过自动锚点恢复）。不能把 `auto_incremental=true` 或 SSE 的 HTTP 200 单独视为增量成功；完整回放成功也不计作增量成功。
+
+原生条目兼容修复增加 `openai_ws_auto_incremental_item_index`（从零开始）、`openai_ws_auto_incremental_item_type` 和 `openai_ws_auto_incremental_previous_item_type`，定位不支持的条目或前缀第一个不匹配处。类型仅从固定枚举输出，未知类型一律写 `unknown`；不输出正文、原始类型字符串、ID、摘要、工具参数、图片或密文。没有条目差异时省略这些字段，每次 WS 尝试清理旧诊断。
 
 ## 验证（2026-11-03）
 
@@ -81,3 +83,18 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 本地真实握手测试覆盖 service 和完整 Responses handler：流式/非流式 403→HTTP 成功、HTTP 也拒绝、401、结构化凭据/权限 403、显式锚点和已写下游。回放断言保留模型、`xhigh`、完整工具调用/结果及 `reasoning.encrypted_content`，不依靠孤立的分类器单元测试代替转发验证。测试仅重定向本地网络目的地，未请求生产账号或修改线上配置。
 
 最终相关回归共 1,007 项测试及子用例通过，0 失败、0 跳过，包含前述工具增量修复。命令：`go test -json -tags unit ./internal/service ./internal/handler ./internal/server/middleware -run 'Test.*(WS|WebSocket|HTTPToWS|Codex.*Replay|RequestAccessLogger|Logger_|OpenAIEnsureForwardErrorResponse|OpenAIForwardErrorAlreadyCommunicated)' -count=1 -timeout=240s`。线上效果须发布部署后核对，HTTP 回退成功不能当成消除了上游握手拒绝的根因。
+
+## 原生历史兼容修复（本地验证，尚未部署）
+
+v0.2.43 上线后于 2026-11-03 12:16:39 核对的生产样本中，493 次自动增量评估全部未命中：221 次 `non_self_contained_input`、139 次 `prefix_mismatch`、95 次 `no_checkpoint`、37 次 `http_fallback`、1 次 `compaction_boundary`。旧日志没有条目类型和差异位置，因此不能据此认定下面的兼容问题解释了全部线上未命中。
+
+对照 [Codex CLI 0.166.0 的原生协议类型](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/protocol/src/models.rs)，本地先复现并修正：
+
+- 白名单遗漏 `agent_message`、`local_shell_call`、`tool_search_call`、`tool_search_output`、`web_search_call`、`image_generation_call` 和 `context_compaction`。新增类型须有可用内容，不能仅靠 ID 视为完整；未知类型继续全量。
+- 协议规定的可空字段在重放时可能省略；reasoning 的空 content 与省略等价。只规范化该类型已知可空字段，实际值、未知扩展、工具执行元数据变化仍阻止增量。
+- 网关现有逻辑会在下一轮转发前删除非便携 reasoning.content。检查点比较在存在非空 encrypted_content 时采用相同投影，继续严格比较密文和 summary；没有密文保护时不忽略非空 content。
+- 工具配对覆盖 local shell 的 function_call_output 以及客户端 tool search 的 tool_search_output，缺结果、错 call_id、错结果类型、重复和孤立结果保持全量。
+
+本地真实 WebSocket 服务配合生产 Forward 路径验证：原生历史、内部标记及 reasoning.content 重放差异可在同一连接第二轮命中增量，只发送一条新增消息；正文改动则完整发送历史并给出差异位置，两条路径均保留模型和 xhigh。新增诊断只保留类型、位置和内存摘要，不增加问答正文持久化。
+
+本轮尚未发布或更新生产。部署后的验收应分别核对增量尝试、成功 completed、恢复全量，并按新增诊断分析仍未命中的原因；本地受控测试通过不代表真实流量已命中，也不承诺降低上游推理时间。
