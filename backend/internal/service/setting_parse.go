@@ -242,6 +242,7 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
 		SettingKeyEnableAnthropicCacheTTL1hInjection:                 "false",
 		SettingKeyRewriteMessageCacheControl:                         strconv.FormatBool(s.defaultRewriteMessageCacheControl()),
 		SettingKeyEnableClientDatelineNormalization:                  "true",
+		SettingKeyOpenAITTFTMode:                                     OpenAITTFTModeVisible,
 		SettingKeyAntigravityUserAgentVersion:                        "",
 		SettingKeyOpenAICodexUserAgent:                               "",
 		SettingKeyOpenAICodexClientVersion:                           "",
@@ -1003,10 +1004,10 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 }
 
 func normalizeOpenAITTFTMode(mode string) string {
-	if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeVisible) {
-		return OpenAITTFTModeVisible
+	if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeSemantic) {
+		return OpenAITTFTModeSemantic
 	}
-	return OpenAITTFTModeSemantic
+	return OpenAITTFTModeVisible
 }
 
 func clampAffiliateRebateRate(value float64) float64 {

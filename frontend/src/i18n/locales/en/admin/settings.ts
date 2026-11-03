@@ -508,7 +508,7 @@ export default {
         openaiTTFTMode: 'OpenAI Responses first-token metric',
         openaiTTFTModeSemantic: 'Legacy-compatible (semantic event)',
         openaiTTFTModeVisible: 'Actual visible output',
-        openaiTTFTModeHint: 'The default records first_token_ms at the first non-preamble semantic event. Actual visible output records it only when non-empty text, tool arguments, or image content arrives.',
+        openaiTTFTModeHint: 'Defaults to actual visible output: from forwarding start until the gateway receives non-empty text, a reasoning summary, tool arguments, or image content. Quota notifications and empty events do not count. Client rendering time is excluded. Historical records are not recalculated.',
         fingerprintUnification: 'Fingerprint Unification',
         fingerprintUnificationHint: 'Unify X-Stainless-* headers across users sharing the same OAuth account. Disabling passes through each client\'s original headers.',
         metadataPassthrough: 'Metadata Passthrough',

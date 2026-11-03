@@ -13,7 +13,7 @@
 
 比较保留消息正文、密文、工具名称/参数及 call_id；已有 message/reasoning/function/custom 等条目忽略输出对象 ID、status，新增原生类型保留 ID/status。忽略已知内部 turn_id/create_time/content_item_kinds/content_item_metadata 和空 annotations/logprobs 等重放元数据；工具执行元数据和未知字段继续严格比较。比较时的规范化不会修改实际发送的新 input。客户端显式提供 previous_response_id 的既有逻辑保持独立。
 
-原生回放还会省略输出的 `metadata.turn_id`、`internal_chat_message_metadata_passthrough.content_token_count` 及空元数据包。摘要比较将内部元数据包的 null、空对象和省略视为等价；其中 cell_id、executed_tool_calls、tool_calls_complete 仅将 null 视为省略，非空值及未知字段继续严格比较。v0.2.47 的原生 app-server 受控实验与实际 Forward 回归确认，空元数据不再导致工具续传误判为 prefix_mismatch。
+原生回放还会省略输出的 `metadata.turn_id`、`internal_chat_message_metadata_passthrough.content_token_count` 及空元数据包。摘要比较将内部元数据包的 null、空对象和省略视为等价。v0.2.47 修复了空元数据引起的误判；v0.2.48 进一步兼容官方客户端在反序列化工具输出时省略非空 `cell_id`、`executed_tool_calls`、`tool_calls_complete` 的行为：只为上一轮上游 function/custom tool 输出保留原始摘要和精确省略这三项的替代摘要。已作为输入发送的历史继续严格比较，下一检查点以实际输入重新计算；工具名称、参数、调用关系、密文及未知字段变化仍阻止增量。这不是对所有历史统一删除执行元数据。
 
 Codex 原生 input 中的 `additional_tools` 与 `configuration_update` 也完整参与比较。此前白名单遗漏了这两种类型，导致真实客户端请求在比较前缀前便返回 `non_self_contained_input`，无法建立检查点。工具声明或配置变化仍会回到全量。
 
@@ -36,6 +36,8 @@ HTTP 成功不会把该回合补入原 WS 的检查点。因此一轮新增图�
 检查点直接属于连接，只含 SHA-256 摘要、条目数、响应标识与过期时间，不保存问答正文，不写数据库或 Redis。连接数量仍由现有账号连接池与并发限制管理。自动续传成功后的 session→connection 关联最多保留 10 分钟；原有其他用途的 response/account 索引 TTL 不做全局修改。
 
 工具续传额外保留调用编号的 SHA-256 摘要与预期结果类型；流中临时收集的输出指纹最多 2,048 项。检查点保留每项的 SHA-256 与固定类型用于定位首个差异，完整输入加输出最多 2,048 项，超出时放弃检查点并继续全量转发。不会因此持久保存工具内容、图片或推理密文，也不修改客户端收到的流事件。
+
+v0.2.48 为前缀不一致诊断额外保留最多 64 项上游输出的固定字段摘要，随连接检查点替换及过期，不累计保存各轮历史。日志中的 `openai_ws_auto_incremental_changed_fields` 只来自固定字段枚举，不输出字段值、摘要或客户端自定义字段名称。
 
 取得租约后才判断增量，因此不会把某连接的增量发送到另一连接。连接繁忙而调度到其他连接时发送全量；同一会话的并发分支也须重新比较历史。任何上游写操作（包括原生 WS、预热）都会清除旧检查点；只有成功 completed 且下游仍连接时才建立下一检查点。
 

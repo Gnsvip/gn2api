@@ -275,6 +275,7 @@ func TestLogger_AccessLogSeparatesIncrementalAttemptFromSuccess(t *testing.T) {
 		c.Set("openai_ws_auto_incremental_item_index", 7)
 		c.Set("openai_ws_auto_incremental_item_type", "message")
 		c.Set("openai_ws_auto_incremental_previous_item_type", "reasoning")
+		c.Set("openai_ws_auto_incremental_changed_fields", "arguments")
 		c.Status(http.StatusOK) // A streaming 200 alone does not prove success.
 	})
 	w := httptest.NewRecorder()
@@ -297,6 +298,9 @@ func TestLogger_AccessLogSeparatesIncrementalAttemptFromSuccess(t *testing.T) {
 		}
 		if event.Fields["openai_ws_auto_incremental_item_type"] != "message" || event.Fields["openai_ws_auto_incremental_previous_item_type"] != "reasoning" {
 			t.Fatal("missing diagnostic item types")
+		}
+		if event.Fields["openai_ws_auto_incremental_changed_fields"] != "arguments" {
+			t.Fatal("missing field-only mismatch diagnostic")
 		}
 		return
 	}

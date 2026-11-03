@@ -139,7 +139,7 @@ func TestOpenAIWSContinuationDiagnosticsAndBounds(t *testing.T) {
 	_, used, reason := prepareOpenAIWSAutoContinuation(payload, "scope", checkpoint, now, &diagnostic)
 	require.False(t, used)
 	require.Equal(t, "prefix_mismatch", reason)
-	require.Equal(t, openAIWSContinuationDiagnostic{Index: 2, Kind: "message", PreviousKind: "message"}, diagnostic)
+	require.Equal(t, openAIWSContinuationDiagnostic{Index: 2, Kind: "message", PreviousKind: "message", Fields: "other_fields"}, diagnostic)
 	_, used, _ = prepareOpenAIWSAutoContinuation(autoContinuationPayload(t, autoContinuationAnswer, autoContinuationUser), "scope", checkpoint, now, &diagnostic)
 	require.True(t, used)
 	require.Equal(t, -1, diagnostic.Index, "each attempt clears stale diagnostics")

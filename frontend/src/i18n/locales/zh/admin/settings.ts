@@ -501,7 +501,7 @@ export default {
         openaiTTFTMode: 'OpenAI Responses 首 token 统计口径',
         openaiTTFTModeSemantic: '历史兼容（语义事件）',
         openaiTTFTModeVisible: '真实可见输出',
-        openaiTTFTModeHint: '默认使用历史兼容口径，首个非预置语义事件即记录 first_token_ms。选择真实可见输出后，仅在首个非空文本、工具参数或图片内容到达时记录。',
+        openaiTTFTModeHint: '默认使用真实可见输出：从开始转发到网关收到首段非空文本、推理摘要、工具参数或图片内容；不计额度通知和空事件，也不包含客户端渲染耗时。历史记录不会重新计算。',
         fingerprintUnification: '指纹统一化',
         fingerprintUnificationHint: '统一共享同一 OAuth 账号的用户的 X-Stainless-* 请求头。关闭后透传客户端原始请求头。',
         metadataPassthrough: 'Metadata 透传',

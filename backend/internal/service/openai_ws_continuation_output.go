@@ -13,12 +13,20 @@ const openAIWSContinuationOutputLimit = 2048
 // Only bounded fingerprints survive a stream event. Do not retain tool text,
 // images or encrypted reasoning in the connection's continuation checkpoint.
 type openAIWSContinuationOutputItem struct {
-	digest   [sha256.Size]byte
-	id       [sha256.Size]byte
-	callID   [sha256.Size]byte
-	toolType string
-	kind     string
-	done     bool
+	digest       [sha256.Size]byte
+	replayDigest [sha256.Size]byte
+	fields       *openAIWSContinuationFields
+	id           [sha256.Size]byte
+	callID       [sha256.Size]byte
+	toolType     string
+	kind         string
+	done         bool
+}
+
+func (item openAIWSContinuationOutputItem) equal(other openAIWSContinuationOutputItem) bool {
+	// Details are derived diagnostics, not part of output identity.
+	item.fields, other.fields = nil, nil
+	return item == other
 }
 
 type openAIWSContinuationOutputCollector struct {
@@ -39,6 +47,10 @@ func openAIWSContinuationOutputFingerprint(item gjson.Result) (openAIWSContinuat
 		return openAIWSContinuationOutputItem{}, false
 	}
 	result := openAIWSContinuationOutputItem{digest: digest, id: openAIWSContinuationOutputIdentity(item), kind: openAIWSContinuationDiagnosticType(item), done: true}
+	if result.kind == "function_call" || result.kind == "custom_tool_call" {
+		result.replayDigest = openAIWSContinuationOutputReplayDigest([]byte(item.Raw))
+	}
+	result.fields = openAIWSContinuationFieldDigests([]byte(item.Raw))
 	switch kind := item.Get("type").String(); kind {
 	case "function_call", "custom_tool_call", "local_shell_call", "tool_search_call":
 		if kind == "tool_search_call" && item.Get("execution").String() == "server" {
@@ -92,7 +104,7 @@ func (c *openAIWSContinuationOutputCollector) observe(event []byte, eventType st
 		return
 	}
 	completed, ok := openAIWSContinuationOutputFingerprint(item)
-	if !ok || (previous.done && previous != completed) {
+	if !ok || (previous.done && !previous.equal(completed)) {
 		c.invalid = true
 		return
 	}
@@ -127,7 +139,7 @@ func (c *openAIWSContinuationOutputCollector) finish(output gjson.Result) ([]ope
 		if index < 0 {
 			// Without an identity, positional matching needs a complete final
 			// array, or an exact match at the already observed position.
-			if len(terminal) < len(items) && (i >= len(items) || !items[i].done || items[i] != item) {
+			if len(terminal) < len(items) && (i >= len(items) || !items[i].done || !items[i].equal(item)) {
 				return nil, false
 			}
 			index = i
@@ -140,7 +152,7 @@ func (c *openAIWSContinuationOutputCollector) finish(output gjson.Result) ([]ope
 			items = append(items, openAIWSContinuationOutputItem{})
 		}
 		existing := items[index]
-		if (existing.done && existing != item) || (existing.id != [sha256.Size]byte{} && existing.id != item.id) {
+		if (existing.done && !existing.equal(item)) || (existing.id != [sha256.Size]byte{} && existing.id != item.id) {
 			return nil, false
 		}
 		items[index] = item

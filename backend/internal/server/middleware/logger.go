@@ -77,7 +77,7 @@ func Logger() gin.HandlerFunc {
 		if model != "" {
 			fields = append(fields, zap.String("model", model))
 		}
-		for _, key := range []string{"openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type"} {
+		for _, key := range []string{"openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type", "openai_ws_auto_incremental_changed_fields"} {
 			if value := c.GetString(key); value != "" {
 				fields = append(fields, zap.String(key, value))
 			}

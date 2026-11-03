@@ -70,6 +70,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		c.Set("openai_ws_auto_incremental_item_index", -1)
 		c.Set("openai_ws_auto_incremental_item_type", "")
 		c.Set("openai_ws_auto_incremental_previous_item_type", "")
+		c.Set("openai_ws_auto_incremental_changed_fields", "")
 		if c.GetBool("openai_ws_auto_incremental_replay") {
 			// Replaying a rejected inferred anchor must retain the original
 			// include (notably reasoning.encrypted_content) on every retry.
@@ -380,6 +381,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 				c.Set("openai_ws_auto_incremental_item_index", diagnostic.Index)
 				c.Set("openai_ws_auto_incremental_item_type", diagnostic.Kind)
 				c.Set("openai_ws_auto_incremental_previous_item_type", diagnostic.PreviousKind)
+				c.Set("openai_ws_auto_incremental_changed_fields", diagnostic.Fields)
 			}
 		}
 		logOpenAIWSModeDebug("auto_continuation account_id=%d conn_id=%s incremental=%v reason=%s", account.ID, connID, autoContinuation, continuationReason)

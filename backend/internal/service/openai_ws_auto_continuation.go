@@ -30,9 +30,17 @@ type openAIWSAutoContinuation struct {
 // In particular tool call_id, reasoning ciphertext, tools and all message
 // content remain part of the comparison. Unresolved references are ineligible.
 func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
+	normalized, ok := normalizeOpenAIWSContinuationItem(raw)
+	if !ok {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256(normalized), ok
+}
+
+func normalizeOpenAIWSContinuationItem(raw []byte) ([]byte, bool) {
 	var item map[string]any
 	if err := decodeOpenAIJSONUseNumber(raw, &item); err != nil || item == nil {
-		return [sha256.Size]byte{}, false
+		return nil, false
 	}
 	kind, _ := item["type"].(string)
 	preserveIdentity := false
@@ -47,7 +55,7 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		// Native Codex durable items. Compare their complete payload, including
 		// IDs/status; never infer hosted state from an ID-only reference.
 		if !openAIWSNativeContinuationItemComplete(item) {
-			return [sha256.Size]byte{}, false
+			return nil, false
 		}
 		preserveIdentity = true
 	case "compaction_summary":
@@ -56,14 +64,14 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		// compare the entire item, including its ID and opaque extensions.
 		ciphertext, ok := item["encrypted_content"].(string)
 		if !ok || ciphertext == "" {
-			return [sha256.Size]byte{}, false
+			return nil, false
 		}
 		normalized, err := json.Marshal(item)
-		return sha256.Sum256(normalized), err == nil
+		return normalized, err == nil
 	default:
 		// Unknown/hosted item types may use id semantically. Full replay is
 		// safer than guessing their serialization and continuation contract.
-		return [sha256.Size]byte{}, false
+		return nil, false
 	}
 	if kind == "" && item["role"] != nil {
 		item["type"] = "message"
@@ -138,7 +146,7 @@ func openAIWSContinuationItemDigest(raw []byte) ([sha256.Size]byte, bool) {
 		}
 	}
 	normalized, err := json.Marshal(item)
-	return sha256.Sum256(normalized), err == nil
+	return normalized, err == nil
 }
 
 func appendOpenAIWSContinuationDigest(prefix, item [sha256.Size]byte) [sha256.Size]byte {
@@ -219,7 +227,7 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 		}
 		eligible = reason == "prefix_mismatch"
 	}
-	var prefix [sha256.Size]byte
+	var prefix, comparedPrefix [sha256.Size]byte
 	for i, item := range items {
 		if item.Get("type").String() == "compaction_trigger" {
 			// Compaction replaces the context window. Do not infer an anchor
@@ -236,11 +244,23 @@ func prepareOpenAIWSAutoContinuation(payload map[string]any, scope string, previ
 		}
 		kind := openAIWSContinuationDiagnosticType(item)
 		draft.itemFingerprints = append(draft.itemFingerprints, openAIWSContinuationFingerprint{Digest: digest, Kind: kind})
+		comparedDigest := digest
 		if eligible && i < len(previous.itemFingerprints) && digest != previous.itemFingerprints[i].Digest {
-			diagnostic.set(i, kind, previous.itemFingerprints[i].Kind)
+			old := previous.itemFingerprints[i]
+			if old.ReplayDigest != [sha256.Size]byte{} && digest == old.ReplayDigest {
+				// Only the previous upstream output has a verified Codex replay
+				// alternative. The next checkpoint still hashes the actual input.
+				comparedDigest = old.Digest
+			} else {
+				diagnostic.set(i, kind, old.Kind)
+				if diagnostic != nil && diagnostic.Index == i {
+					diagnostic.Fields = openAIWSContinuationChangedFields(old.Fields, []byte(item.Raw))
+				}
+			}
 		}
 		prefix = appendOpenAIWSContinuationDigest(prefix, digest)
-		if eligible && i+1 == previous.items && prefix != previous.prefix {
+		comparedPrefix = appendOpenAIWSContinuationDigest(comparedPrefix, comparedDigest)
+		if eligible && i+1 == previous.items && comparedPrefix != previous.prefix {
 			eligible = false
 		}
 	}
@@ -291,7 +311,7 @@ func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAu
 		return nil
 	}
 	completed.pendingTools = make(map[[sha256.Size]byte]string)
-	for _, item := range output {
+	for i, item := range output {
 		if item.toolType != "" {
 			if _, duplicate := completed.pendingTools[item.callID]; duplicate {
 				return nil
@@ -299,7 +319,13 @@ func (collector *openAIWSContinuationOutputCollector) complete(draft *openAIWSAu
 			completed.pendingTools[item.callID] = item.toolType
 		}
 		completed.prefix = appendOpenAIWSContinuationDigest(completed.prefix, item.digest)
-		completed.itemFingerprints = append(completed.itemFingerprints, openAIWSContinuationFingerprint{Digest: item.digest, Kind: item.kind})
+		fingerprint := openAIWSContinuationFingerprint{Digest: item.digest, ReplayDigest: item.replayDigest, Kind: item.kind}
+		// At most 64 output items retain field hashes. No raw values survive,
+		// and the next request rebuilds input fingerprints without these details.
+		if i < openAIWSContinuationFieldLimit {
+			fingerprint.Fields = item.fields
+		}
+		completed.itemFingerprints = append(completed.itemFingerprints, fingerprint)
 		completed.items++
 	}
 	completed.expiresAt = now.Add(openAIWSAutoContinuationTTL)

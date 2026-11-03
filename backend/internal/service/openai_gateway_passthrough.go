@@ -1340,7 +1340,7 @@ func openAIStreamDataStartsSemanticTTFT(data, eventType string) bool {
 }
 
 func (s *OpenAIGatewayService) openAITTFTMode(ctx context.Context) string {
-	mode := OpenAITTFTModeSemantic
+	mode := OpenAITTFTModeVisible
 	if s != nil && s.settingService != nil {
 		mode = s.settingService.GetOpenAITTFTMode(ctx)
 	} else if cached, ok := gatewayForwardingCache.Load().(*cachedGatewayForwardingSettings); ok && cached != nil {
@@ -1357,7 +1357,7 @@ func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode s
 	}
 	// A terminal-only response has no independently observed first output.
 	// Do not turn its completion time (or an error) into a fabricated TTFT.
-	if eventType == "error" || isOpenAIWSTerminalEvent(eventType) {
+	if eventType == "error" || eventType == "codex.rate_limits" || isOpenAIWSTerminalEvent(eventType) {
 		return false
 	}
 	if mode == OpenAITTFTModeVisible {

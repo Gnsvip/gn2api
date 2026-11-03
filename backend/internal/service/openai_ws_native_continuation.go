@@ -8,8 +8,10 @@ import (
 )
 
 type openAIWSContinuationFingerprint struct {
-	Digest [sha256.Size]byte
-	Kind   string
+	Digest       [sha256.Size]byte
+	ReplayDigest [sha256.Size]byte
+	Kind         string
+	Fields       *openAIWSContinuationFields
 }
 
 func openAIWSContinuationNullableFields(kind string) []string {
@@ -37,11 +39,13 @@ type openAIWSContinuationDiagnostic struct {
 	Index        int
 	Kind         string
 	PreviousKind string
+	Fields       string
 }
 
 func (d *openAIWSContinuationDiagnostic) set(index int, kind, previousKind string) {
 	if d != nil && d.Index < 0 {
 		d.Index, d.Kind, d.PreviousKind = index, kind, previousKind
+		d.Fields = ""
 	}
 }
 

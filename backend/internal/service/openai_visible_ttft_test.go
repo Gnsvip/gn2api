@@ -106,7 +106,7 @@ func TestOpenAINativeMetadataAndKeepaliveDoNotDisarmFirstOutputTimeout(t *testin
 	}
 }
 
-func TestOpenAIResponsesTTFTDefaultsToSemanticOutput(t *testing.T) {
+func TestOpenAIResponsesTTFTDefaultsToVisibleOutput(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		name := "native"
 		if passthrough {
@@ -116,7 +116,7 @@ func TestOpenAIResponsesTTFTDefaultsToSemanticOutput(t *testing.T) {
 			result := runSyntheticVisibleTTFTStream(t, passthrough, 120*time.Millisecond, 0, "",
 				`{"type":"response.output_text.delta","delta":"test output"}`)
 			require.NotNil(t, result.firstTokenMs)
-			require.Less(t, *result.firstTokenMs, 100)
+			require.GreaterOrEqual(t, *result.firstTokenMs, 100)
 		})
 	}
 }
@@ -124,13 +124,10 @@ func TestOpenAIResponsesTTFTDefaultsToSemanticOutput(t *testing.T) {
 func runSyntheticVisibleTTFTStream(t *testing.T, passthrough bool, visibleDelay time.Duration, timeoutSeconds int, ttftMode string, visibleEvent string) *openaiStreamingResult {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	mode := ttftMode
-	if mode == "" {
-		mode = OpenAITTFTModeSemantic
-	}
+	mode := ttftMode // Leave empty to exercise the production default.
 	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
 	t.Cleanup(func() {
-		gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: OpenAITTFTModeSemantic, expiresAt: time.Now().Add(time.Minute).UnixNano()})
+		gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{})
 	})
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		MaxLineSize:                     defaultMaxLineSize,
