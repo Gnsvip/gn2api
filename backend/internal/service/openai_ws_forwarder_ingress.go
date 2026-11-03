@@ -284,6 +284,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		} else if compatibilityChanged {
 			normalized = compatibilityBody
 		}
+		if account.IsOpenAI() {
+			sanitized, changed, sanitizeErr := sanitizeOpenAIResponsesInputItemIDs(normalized)
+			if sanitizeErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", sanitizeErr)
+			}
+			if changed {
+				normalized = sanitized
+				logOpenAIWSModeDebug("ingress_ws_input_item_ids_sanitized account_id=%d turn=%d", account.ID, turn)
+			}
+		}
 		if account.IsOpenAIOAuthLike() {
 			aliasedBody, reverse, aliased, aliasErr := aliasOpenAIOAuthReservedToolNamesBody(normalized)
 			if aliasErr != nil {

@@ -92,7 +92,7 @@ func TestOpenAIWSDownstreamWriteContext_CancellationOwnership(t *testing.T) {
 	})
 }
 
-func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossTurns(t *testing.T) {
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossTurnsAndSanitizeBadIDs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	cfg := &config.Config{}
@@ -212,7 +212,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 		return message
 	}
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":[{"type":"message","id":"item_7ed4f2296a2a6b28184ca575","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
 	firstTurnImageEvent := readMessage()
 	require.Equal(t, "response.output_item.done", gjson.GetBytes(firstTurnImageEvent, "type").String())
 	require.Equal(t, "completed", gjson.GetBytes(firstTurnImageEvent, "item.status").String())
@@ -227,6 +227,8 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	require.Equal(t, "resp_ingress_turn_2", gjson.GetBytes(secondTurnEvent, "response.id").String())
 	require.Equal(t, "response.completed", <-turnTerminalCh, "首轮 turn 应保留成功终态")
 	require.Equal(t, "response.completed", <-turnTerminalCh, "第二轮 turn 应保留成功终态")
+	require.False(t, gjson.Get(requestToJSONString(captureConn.writes[0]), "input.0.id").Exists(), "上游不接受 item_* 作为 message item id")
+	require.Equal(t, "hello", gjson.Get(requestToJSONString(captureConn.writes[0]), "input.0.content.0.text").String())
 
 	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
 
