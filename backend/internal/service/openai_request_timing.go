@@ -1,11 +1,23 @@
 package service
 
 import (
+	"context"
+	"net/http"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/tidwall/gjson"
 )
+
+type openAIRequestTimingHTTPKey struct{}
+
+// Only callers that observe response events may create timing attempts. The
+// shared HTTP transport also serves compatibility and account-usage requests;
+// those have no matching observer and must not be classified as incomplete.
+func (s *OpenAIGatewayService) doTimedOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+	ctx := context.WithValue(request.Context(), openAIRequestTimingHTTPKey{}, true)
+	return s.doOpenAIUpstream(request.WithContext(ctx), proxyURL, account)
+}
 
 // This observer retains only enums, lengths and IDs. Never pass arbitrary error
 // messages, event names, headers or JSON to the evidence recorder.

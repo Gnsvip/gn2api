@@ -20,7 +20,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 
 func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxyURL string, account *Account) (response *http.Response, resultErr error) {
 	var timing *requesttiming.Attempt
-	if recorder := requesttiming.FromContext(request.Context()); recorder != nil {
+	if recorder := requesttiming.FromContext(request.Context()); recorder != nil && request.Context().Value(openAIRequestTimingHTTPKey{}) == true {
 		timing = recorder.Begin(account.ID, "http")
 		trace := &httptrace.ClientTrace{
 			GotConn: func(info httptrace.GotConnInfo) { timing.Connection("", info.Reused, -1, -1, -1) },

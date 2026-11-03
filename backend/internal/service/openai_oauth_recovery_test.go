@@ -117,7 +117,7 @@ func TestOpenAIUnauthorizedHTTPRecovery(t *testing.T) {
 			request.Header.Set("Authorization", "Bearer rejected")
 			timing := requesttiming.New(time.Now(), "recovery-request", "", 0)
 			request = request.WithContext(timing.Context(request.Context()))
-			response, err := s.doOpenAIUpstream(request, "", a)
+			response, err := s.doTimedOpenAIUpstream(request, "", a)
 			require.NoError(t, err)
 			summary, ok := timing.Finish(response.StatusCode)
 			require.True(t, ok)

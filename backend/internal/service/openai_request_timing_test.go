@@ -123,7 +123,7 @@ func TestRequestTimingAlreadyEncodedHTTPBody(t *testing.T) {
 	req.Header.Set("Content-Encoding", "gzip")
 	req = req.WithContext(r.Context(req.Context()))
 	svc := &OpenAIGatewayService{httpUpstream: &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}}}
-	resp, err := svc.doOpenAIUpstreamOnce(req, "", &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey})
+	resp, err := svc.doTimedOpenAIUpstream(req, "", &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey})
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	s, ok := r.Finish(200)
@@ -131,4 +131,25 @@ func TestRequestTimingAlreadyEncodedHTTPBody(t *testing.T) {
 	require.Nil(t, s.Attempts[0].OutboundBytes)
 	require.Equal(t, int64(7), *s.Attempts[0].EncodedBodyBytes)
 	require.Nil(t, s.Attempts[0].SentMS, "mock transport has no write callback; do not invent a send time")
+}
+
+func TestRequestTimingSharedTransportDoesNotRecordUnobservedRequests(t *testing.T) {
+	for _, path := range []string{"/v1/chat/completions", "/backend-api/codex/usage", "/v1/responses"} {
+		t.Run(path, func(t *testing.T) {
+			r := requesttiming.New(time.Now(), "unobserved-request", "", 0)
+			req := httptest.NewRequest("POST", "https://example.test"+path, strings.NewReader(`{"input":"unchanged"}`))
+			req = req.WithContext(r.Context(req.Context()))
+			upstream := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("UNCHANGED_RESPONSE"))}
+			svc := &OpenAIGatewayService{httpUpstream: &httpUpstreamRecorder{resp: upstream}}
+			resp, err := svc.doOpenAIUpstream(req, "", &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey})
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Same(t, upstream, resp)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, "UNCHANGED_RESPONSE", string(body))
+			_, ok := r.Finish(200)
+			require.False(t, ok, "an unobserved response must not create an incomplete record or a false retry")
+		})
+	}
 }
