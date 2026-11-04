@@ -56,6 +56,14 @@ v0.2.56 起，Chat Completions → Responses → Chat Completions 的流式转�
 - HTTP 入口转 WS 上游使用 WS 口径；原生 WS 入口桥接 HTTP 上游也使用 WS semantic（按实际出站 HTTP、计时口径 ws_semantic 单独分组）。后续 WS 轮次分别重新计时。
 - 已移除将开始处理通知计作首字的 `first_event` 选项。旧配置读取时归一化为 `semantic`，新写入只接受 `semantic` / `visible`。历史用量记录不重算。
 
+### 单账号 HTTP 首次响应例外
+
+按用户要求，仅为 #12140 准备启用 `accounts.extra.openai_http_ttft_mode = "first_event"`。此字段只作用于显式配置的 OpenAI API Key 账号的普通 HTTP 流式 Responses 链路（包括 Responses 转 Chat 输出）；没有配置的账号继续使用全局口径。代码没有硬编码账号 ID，全局设置仍不接受 `first_event`。发布部署后需通过管理员账号更新接口仅合并此账号的该字段，不覆盖其余 extra，也不修改全局设置。
+
+此口径从该次转发开始到收到第一个有效、非终止的 Responses 事件记时，包含 `response.created` / `response.in_progress` 等处理通知。它不证明推理已经开始；错误、额度通知、心跳和单独终止事件不填首字。每次请求重新计时，不固定写入 2.581 秒，也不回填历史用量。摘要里的 `first_event_ms` 从请求入口计时，因此可能比用量首字多出转发前准备时间。
+
+首内容、首正文、实际写出和 Flush 诊断仍分别记录；账号性能观察将 `first_event` 单独分组，不与 `semantic` 混算。该设置不改变首输出超时、切号、缓冲或响应提交。WS 入口/出口以及 WS→HTTP 回退仍按 `ws_semantic`，即使选中此账号也不使用例外。
+
 WS semantic 是首次推理活动或内容信号，不是严格的正文可见时间。例如推理条目在 1.2 秒到达、正文在 10 秒到达，首字为 1.2 秒，正文里程碑仍为 10 秒。该规则参考 ranxi2001/sub2api v2.19.4；旧版本与本版本的 WS 首字不能直接混作同口径基线。独立的 `first_event_ms`、`first_visible_ms`、`first_text_ms` 诊断里程碑继续分别记录。诊断字段 `first_event_ms` 不是已移除的统计选项。计时判定不参与响应提交、重试、超时或刷出决策。
 
 仅已接入事件观察器的链路创建耗时尝试。Chat 非流式缓冲转换、其他未接入的兼容路径和账号用量查询仍只保留既有日志，不会因缺少 Responses 终止事件而记为 `incomplete`。v0.2.53 曾错误纳入这些调用；调查该版本期间的摘要时，须结合入口路径确认，不能仅凭这类摘要认定请求失败。v0.2.54 已限制采集范围。

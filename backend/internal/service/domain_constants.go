@@ -666,6 +666,8 @@ const (
 	SettingKeyOpenAITTFTMode = "openai_ttft_mode"
 	OpenAITTFTModeSemantic   = "semantic"
 	OpenAITTFTModeVisible    = "visible"
+	// Account-only HTTP override; not accepted by the global timing setting.
+	OpenAITTFTModeFirstEvent = "first_event"
 	// WS ingress/egress (including HTTP bridges) uses this fixed observation label.
 	OpenAITTFTModeWSSemantic = "ws_semantic"
 	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）

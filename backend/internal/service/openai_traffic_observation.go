@@ -135,7 +135,7 @@ func buildTrafficObservation(account int64, r *OpenAIForwardResult, trace reques
 	transport, mode := trace.Transport, trace.TTFTMode
 	switch transport {
 	case "http":
-		if mode != OpenAITTFTModeSemantic && mode != OpenAITTFTModeVisible && mode != OpenAITTFTModeWSSemantic {
+		if mode != OpenAITTFTModeSemantic && mode != OpenAITTFTModeVisible && mode != OpenAITTFTModeFirstEvent && mode != OpenAITTFTModeWSSemantic {
 			sample.excluded = "missing_metric"
 			return sample
 		}

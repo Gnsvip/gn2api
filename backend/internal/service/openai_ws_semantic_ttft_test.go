@@ -74,7 +74,8 @@ func TestWSSemanticTTFTHTTPBridgeKeepsTextDiagnosticsSeparate(t *testing.T) {
 	}()
 	upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: reader}}
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}, httpUpstream: upstream}
-	account := &Account{ID: 880015, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1}
+	account := firstEventHTTPAccount()
+	account.Concurrency = 1 // A WS ingress keeps WS semantic even on this HTTP-only override.
 	c, _ := httpBridgeContext("semantic-http-bridge")
 	body := []byte(`{"type":"response.create","model":"model","stream":true,"input":"synthetic"}`)
 	var forwarded []string

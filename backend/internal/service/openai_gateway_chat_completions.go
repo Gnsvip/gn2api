@@ -913,7 +913,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 	var usage OpenAIUsage
 	var firstTokenMs *int
-	ttftMode := s.openAITTFTMode(c.Request.Context())
+	ttftMode := s.openAIHTTPAccountTTFTMode(c.Request.Context(), account)
 	timing := requesttiming.FromGin(c).Current()
 	timing.SetTTFTMode(ttftMode)
 	defer timing.End()

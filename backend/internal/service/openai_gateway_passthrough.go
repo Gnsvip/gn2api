@@ -1358,6 +1358,18 @@ func (s *OpenAIGatewayService) openAITTFTMode(ctx context.Context) string {
 	return normalizeOpenAITTFTMode(mode)
 }
 
+// openAIHTTPAccountTTFTMode is used only by ordinary HTTP response handlers.
+// WS ingress/egress, including HTTP bridges, keeps its fixed WS semantic rule.
+func (s *OpenAIGatewayService) openAIHTTPAccountTTFTMode(ctx context.Context, account *Account) string {
+	if account != nil && account.IsOpenAIApiKey() {
+		mode, _ := account.Extra["openai_http_ttft_mode"].(string)
+		if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeFirstEvent) {
+			return OpenAITTFTModeFirstEvent
+		}
+	}
+	return s.openAITTFTMode(ctx)
+}
+
 func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode string) bool {
 	if eventType == "" {
 		eventType = strings.TrimSpace(gjson.Get(data, "type").String())
@@ -1366,6 +1378,11 @@ func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode s
 	// Do not turn its completion time (or an error) into a fabricated TTFT.
 	if eventType == "error" || eventType == "codex.rate_limits" || isOpenAIWSTerminalEvent(eventType) {
 		return false
+	}
+	if mode == OpenAITTFTModeFirstEvent {
+		// Metric only: processing notices must not commit output, disarm output
+		// timeouts, or prevent failover. This does not imply reasoning or text.
+		return strings.HasPrefix(eventType, "response.") && gjson.Valid(data)
 	}
 	if mode == OpenAITTFTModeVisible {
 		return openAIStreamDataStartsVisibleOutput(data, eventType)
@@ -1964,7 +1981,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	timing := requesttiming.FromGin(c).Current()
 	var firstTokenMs *int
 	responseID := ""
-	ttftMode := s.openAITTFTMode(ctx)
+	ttftMode := s.openAIHTTPAccountTTFTMode(ctx, account)
 	timing.SetTTFTMode(ttftMode)
 	clientDisconnected := false
 	defer func() {
