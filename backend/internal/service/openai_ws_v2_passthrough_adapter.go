@@ -932,6 +932,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), capturedSessionModel)
 			return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, nil, err.Error())
 		}
+		if statusCode == http.StatusUnauthorized {
+			return newOpenAIUpstreamFailoverError(statusCode, handshakeHeaders, responseBody, "", false)
+		}
 		return s.mapOpenAIWSPassthroughDialError(err, statusCode, handshakeHeaders)
 	}
 	defer func() {

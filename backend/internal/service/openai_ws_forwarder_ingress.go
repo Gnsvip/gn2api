@@ -992,6 +992,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					acquireErr,
 				)
 			}
+			var authFailover *UpstreamFailoverError
+			if turn > 1 && errors.As(acquireErr, &authFailover) {
+				// An acquire failure on a later turn must never cause the
+				// handler to replay the session's initial request. Require a
+				// reconnect with complete context for this auth recovery.
+				return nil, newOpenAIWSCurrentTurnFailoverError(acquireErr, nil)
+			}
 			return nil, acquireErr
 		}
 		timingAcquired = true

@@ -4,9 +4,62 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"errors"
+	"log/slog"
 	"net/http"
+	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 )
+
+const (
+	OpenAICredentialRejectedReason           GatewayFailureReason = "openai_oauth_credential_rejected"
+	OpenAICredentialUnavailableClientMessage                      = "No healthy OpenAI account is currently available; rejected OAuth credentials require sign-in again"
+)
+
+// Exact credential comparison is required: a late rejection must never disable
+// credentials that an administrator or another worker has already replaced.
+type openAIOAuthFailureRepository interface {
+	SetOpenAIOAuthErrorIfCredentialsUnchanged(context.Context, int64, map[string]any, string) (bool, error)
+}
+
+func openAICredentialFailoverError(err error) error {
+	if !isPermanentOpenAIRefreshError(err) {
+		return err
+	}
+	return &UpstreamFailoverError{
+		Stage:             GatewayFailureStageAccountAuth,
+		Scope:             GatewayFailureScopeAccount,
+		Reason:            OpenAICredentialRejectedReason,
+		NextAccountAction: NextAccountRetry,
+		ClientStatusCode:  http.StatusServiceUnavailable,
+		ClientMessage:     OpenAICredentialUnavailableClientMessage,
+	}
+}
+
+func isPermanentOpenAIRefreshError(err error) bool {
+	var rejection *openai.RefreshTokenError
+	return errors.As(err, &rejection) && rejection.Permanent
+}
+
+func (p *OpenAITokenProvider) quarantineRejectedCredentials(ctx context.Context, account *Account) {
+	if p == nil || account == nil || p.refreshAPI.openAIRefreshFailure(account) == nil {
+		return
+	}
+	repo, ok := p.accountRepo.(openAIOAuthFailureRepository)
+	if !ok {
+		return
+	}
+	// Finish the bounded state write even if the downstream disconnects. The
+	// fingerprint guard also excludes stale scheduler snapshots if SQL fails.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := repo.SetOpenAIOAuthErrorIfCredentialsUnchanged(cleanupCtx, account.ID, account.Credentials,
+		"OpenAI OAuth credentials permanently rejected; sign in again")
+	if err != nil {
+		slog.Warn("openai_oauth_credential_quarantine_failed", "account_id", account.ID)
+	}
+}
 
 type openAIRefreshRejection struct {
 	credentials [sha256.Size]byte
@@ -59,6 +112,7 @@ func (p *OpenAITokenProvider) RecordUnauthorizedAfterRefresh(ctx context.Context
 		return
 	}
 	p.refreshAPI.recordOpenAIRefreshFailure(latest, &openai.RefreshTokenError{StatusCode: http.StatusUnauthorized, Permanent: true})
+	p.quarantineRejectedCredentials(ctx, latest)
 	if p.tokenCache != nil {
 		_ = p.tokenCache.DeleteAccessToken(ctx, OpenAITokenCacheKey(latest))
 	}

@@ -986,13 +986,23 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 		if isNonRetryableRefreshError(err) {
 			errorMsg := "Token refresh failed (non-retryable): " + logredact.RedactText(err.Error())
 			isGrokOAuth := account.IsGrokOAuth()
-			if !isGrokOAuth {
+			isOpenAIRejection := account.IsOpenAIOAuth() && isPermanentOpenAIRefreshError(err)
+			if !isGrokOAuth && !isOpenAIRejection {
 				s.notifyAccountSchedulingBlocked(account, time.Time{}, "token_refresh_non_retryable")
 			}
 			s.clearAntigravityForceTokenRefresh(ctx, account, "non_retryable")
 			persistentlyBlocked := false
 			var setErr error
-			if isGrokOAuth {
+			if isOpenAIRejection {
+				conditionalRepo, ok := s.accountRepo.(openAIOAuthFailureRepository)
+				if !ok {
+					return &providerConfigurationRefreshError{err: errors.New("OpenAI OAuth conditional failure repository is not configured")}
+				}
+				persistentlyBlocked, setErr = conditionalRepo.SetOpenAIOAuthErrorIfCredentialsUnchanged(ctx, account.ID, account.Credentials, errorMsg)
+				if setErr == nil && !persistentlyBlocked {
+					return errRefreshSkipped
+				}
+			} else if isGrokOAuth {
 				conditionalRepo, ok := s.accountRepo.(GrokOAuthRefreshMutationRepository)
 				if !ok {
 					return &providerConfigurationRefreshError{
@@ -1020,16 +1030,16 @@ func (s *TokenRefreshService) refreshWithRetryWithRateGate(
 					"account_id", account.ID,
 					"error", setErr,
 				)
-				if isGrokOAuth {
+				if isGrokOAuth || isOpenAIRejection {
 					return &providerCycleContainmentRefreshError{
-						err: fmt.Errorf("failed to conditionally persist Grok OAuth refresh failure: %w", setErr),
+						err: fmt.Errorf("failed to conditionally persist OAuth refresh failure: %w", setErr),
 					}
 				}
 			} else if isGrokOAuth && persistentlyBlocked {
 				s.notifyAccountSchedulingBlocked(account, time.Time{}, "token_refresh_non_retryable")
 			}
 			cacheInvalidationFailed := false
-			if account.Type == AccountTypeOAuth && (!isGrokOAuth || persistentlyBlocked) {
+			if account.Type == AccountTypeOAuth && ((!isGrokOAuth && !isOpenAIRejection) || persistentlyBlocked) {
 				if s.cacheInvalidator == nil {
 					cacheInvalidationFailed = true
 				} else if invalidateErr := s.cacheInvalidator.InvalidateToken(ctx, account); invalidateErr != nil {
@@ -1409,6 +1419,9 @@ func isSharedProviderRefreshError(err error) bool {
 func isNonRetryableRefreshError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isPermanentOpenAIRefreshError(err) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	nonRetryable := []string{

@@ -90,7 +90,12 @@ func TestHTTPToWSHandshake403Fallback(t *testing.T) {
 				if !fallback {
 					require.Error(t, err)
 					require.Zero(t, upstream.callCount)
-					if mode == "already_written" {
+					if mode == "401" {
+						var failover *UpstreamFailoverError
+						require.ErrorAs(t, err, &failover)
+						require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
+						require.False(t, IsResponseCommitted(c), "401 must reach account selection before committing an error")
+					} else if mode == "already_written" {
 						require.Equal(t, "already delivered", recorder.Body.String())
 					} else {
 						require.True(t, IsResponseCommitted(c), "handler must not append a second error")

@@ -145,6 +145,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		// The caller may hold a pre-reauthorization scheduler snapshot.
 		latest, err := p.accountRepo.GetByID(ctx, account.ID)
 		if err != nil || latest == nil || latest.ID != account.ID || !latest.IsActive() || p.refreshAPI.openAIRefreshFailure(latest) != nil {
+			p.quarantineRejectedCredentials(ctx, account)
 			return "", failure
 		}
 		account = latest
@@ -186,6 +187,9 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		if err != nil {
 			var rejection *openai.RefreshTokenError
 			if errors.As(err, &rejection) && rejection.Permanent {
+				if result != nil && result.Account != nil {
+					p.quarantineRejectedCredentials(ctx, result.Account)
+				}
 				return "", rejection
 			}
 			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {

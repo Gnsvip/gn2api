@@ -3630,7 +3630,7 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 }
 
 func credentialFailoverClientResponse(failoverErr *service.UpstreamFailoverError) (int, string) {
-	if failoverErr != nil && failoverErr.Reason == service.OpenAIUpstreamAccessStateReason && strings.TrimSpace(failoverErr.ClientMessage) != "" {
+	if failoverErr != nil && (failoverErr.Reason == service.OpenAIUpstreamAccessStateReason || failoverErr.Reason == service.OpenAICredentialRejectedReason) && strings.TrimSpace(failoverErr.ClientMessage) != "" {
 		status := failoverErr.ClientStatusCode
 		if status <= 0 {
 			status = http.StatusServiceUnavailable
@@ -4008,6 +4008,9 @@ func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failover
 			intendedStatus = http.StatusServiceUnavailable
 			errorType = "api_error"
 			message = service.GrokCredentialUnavailableClientMessage
+			if failoverErr.Reason == service.OpenAICredentialRejectedReason {
+				message = service.OpenAICredentialUnavailableClientMessage
+			}
 			closeStatus = coderws.StatusTryAgainLater
 		} else {
 			switch failoverErr.StatusCode {

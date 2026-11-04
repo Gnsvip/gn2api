@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -45,6 +46,13 @@ func (p *OpenAITokenProvider) RefreshAfterUnauthorized(ctx context.Context, acco
 	ctx = openai.WithRefreshReason(ctx, "unauthorized_recovery")
 	result, err := p.refreshAPI.RefreshIfNeeded(withOAuthRefreshRequestPath(ctx), account, executor, 0)
 	if err != nil {
+		var rejection *openai.RefreshTokenError
+		if errors.As(err, &rejection) && rejection.Permanent {
+			if result != nil && result.Account != nil {
+				p.quarantineRejectedCredentials(ctx, result.Account)
+			}
+			return "", rejection
+		}
 		return "", errors.New("OpenAI OAuth unauthorized recovery failed")
 	}
 	if result == nil || result.LockHeld || result.Account == nil || !result.Account.IsActive() ||
@@ -128,6 +136,13 @@ func (s *OpenAIGatewayService) acquireOpenAIWSWithAuthRecovery(ctx context.Conte
 			s.openAITokenProvider.RecordUnauthorizedAfterRefresh(ctx, owner, strings.TrimPrefix(retry.Headers.Get("Authorization"), "Bearer "))
 		}
 	}
+	var dialErr *openAIWSDialError
+	if errors.As(err, &dialErr) && dialErr.StatusCode == http.StatusUnauthorized {
+		// Keep the dial cause for diagnostics and agent-task recovery, while
+		// exposing the exhausted authentication attempt to account selection.
+		return lease, fmt.Errorf("%w: %w", newOpenAIUpstreamFailoverError(
+			dialErr.StatusCode, dialErr.ResponseHeaders, dialErr.ResponseBody, "", false), dialErr)
+	}
 	return lease, err
 }
 
@@ -199,6 +214,12 @@ func (s *OpenAIGatewayService) refreshOpenAIWSAuthHeaders(ctx context.Context, a
 	}
 	if s.openAITokenProvider.accountRepo != nil {
 		latest, readErr := s.openAITokenProvider.accountRepo.GetByID(ctx, owner.ID)
+		if readErr == nil && latest != nil && latest.ID == owner.ID {
+			if rejection := s.openAITokenProvider.refreshAPI.openAIRefreshFailure(latest); rejection != nil {
+				s.openAITokenProvider.quarantineRejectedCredentials(ctx, latest)
+				return nil, openAICredentialFailoverError(rejection)
+			}
+		}
 		if readErr != nil || latest == nil || latest.ID != owner.ID || !latest.IsActive() || !canRecoverOpenAIOAuth(latest) || latest.GetCredential("chatgpt_account_id") != owner.GetCredential("chatgpt_account_id") {
 			return nil, errors.New("OpenAI OAuth credential state is unavailable")
 		}
@@ -206,7 +227,7 @@ func (s *OpenAIGatewayService) refreshOpenAIWSAuthHeaders(ctx context.Context, a
 	}
 	token, err := s.openAITokenProvider.GetAccessToken(ctx, owner)
 	if err != nil {
-		return nil, err
+		return nil, openAICredentialFailoverError(err)
 	}
 	updated := headers.Clone()
 	updated.Set("Authorization", "Bearer "+token)

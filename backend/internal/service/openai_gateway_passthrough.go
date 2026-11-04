@@ -847,7 +847,7 @@ func shouldFailoverOpenAIPassthroughResponse(account *Account, statusCode int, r
 		return true
 	}
 	switch statusCode {
-	case http.StatusTooManyRequests, 529:
+	case http.StatusUnauthorized, http.StatusTooManyRequests, 529:
 		return true
 	}
 	if account == nil || account.Type != AccountTypeAPIKey {

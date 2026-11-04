@@ -1005,6 +1005,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if c != nil && c.Writer != nil && c.Writer.Written() {
 				break
 			}
+			var credentialFailover *UpstreamFailoverError
+			if errors.As(wsErr, &credentialFailover) && (credentialFailover.IsCredentialFailure() || credentialFailover.StatusCode == http.StatusUnauthorized) {
+				return nil, wsErr
+			}
 			var taskRecoveredErr *agentIdentityTaskRecoveredError
 			if errors.As(wsErr, &taskRecoveredErr) {
 				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)

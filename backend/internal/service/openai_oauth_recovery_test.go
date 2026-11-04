@@ -232,7 +232,11 @@ func TestOpenAIUnauthorizedPoolRecovery(t *testing.T) {
 			req := openAIWSAcquireRequest{Account: a, WSURL: "wss://example.test/responses", Headers: http.Header{"Authorization": {"Bearer rejected"}}}
 			lease, err := s.acquireOpenAIWSWithAuthRecovery(context.Background(), pool, &req)
 			if rejected {
-				require.Error(t, err)
+				var failover *UpstreamFailoverError
+				require.ErrorAs(t, err, &failover)
+				require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
+				require.True(t, failover.ShouldRetryNextAccount())
+				require.False(t, failover.RetryableOnSameAccount)
 			} else {
 				require.NoError(t, err)
 				lease.Release()

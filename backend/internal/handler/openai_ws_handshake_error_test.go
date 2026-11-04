@@ -91,7 +91,11 @@ func TestOpenAIResponsesWSHandshakeFallbackAndSingleError(t *testing.T) {
 					require.True(t, json.Valid(recorder.Body.Bytes()))
 					return
 				}
-				require.Equal(t, int32(1), dials.Load())
+				wantDials := int32(1)
+				if mode == "401" {
+					wantDials = 2 // Both eligible accounts reject their handshake.
+				}
+				require.Equal(t, wantDials, dials.Load())
 				if mode == "edge_403" {
 					require.Len(t, bodies, 1)
 					require.Equal(t, "xhigh", gjson.GetBytes(bodies[0], "reasoning.effort").String())
@@ -104,11 +108,16 @@ func TestOpenAIResponsesWSHandshakeFallbackAndSingleError(t *testing.T) {
 				require.Empty(t, bodies)
 				wantStatus := http.StatusForbidden
 				if mode == "401" {
-					wantStatus = http.StatusUnauthorized
+					wantStatus = http.StatusBadGateway // Exhausted upstream auth failures use the existing HTTP mapping.
 				}
 				require.Equal(t, wantStatus, recorder.Code)
 				require.True(t, json.Valid(recorder.Body.Bytes()), "one JSON error, never JSON followed by a second SSE error: %s", recorder.Body.String())
-				require.True(t, service.IsResponseCommitted(c))
+				require.True(t, c.Writer.Written())
+				if mode == "401" {
+					require.Equal(t, "Upstream authentication failed, please contact administrator", gjson.GetBytes(recorder.Body.Bytes(), "error.message").String())
+				} else {
+					require.True(t, service.IsResponseCommitted(c))
+				}
 				require.NotContains(t, recorder.Body.String(), "Upstream request failed")
 				require.NotContains(t, recorder.Body.String(), "response.failed")
 			})
