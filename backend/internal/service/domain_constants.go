@@ -662,11 +662,12 @@ const (
 	SettingKeyBackendModeEnabled = "backend_mode_enabled"
 
 	// Gateway Forwarding Behavior
-	// SettingKeyOpenAITTFTMode 控制 first_token_ms 的统计口径。
+	// SettingKeyOpenAITTFTMode 控制普通 HTTP 链路 first_token_ms 的统计口径。
 	SettingKeyOpenAITTFTMode = "openai_ttft_mode"
 	OpenAITTFTModeSemantic   = "semantic"
 	OpenAITTFTModeVisible    = "visible"
-	OpenAITTFTModeFirstEvent = "first_event"
+	// WS ingress/egress (including HTTP bridges) uses this fixed observation label.
+	OpenAITTFTModeWSSemantic = "ws_semantic"
 	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
 	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
 	// SettingKeyEnableMetadataPassthrough 是否透传客户端原始 metadata.user_id（默认 false）

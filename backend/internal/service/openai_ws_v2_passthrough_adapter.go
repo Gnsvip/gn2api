@@ -1201,7 +1201,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		firstTurnStartedAt = hooks.InitialTurnStartedAt
 	}
 	failureAccountSideEffectsApplied := false
-	ttftMode := s.openAITTFTMode(ctx)
+	// OnTurnComplete fires before the terminal write. Only observe its copied
+	// result after that write succeeds, using this turn's recorder (not Gin's
+	// first-turn recorder). Both callbacks run on the upstream relay goroutine.
+	var pendingTrafficResult *OpenAIForwardResult
+	var pendingTrafficBlocked bool
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
 		Ctx:                ctx,
 		ClientConn:         policyClientConn,
@@ -1209,7 +1213,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		FirstClientMessage: firstClientMessage,
 		Options: openaiwsv2.RelayOptions{
 			StartsTTFT: func(payload []byte, eventType string) bool {
-				return openAIStreamDataStartsTTFT(string(payload), eventType, false, ttftMode)
+				return openAIWSDataStartsTTFT(payload, eventType)
 			},
 			WriteTimeout:       s.openAIWSWriteTimeout(),
 			FirstTurnStartedAt: firstTurnStartedAt,
@@ -1280,6 +1284,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					turnResult.Usage.OutputTokens,
 					turnResult.Usage.CacheReadInputTokens,
 				)
+				turnResult.trafficObservationHandled = true
+				copyResult := *turnResult
+				pendingTrafficResult = &copyResult
+				pendingTrafficBlocked = GetOpsCyberPolicy(c) != nil
 				if hooks != nil && hooks.AfterTurn != nil {
 					hooks.AfterTurn(turnNo, turnResult, nil)
 				}
@@ -1296,6 +1304,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					markOpenAIWSClientVisibleFailure(c, eventType, payload)
 				}
 				if msgType == coderws.MessageText && openAIWSPassthroughIsTerminalOutput(payload) {
+					if pendingTrafficResult != nil {
+						_, attempt := timingFrames.current()
+						s.observeOpenAITraffic(c, account, pendingTrafficResult, writeErr, attempt.Completion(), pendingTrafficBlocked)
+						pendingTrafficResult = nil
+					}
 					turnLifecycle.finishTerminalWrite(writeErr == nil, clientFrameConn.markTurnCompleted)
 				}
 			},

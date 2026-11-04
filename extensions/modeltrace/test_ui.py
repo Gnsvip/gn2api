@@ -38,6 +38,12 @@ states['8']['model'] = ''  # A new account must prefer astra after live catalog 
 states['7']['history'][-1].update(requests=4, valid_samples=3, insufficient_samples=1)
 live_models = ['gpt-6-sol', 'gpt-6-astra', 'gpt-6.1-sol']
 writes = []
+traffic_requests = []
+traffic_error = False
+traffic_data = dict(mode='observe_only', started_at='2026-11-04T00:00:00Z', generated_at='2026-11-04T01:00:00Z',
+    capacity=100000, capacity_limited=False, window_complete=True, valid_samples=24, excluded={'forward_error': 2, 'missing_ttft': 1},
+    groups=[dict(model='gpt-6-astra', effort='xhigh', tier='unspecified', transport='websocket', mode='ws_semantic', context='128–230k',
+        stats=dict(count=24, mean_ms=2500, p50_ms=1800, p95_ms=6500), earlier=dict(count=12, p50_ms=1600), later=dict(count=12, p50_ms=2000))], omitted_groups=0)
 errors = []
 fail_prompt_save = False
 accept_discard = True
@@ -61,7 +67,10 @@ with sync_playwright() as p:
         dialog.accept() if accept_discard else dialog.dismiss()
     page.on('dialog', handle_dialog)
     def route(r):
-        if '/api/v1/admin/accounts/' in r.request.url:
+        if '/traffic-observation' in r.request.url:
+            traffic_requests.append((r.request.method, parse_qs(urlsplit(r.request.url).query)))
+            r.fulfill(status=503 if traffic_error else 200, json={'code': 503, 'message': '暂时无法读取'} if traffic_error else {'code': 0, 'data': traffic_data})
+        elif '/api/v1/admin/accounts/' in r.request.url:
             r.fulfill(json={'code': 0, 'data': [{'id': model} for model in live_models]})
         elif '/custom/modeltrace/api/' in r.request.url:
             if '/artifacts/' in r.request.url:
@@ -563,6 +572,44 @@ with sync_playwright() as p:
     assert 'Tibo 题：上游繁忙' in page.locator('[role=tabpanel]:visible .mt-result > summary').inner_text()
     page.locator('[role=tabpanel]:visible .mt-result > summary').click()
     assert page.locator('[role=tabpanel]:visible .mt-result').inner_text().count(failure_message) == 1
+    page.get_by_role('button', name='关闭', exact=True).click()
+    # Observation is GET-only: never changes scheduled questions or sends probes.
+    paid_writes = len(writes)
+    page.locator('[data-row-id="8"] .mt-label').click()
+    page.get_by_role('tab', name='模型归因', exact=True).click()
+    toggle = page.get_by_role('switch', name='启用定时模型归因', exact=True)
+    assert toggle.locator('..').evaluate('(e) => e.parentElement.classList.contains("mt-panel-top")')
+    assert toggle.bounding_box()['y'] < page.get_by_label('检测模型', exact=True).bounding_box()['y']
+    page.get_by_role('tab', name='首字观察', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('有效样本 24')")
+    panel = page.locator('#mt-panel-traffic')
+    assert '观察中 · 不自动停调度' in panel.inner_text()
+    assert 'P50 1.80 秒' in panel.inner_text()
+    assert 'WS semantic（含推理信号）' in panel.inner_text()
+    assert '转发失败 2' in panel.inner_text()
+    assert panel.locator('input').count() == 0
+    assert panel.get_by_role('switch').count() == 0
+    assert page.locator('.mt-actions .mt-primary').is_hidden()
+    assert len(writes) == paid_writes
+    for width in (1160, 390):
+        page.set_viewport_size({'width': width, 'height': 844})
+        assert panel.locator('.mt-body').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
+        page.locator('dialog').screenshot(path=str(out.with_name(f'modeltrace-traffic-observation-{width}.png')))
+    traffic_data.update(groups=[], valid_samples=0, excluded={}, window_complete=False)
+    page.get_by_label('首字观察窗口', exact=True).select_option('1440')
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('暂无有效样本')")
+    assert '尚未收满所选窗口' in panel.inner_text()
+    assert 'P50 0.00' not in panel.inner_text()
+    traffic_error = True
+    page.get_by_role('button', name='刷新统计', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic .mt-error').textContent === '暂时无法读取'")
+    assert '观察中' not in panel.inner_text()
+    traffic_error = False
+    page.get_by_role('button', name='刷新统计', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('暂无有效样本')")
+    assert all(method == 'GET' for method, _ in traffic_requests), traffic_requests
+    assert traffic_requests[-1][1] == dict(window_minutes=['1440'])
+    assert len(writes) == paid_writes
     page.get_by_role('button', name='关闭', exact=True).click()
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")

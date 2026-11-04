@@ -81,6 +81,11 @@ func (u *openAICredentialHandlerUpstream) DoWithTLS(r *http.Request, p string, i
 
 func newOpenAICredentialHandler(t *testing.T, healthyType string, configure ...func(*config.Config, []service.Account)) (*openAICredentialHandlerRepo, *openAICredentialHandlerUpstream, *openAICredentialHandlerRefresher, *gin.Engine) {
 	t.Helper()
+	return newOpenAICredentialHandlerWithBilling(t, healthyType, nil, nil, nil, configure...)
+}
+
+func newOpenAICredentialHandlerWithBilling(t *testing.T, healthyType string, balanceCache *handlerInflightCache, usageRepo service.UsageLogRepository, billingRepo service.UsageBillingRepository, configure ...func(*config.Config, []service.Account)) (*openAICredentialHandlerRepo, *openAICredentialHandlerUpstream, *openAICredentialHandlerRefresher, *gin.Engine) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	groupID := int64(901)
 	accounts := []service.Account{
@@ -114,12 +119,22 @@ func newOpenAICredentialHandler(t *testing.T, healthyType string, configure ...f
 	for _, apply := range configure {
 		apply(cfg, accounts)
 	}
-	billing := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	var billingCache service.BillingCache
+	if balanceCache != nil {
+		cfg.RunMode = config.RunModeStandard
+		cfg.Default.RateMultiplier = 1
+		cfg.Billing.InflightReservation = config.InflightReservationConfig{Enabled: true, TTLSeconds: 60, FailClosedOnUnpriced: true}
+		billingCache = balanceCache
+	}
+	billing := service.NewBillingCacheService(billingCache, nil, nil, nil, nil, nil, cfg, nil)
 	t.Cleanup(billing.Stop)
-	gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, cfg, nil, nil, service.NewBillingService(cfg, nil), nil, billing, upstream, &service.DeferredService{}, provider, nil, nil, nil, nil, nil, nil)
+	gateway := service.NewOpenAIGatewayService(repo, usageRepo, billingRepo, nil, nil, nil, nil, cfg, nil, nil, service.NewBillingService(cfg, nil), nil, billing, upstream, &service.DeferredService{}, provider, nil, nil, nil, nil, nil, nil)
 	cache := &concurrencyCacheMock{acquireUserSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil }, acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil }}
 	h := NewOpenAIGatewayHandler(gateway, service.NewConcurrencyService(cache), billing, &service.APIKeyService{}, nil, nil, nil, nil, cfg)
 	key := &service.APIKey{ID: 902, GroupID: &groupID, User: &service.User{ID: 903, Status: service.StatusActive}, Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive}}
+	if balanceCache != nil {
+		key.Group.RateMultiplier = 1
+	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set(string(middleware.ContextKeyAPIKey), key)

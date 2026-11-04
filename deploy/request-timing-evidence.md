@@ -45,7 +45,18 @@
 
 覆盖 HTTP/SSE（普通与透传）、HTTP→WS、原生 WS 连接池、WS 透传和 WS→HTTP 桥接。WS 透传后续轮次从收到 `response.create` 开始记录，包含准入处理，不含此前的客户端空闲。
 
-v0.2.56 起，Chat Completions → Responses → Chat Completions 的流式转换也接入上述观察器，仍使用 HTTP/SSE。该分支的 `first_token_ms` 遵守全局 `visible` / `semantic` 设置；`visible` 可包含推理内容或工具输入，并不等同于正文。结构事件、空增量、无效 JSON、仅终止事件不会伪造 visible 首字。转换后的内容实际写出及 Flush 返回单独计时，包括被暂存后释放的内容。
+v0.2.56 起，Chat Completions → Responses → Chat Completions 的流式转换也接入上述观察器，仍使用 HTTP/SSE。该分支的 `first_token_ms` 遵守 HTTP 的 `visible` / `semantic` 设置；`visible` 可包含推理内容或工具输入，并不等同于正文。结构事件、空增量、无效 JSON、仅终止事件不会伪造 visible 首字。转换后的内容实际写出及 Flush 返回单独计时，包括被暂存后释放的内容。
+
+## HTTP 与 WS 的首字口径
+
+按实际出站到上游的协议区分，不按客户端入口或用量表的 WS 标记猜测：
+
+- HTTP/SSE 默认 `semantic`：跳过 `response.created`、`response.queued`、`response.in_progress` 等开始处理通知，首次语义事件记时；空的 `response.output_item.added` 也可能触发。仍可显式选择 `visible`。
+- WS 固定使用 `ws_semantic`：收到类型明确的 reasoning item，或 summary_text / reasoning_text part 即记时，即使正文尚空；非空字符串的推理、正文、工具或媒体内容也可触发。不受普通 HTTP 设置影响。开始处理通知、心跳、未知事件、空/null/对象等非法 delta 不触发；单独的终止帧不填首字。
+- HTTP 入口转 WS 上游使用 WS 口径；原生 WS 入口桥接 HTTP 上游也使用 WS semantic（按实际出站 HTTP、计时口径 ws_semantic 单独分组）。后续 WS 轮次分别重新计时。
+- 已移除将开始处理通知计作首字的 `first_event` 选项。旧配置读取时归一化为 `semantic`，新写入只接受 `semantic` / `visible`。历史用量记录不重算。
+
+WS semantic 是首次推理活动或内容信号，不是严格的正文可见时间。例如推理条目在 1.2 秒到达、正文在 10 秒到达，首字为 1.2 秒，正文里程碑仍为 10 秒。该规则参考 ranxi2001/sub2api v2.19.4；旧版本与本版本的 WS 首字不能直接混作同口径基线。独立的 `first_event_ms`、`first_visible_ms`、`first_text_ms` 诊断里程碑继续分别记录。诊断字段 `first_event_ms` 不是已移除的统计选项。计时判定不参与响应提交、重试、超时或刷出决策。
 
 仅已接入事件观察器的链路创建耗时尝试。Chat 非流式缓冲转换、其他未接入的兼容路径和账号用量查询仍只保留既有日志，不会因缺少 Responses 终止事件而记为 `incomplete`。v0.2.53 曾错误纳入这些调用；调查该版本期间的摘要时，须结合入口路径确认，不能仅凭这类摘要认定请求失败。v0.2.54 已限制采集范围。
 

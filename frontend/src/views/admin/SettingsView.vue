@@ -5325,9 +5325,6 @@
                   class="input mt-2 w-full"
                   data-testid="openai-ttft-mode"
                 >
-                  <option value="first_event">
-                    {{ t("admin.settings.gatewayForwarding.openaiTTFTModeFirstEvent") }}
-                  </option>
                   <option value="visible">
                     {{ t("admin.settings.gatewayForwarding.openaiTTFTModeVisible") }}
                   </option>
@@ -9978,7 +9975,7 @@ const form = reactive<SettingsForm>({
   openai_advanced_scheduler_weight_previous_response: "",
   openai_advanced_scheduler_weight_session_sticky: "",
   // Gateway forwarding behavior
-  openai_ttft_mode: "visible",
+  openai_ttft_mode: "semantic",
   enable_fingerprint_unification: true,
   enable_metadata_passthrough: false,
   enable_cch_signing: false,
@@ -11011,6 +11008,8 @@ async function loadSettings() {
   loadFailed.value = false;
   try {
     const settings = await adminAPI.settings.getSettings();
+    settings.openai_ttft_mode =
+      settings.openai_ttft_mode === "visible" ? "visible" : "semantic";
     settings.payment_load_balance_strategy =
       settings.payment_load_balance_strategy || "round-robin";
     // Only assign non-null values from backend (null means unconfigured, keep defaults)
@@ -11623,8 +11622,7 @@ async function saveSettings() {
       max_claude_code_version: form.max_claude_code_version,
       allow_ungrouped_key_scheduling: form.allow_ungrouped_key_scheduling,
       openai_ttft_mode:
-        ["semantic", "first_event"].includes(form.openai_ttft_mode)
-          ? form.openai_ttft_mode : "visible",
+        form.openai_ttft_mode === "visible" ? "visible" : "semantic",
       enable_fingerprint_unification: form.enable_fingerprint_unification,
       enable_metadata_passthrough: form.enable_metadata_passthrough,
       enable_cch_signing: form.enable_cch_signing,

@@ -85,6 +85,7 @@ type Attempt struct {
 	lastEvent, lastContent *int64
 	pendingContent         bool
 	ended                  bool
+	ttftMode               string
 }
 
 func New(start time.Time, requestID, clientRequestID string, turn int) *Recorder {
@@ -143,6 +144,37 @@ func (r *Recorder) Current() *Attempt {
 		return nil
 	}
 	return r.attempts[len(r.attempts)-1]
+}
+
+// Completion is a read-only copy for live statistics. It does not finish the
+// recorder or change which requests qualify for diagnostic files.
+type Completion struct {
+	AccountID                                                   int64
+	Number                                                      int
+	Transport, Outcome, Failure, Terminal, ResponseID, TTFTMode string
+	Status                                                      int
+}
+
+// SetTTFTMode captures the HTTP metric selected at stream start, so a settings
+// change during a long request cannot relabel the finished sample.
+func (a *Attempt) SetTTFTMode(mode string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ttftMode = mode
+}
+
+func (a *Attempt) Completion() Completion {
+	if a == nil {
+		return Completion{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return Completion{AccountID: a.d.AccountID, Number: a.d.Number,
+		Transport: a.d.Transport, Outcome: a.d.Outcome, Failure: a.d.Failure,
+		Terminal: a.d.Terminal, TTFTMode: a.ttftMode, ResponseID: a.d.ResponseID, Status: a.d.Status}
 }
 func (r *Recorder) Finish(status int) (Summary, bool) {
 	if r == nil {

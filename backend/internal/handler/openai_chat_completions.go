@@ -263,6 +263,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
 		var cyberBlockBodyChat []byte
+		h.gatewayService.ObserveOpenAITraffic(c, account, result, err)
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyChat = body
 		}

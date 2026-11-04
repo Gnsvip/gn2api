@@ -84,9 +84,10 @@ func TestReserveInflightBalance_UnpricedFailOpenByDefaultFailClosedOptIn(t *test
 // handlerInflightCache 内存版余额缓存 + 在途预留（语义同 Redis Lua）。
 type handlerInflightCache struct {
 	service.BillingCache
-	mu      sync.Mutex
-	balance float64
-	res     map[string]float64
+	mu           sync.Mutex
+	balance      float64
+	res          map[string]float64
+	reservations int
 }
 
 func newHandlerInflightCache(balance float64) *handlerInflightCache {
@@ -106,6 +107,7 @@ func (m *handlerInflightCache) GetUserPlatformQuotaCache(context.Context, int64,
 func (m *handlerInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id string, amount, balance float64, _ time.Duration) (bool, float64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.reservations++
 	sum := 0.0
 	for _, v := range m.res {
 		sum += v
@@ -128,6 +130,13 @@ func (m *handlerInflightCache) count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.res)
+}
+
+func (m *handlerInflightCache) DeductUserBalance(_ context.Context, _ int64, amount float64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.balance -= amount
+	return nil
 }
 
 func TestWrapUsageRecordTaskContext_HandsReservationToBillingTask(t *testing.T) {

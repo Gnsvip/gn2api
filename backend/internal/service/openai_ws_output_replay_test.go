@@ -129,14 +129,15 @@ func TestOpenAITTFTIgnoresQuotaNotifications(t *testing.T) {
 }
 
 func TestOpenAITTFTDefaultAndExplicitModes(t *testing.T) {
-	for _, value := range []string{"", "invalid", " VISIBLE "} {
-		require.Equal(t, OpenAITTFTModeVisible, normalizeOpenAITTFTMode(value))
+	for _, value := range []string{"", "invalid", "first_event", " FIRST_EVENT "} {
+		require.Equal(t, OpenAITTFTModeSemantic, normalizeOpenAITTFTMode(value))
 	}
+	require.Equal(t, OpenAITTFTModeVisible, normalizeOpenAITTFTMode(" VISIBLE "))
 	require.Equal(t, OpenAITTFTModeSemantic, normalizeOpenAITTFTMode(" SEMANTIC "))
 	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{})
 	t.Cleanup(func() { gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{}) })
 	svc := &OpenAIGatewayService{}
-	require.Equal(t, OpenAITTFTModeVisible, svc.openAITTFTMode(context.Background()))
+	require.Equal(t, OpenAITTFTModeSemantic, svc.openAITTFTMode(context.Background()))
 }
 
 func TestOpenAIWSReplayFieldDiagnosticsAreBounded(t *testing.T) {

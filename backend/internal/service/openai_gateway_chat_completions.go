@@ -915,6 +915,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	var firstTokenMs *int
 	ttftMode := s.openAITTFTMode(c.Request.Context())
 	timing := requesttiming.FromGin(c).Current()
+	timing.SetTTFTMode(ttftMode)
 	defer timing.End()
 	clientDisconnected := false
 	clientOutputStarted := false

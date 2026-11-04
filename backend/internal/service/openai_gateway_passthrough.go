@@ -1347,7 +1347,7 @@ func openAIStreamDataStartsSemanticTTFT(data, eventType string) bool {
 }
 
 func (s *OpenAIGatewayService) openAITTFTMode(ctx context.Context) string {
-	mode := OpenAITTFTModeVisible
+	mode := OpenAITTFTModeSemantic
 	if s != nil && s.settingService != nil {
 		mode = s.settingService.GetOpenAITTFTMode(ctx)
 	} else if cached, ok := gatewayForwardingCache.Load().(*cachedGatewayForwardingSettings); ok && cached != nil {
@@ -1366,11 +1366,6 @@ func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode s
 	// Do not turn its completion time (or an error) into a fabricated TTFT.
 	if eventType == "error" || eventType == "codex.rate_limits" || isOpenAIWSTerminalEvent(eventType) {
 		return false
-	}
-	if mode == OpenAITTFTModeFirstEvent {
-		// Measure the first upstream Responses event, including processing
-		// notifications. This is a metric only, never a client-output/commit guard.
-		return strings.HasPrefix(eventType, "response.") && gjson.Valid(data)
 	}
 	if mode == OpenAITTFTModeVisible {
 		return openAIStreamDataStartsVisibleOutput(data, eventType)
@@ -1970,6 +1965,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	var firstTokenMs *int
 	responseID := ""
 	ttftMode := s.openAITTFTMode(ctx)
+	timing.SetTTFTMode(ttftMode)
 	clientDisconnected := false
 	defer func() {
 		if clientDisconnected {

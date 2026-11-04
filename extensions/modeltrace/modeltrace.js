@@ -32,7 +32,7 @@
     .mt-badge{font-size:11px;color:#64748b;background:#f1f5f9;border-radius:12px;padding:2px 9px;white-space:nowrap}.mt-badge[data-enabled=true]{background:#ecfdf5;color:#047857}
     .mt-body{padding:0 18px;overflow:auto;min-height:0}.mt-dialog label{font-size:13px}
     .mt-tabs{display:flex;gap:6px;padding:0 18px 10px;flex-shrink:0}.mt-tab{position:relative;flex:1;padding:7px;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}.mt-tab[aria-selected=true]{background:#ecfdf5;color:#047857}.dark .mt-tab[aria-selected=true]{background:#064e3b;color:#a7f3d0}.mt-tab:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}.mt-tab:disabled{opacity:.5;cursor:wait}.mt-tab[data-dirty=true]::after{content:'';position:absolute;right:7px;top:7px;width:6px;height:6px;border-radius:50%;background:#dc2626}
-    .mt-settings-dialog{width:min(760px,calc(100vw - 24px))}.mt-settings-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}.mt-panel-status{margin:0 0 10px!important}.mt-save-error:not(.mt-error){color:#059669}.mt-inline-toggle{display:flex;align-items:center;gap:5px;padding-bottom:8px;white-space:nowrap}.mt-header h3{margin-right:auto}.mt-actions>.mt-note{margin-right:auto;align-self:center}.mt-tab[data-dirty=true]::after{content:'未保存';font-size:10px;position:static;display:inline;margin-left:8px;width:auto;height:auto;background:transparent;color:#b45309}
+    .mt-settings-dialog{width:min(760px,calc(100vw - 24px))}.mt-settings-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden}.mt-panel-status{margin:0 0 10px!important}.mt-save-error:not(.mt-error){color:#059669}.mt-inline-toggle{display:flex;align-items:center;gap:6px;white-space:nowrap}.mt-panel-top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 10px}.mt-panel-top .mt-panel-status{margin:0!important}.mt-panel-top input{accent-color:#059669}.mt-setting-grid.mt-two-columns{grid-template-columns:repeat(2,minmax(0,1fr))}.mt-traffic-fields{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.mt-dialog .mt-traffic-fields select{width:auto;margin:0}.mt-traffic-refresh{padding:8px 12px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;cursor:pointer}.mt-traffic-refresh:disabled{opacity:.5;cursor:wait}.mt-traffic-result{border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:8px 0;overflow-wrap:anywhere}.mt-traffic-result p{margin:5px 0}.mt-header h3{margin-right:auto}.mt-actions>.mt-note{margin-right:auto;align-self:center}.mt-tab[data-dirty=true]::after{content:'未保存';font-size:10px;position:static;display:inline;margin-left:8px;width:auto;height:auto;background:transparent;color:#b45309}
     .mt-dialog select{display:block;width:100%;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit}
     .mt-dialog select option{color:#334155;background:#fff}.mt-dialog .mt-note{font-size:12px;color:#64748b}.dark .mt-dialog .mt-note{color:#94a3b8}
     .mt-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:10px 18px;flex-shrink:0;border-top:1px solid #e2e8f066}.mt-actions button{padding:7px 16px;border-radius:6px;border:1px solid #cbd5e1;background:transparent;color:inherit;cursor:pointer;font:inherit}
@@ -43,6 +43,7 @@
     .mt-result>summary{display:flex;align-items:center;gap:8px;padding:10px 0;cursor:pointer;list-style:none;min-width:0}.mt-result>summary::-webkit-details-marker{display:none}
     .mt-result>summary::after{content:'›';color:#94a3b8;margin-left:auto}.mt-result[open]>summary::after{transform:rotate(90deg)}
     .mt-result time{color:#64748b;white-space:nowrap;font-variant-numeric:tabular-nums;flex-shrink:0}.mt-result-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:1;min-width:54px}.mt-result-inline{display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden;white-space:nowrap;color:#64748b}.mt-result-case{max-width:145px;overflow:hidden;text-overflow:ellipsis;flex-shrink:1}.mt-result-case button{max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}.mt-result>summary::after{flex-shrink:0}
+    .mt-prompt-history .mt-result>summary{display:grid;grid-template-columns:8px max-content minmax(0,1fr) 12px;column-gap:8px;row-gap:3px}.mt-prompt-history .mt-result-inline{grid-column:2/4;grid-row:2}.mt-prompt-history .mt-result-inline:empty{display:none}.mt-prompt-history .mt-result>summary::after{grid-column:4;grid-row:1}
     .mt-result pre{margin:0 0 10px 17px;white-space:pre-wrap;overflow-wrap:anywhere;color:#64748b;font:12px/1.7 system-ui}
     .mt-answer-links{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 10px 17px;gap:5px}.mt-answer-text{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 system-ui}.mt-evidence-events{max-height:45vh;overflow:auto}.mt-evidence-paging{display:flex;gap:14px;align-items:center;margin:10px 0}.mt-evidence-entry{border-bottom:1px solid #e2e8f066}
     .mt-help{margin:14px 0;font-size:12px;color:#64748b}.mt-help>summary{cursor:pointer;width:fit-content}.mt-help p{line-height:1.7}
@@ -557,6 +558,7 @@
         page.button.title = dirty ? '本页有未保存修改' : '';
       }
       saveAllButton.dataset.dirty = String(forms.some(form => form.dirty()));
+      saveAllButton.hidden = dialog.dataset.activeTab === 'traffic' && !forms.some(form => form.dirty());
     };
     const registerForm = (key, panel, form) => {
       forms.push({ ...form, key, panel });
@@ -575,7 +577,7 @@
     const refreshStatus = () => {
       const current = states.get(id);
       const enabled = !!(current?.enabled || current?.prompt_test?.enabled);
-      badge.textContent = current?.running || current?.prompt_test?.running ? '检测中' : enabled ? '已开启' : '已关闭';
+      badge.textContent = dialog.dataset.activeTab === 'traffic' ? '只观察' : current?.running || current?.prompt_test?.running ? '检测中' : enabled ? '已开启' : '已关闭';
       badge.dataset.enabled = String(enabled);
       for (const status of dialog.querySelectorAll('[data-mode-status]')) {
         const mode = status.dataset.modeStatus === 'custom' ? current?.prompt_test : current;
@@ -601,6 +603,8 @@
     })();
     const pages = [];
     const selectTab = (key, focus = false) => {
+      dialog.dataset.activeTab = key; refreshStatus(); refreshDirty();
+      if (!forms.some(form => form.dirty())) footerNotice.textContent = key === 'traffic' ? '此页只读，无需保存' : '';
       for (const page of pages) {
         const selected = page.key === key;
         page.panel.hidden = !selected;
@@ -610,9 +614,10 @@
       }
     };
     for (const [key, name, build] of [
-      ['attribution', '模型归因', buildAttributionPanel], ['custom', '自定义题目', buildPromptPanel]
+      ['attribution', '模型归因', buildAttributionPanel], ['custom', '自定义题目', buildPromptPanel], ['traffic', '首字观察', buildTrafficPanel]
     ]) {
       if (key === 'custom' && !state.prompt_test) continue;
+      if (key === 'traffic' && state.platform && state.platform !== 'openai') continue;
       const button = el('button', 'mt-tab', name); button.type = 'button'; button.id = 'mt-tab-' + key;
       button.setAttribute('role', 'tab'); button.setAttribute('aria-controls', 'mt-panel-' + key);
       const panel = el('section', 'mt-settings-panel'); panel.id = 'mt-panel-' + key;
@@ -655,6 +660,73 @@
     document.body.append(dialog); dialog.showModal();
   }
 
+  function buildTrafficPanel(id, dialog, panel) {
+    const body = el('div', 'mt-body');
+    const top = el('div', 'mt-panel-top');
+    const status = el('p', 'mt-note', '正在读取观察数据…');
+    const controls = el('div', 'mt-traffic-fields');
+    const windowSelect = el('select'); windowSelect.setAttribute('aria-label', '首字观察窗口');
+    for (const [value, name] of [[60, '最近 1 小时'], [360, '最近 6 小时'], [1440, '最近 24 小时']]) {
+      const option = el('option', '', name); option.value = String(value); windowSelect.append(option);
+    }
+    const refresh = el('button', 'mt-traffic-refresh', '刷新统计'); refresh.type = 'button';
+    controls.append(windowSelect, refresh); top.append(status, controls);
+    const note = el('p', 'mt-note', '只观察承接用户请求的上游账号，不额外发题、不取消请求、不自动停调度。无需填写阈值，首字慢也不直接判定模型降智。');
+    const timing = el('p', 'mt-note', '按实际出站和计时口径分组：普通 HTTP 使用 semantic 或 visible；WS 链路（含 HTTP 回退）收到明确推理信号或非空内容即记时，开始处理通知、空 delta 不算。只比较同模型、档位、上下文区间和口径。缺少完整链路证据的兼容请求不纳入分布。');
+    const coverage = el('p', 'mt-note');
+    const totals = el('p', 'mt-note');
+    const exclusions = el('p', 'mt-note');
+    const rows = el('div', 'mt-traffic-results');
+    const error = el('p', 'mt-error');
+    body.append(top, note, timing, coverage, totals, exclusions, rows, error); panel.append(body);
+    const seconds = value => value == null ? '—' : (Number(value) / 1000).toFixed(2) + ' 秒';
+    const time = value => new Date(value).toLocaleString('zh-CN', { hour12: false });
+    const reasons = { cancelled: '取消/断开', policy_blocked: '策略拦截', forward_error: '转发失败', missing_result: '无结果',
+      nonstream: '非流式', media_output: '媒体生成', missing_trace: '缺少完整链路证据', retried: '含重试', incomplete: '未完整完成',
+      missing_ttft: '无首字', invalid_ttft: '计时无效', insufficient_output: '输出不足', missing_metric: '口径不明' };
+    let sequence = 0;
+    const load = async () => {
+      const request = ++sequence;
+      refresh.disabled = true; error.textContent = ''; status.textContent = '正在读取观察数据…';
+      rows.replaceChildren(); totals.textContent = coverage.textContent = exclusions.textContent = '';
+      try {
+        const currentToken = token();
+        const response = await fetch('/api/v1/admin/accounts/' + id + '/traffic-observation?window_minutes=' + windowSelect.value, {
+          headers: { Authorization: 'Bearer ' + currentToken }, cache: 'no-store', signal: AbortSignal.timeout(15000)
+        });
+        const data = await response.json();
+        if (request !== sequence || !dialog.open) return;
+        if (currentToken !== token()) throw new Error('登录状态已变化');
+        if (!response.ok || data.code !== 0) throw new Error(data.message || '无法读取观察数据');
+        const view = data.data;
+        if (view?.mode !== 'observe_only' || !Array.isArray(view.groups)) throw new Error('网关尚未支持首字观察，请先更新后端');
+        status.textContent = '观察中 · 不自动停调度';
+        coverage.textContent = '本次采集始于 ' + time(view.started_at) + '。仅保留最近 24 小时、全进程最多 ' + Number(view.capacity).toLocaleString() + ' 条数值元数据；不落盘，服务重启会清空。'
+          + (view.capacity_limited ? ' 容量已达上限，本窗口较早样本已淘汰。' : !view.window_complete ? ' 尚未收满所选窗口。' : ' 已覆盖所选时间窗口。');
+        const omitted = Object.values(view.excluded || {}).reduce((total, value) => total + Number(value), 0);
+        totals.textContent = '有效样本 ' + view.valid_samples + ' · 未纳入分布 ' + omitted + ' · 更新于 ' + time(view.generated_at);
+        exclusions.textContent = Object.entries(view.excluded || {}).map(([key, count]) => (reasons[key] || key) + ' ' + count).join(' · ');
+        if (!view.groups.length) rows.append(el('p', 'mt-note', '暂无有效样本，等待用户正常使用；没有数据不代表首字为 0 秒。'));
+        for (const group of view.groups) {
+          const row = el('div', 'mt-traffic-result');
+          const mode = group.mode === 'ws_semantic' ? 'WS semantic（含推理信号）' : group.mode;
+          const effort = group.effort === 'unspecified' ? '档位未指定' : group.effort;
+          const tier = group.tier === 'unspecified' ? '服务档位未指定' : group.tier;
+          row.append(el('strong', '', group.model + ' · ' + effort));
+          row.append(el('p', 'mt-note', (group.transport === 'websocket' ? 'WS' : 'HTTP') + ' · ' + mode + ' · 上下文 ' + group.context + ' tokens · ' + tier));
+          row.append(el('p', '', '样本 ' + group.stats.count + ' · 平均 ' + seconds(group.stats.mean_ms) + ' · P50 ' + seconds(group.stats.p50_ms) + ' · P95 ' + seconds(group.stats.p95_ms)));
+          row.append(el('p', 'mt-note', '窗口前半段 P50 ' + seconds(group.earlier.p50_ms) + '（' + group.earlier.count + ' 次） → 后半段 ' + seconds(group.later.p50_ms) + '（' + group.later.count + ' 次）'));
+          rows.append(row);
+        }
+        rows.append(el('p', 'mt-note', 'P50 为中位数；P95 表示约 95% 的样本不超过此耗时。样本少时仅供观察，不生成自动停用阈值。'
+          + (view.omitted_groups ? ' 当前仅展示样本最多的 50 组，另有 ' + view.omitted_groups + ' 组。' : '')));
+      } catch (e) {
+        if (request === sequence && dialog.open) { status.textContent = '暂不可用'; error.textContent = e.message; }
+      } finally { if (request === sequence) refresh.disabled = false; }
+    };
+    refresh.addEventListener('click', load); windowSelect.addEventListener('change', load); load();
+  }
+
   function buildAttributionPanel(id, dialog, panel, loadModels, registerForm) {
     let state = states.get(id);
     const body = el('div', 'mt-body');
@@ -675,7 +747,8 @@
     select.disabled = !state.available;
     label.append(select);
     const effort = effortField(state.reasoning_effort, '归因推理等级');
-    const settingsGrid = el('div', 'mt-setting-grid'); settingsGrid.append(label, effort.label, enabledLabel);
+    const settingsGrid = el('div', 'mt-setting-grid mt-two-columns'); settingsGrid.append(label, effort.label);
+    const top = el('div', 'mt-panel-top'); top.append(enabledLabel, status);
     const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟，只跑一轮，不自动补采或复测。若检测超过设置的间隔，完成后再等一个间隔，避免连续补跑。修改推理等级会取消旧轮次后续请求；已发出的请求可能已计费。');
     const bankNote = el('p', 'mt-note', '当前指纹库尚未完成各档位校准，候选分数不证明实际型号。开启自动停止后，仍按你设置的连续不符轮数停止调度。');
     const mapping = el('p', 'mt-note');
@@ -795,7 +868,7 @@
     dialog.addEventListener('mt-save-end', refreshAvailability);
     body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
     help.append(bankNote, budgetNote);
-    body.append(status, settingsGrid, catalogNote, mapping, schedule, estimate, policyNotes, reason, historyHead, list, empty, help, error);
+    body.append(top, settingsGrid, catalogNote, mapping, schedule, estimate, policyNotes, reason, historyHead, list, empty, help, error);
     panel.append(body); refreshAvailability();
     const serialize = value => JSON.stringify(value);
     const form = {
@@ -961,10 +1034,11 @@
       const option = el('option', '', text); option.value = value; mode.append(option);
     }
     mode.value = promptState.test_mode || 'attribution'; modeLabel.append(mode);
-    const enabledLabel = el('label', 'mt-qa-enabled');
+    const enabledLabel = el('label', 'mt-inline-toggle');
     const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!promptState.enabled;
     enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用此页定时测试');
     enabledLabel.append(enabled, document.createTextNode('启用此页定时测试'));
+    const top = el('div', 'mt-panel-top'); top.append(enabledLabel, status);
     const modelLabel = el('label', 'mt-prompt-label', '测试模型');
     const model = el('select');
     let desiredModel = promptState.model || state.model;
@@ -1133,7 +1207,7 @@
       if (mode.value === 'qa') payload.cases = editor.values();
       return payload;
     };
-    body.append(status, enabledLabel, settingsGrid, catalogNote, schedule, estimate, policyNotes,
+    body.append(top, settingsGrid, catalogNote, schedule, estimate, policyNotes,
       availability, editor.root, promptLabel, templateNote, historyHead, history, empty, help, error);
     help.append(budgetNote);
     panel.append(body);

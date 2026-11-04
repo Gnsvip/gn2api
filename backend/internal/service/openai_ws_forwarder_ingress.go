@@ -1067,7 +1067,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		usage := OpenAIUsage{}
 		imageCounter := newOpenAIImageOutputCounter()
 		var firstTokenMs *int
-		ttftMode := s.openAITTFTMode(ctx)
 		reqStream := openAIWSPayloadBoolFromRaw(payload, "stream", true)
 		turnPreviousResponseID := openAIWSPayloadStringFromRaw(payload, "previous_response_id")
 		turnPreviousResponseIDKind := ClassifyOpenAIPreviousResponseIDKind(turnPreviousResponseID)
@@ -1244,7 +1243,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if isTerminalEvent {
 				terminalEventCount++
 			}
-			if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(upstreamMessage), eventType, false, ttftMode) {
+			if firstTokenMs == nil && openAIWSDataStartsTTFT(upstreamMessage, eventType) {
 				ms := int(time.Since(turnStart).Milliseconds())
 				firstTokenMs = &ms
 			}

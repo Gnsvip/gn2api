@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -388,6 +389,12 @@ func isOpenAIWSTokenEvent(eventType string) bool {
 	// 不能把它们当作 token event，否则当上游没有可识别的 delta 时，
 	// firstTokenMs 会被填到终止时刻，等于把"总耗时"误报为"首 token 延迟"。
 	return false
+}
+
+// WS semantic timing includes typed reasoning activity before its text arrives.
+// This predicate only controls measurement, not buffering or failover.
+func openAIWSDataStartsTTFT(data []byte, eventType string) bool {
+	return openai.ResponseStartsSemanticOutput(data, eventType)
 }
 
 func replaceOpenAIWSMessageModel(message []byte, fromModel, toModel string) []byte {

@@ -1931,6 +1931,9 @@ func newOpenAIWSHandlerTestServer(t *testing.T, h *OpenAIGatewayHandler, subject
 }
 
 type openAIResponsesWSUsageLogCase struct {
+	standardBillingCache   *handlerInflightCache
+	usageBillingRepo       service.UsageBillingRepository
+	afterFirstCompleted    func()
 	simpleModeRejectAtRead int64
 	compositeResolver      *service.CompositeRouteResolver
 	accountPlatform        string
@@ -1959,6 +1962,9 @@ type openAIResponsesWSUsageLogCase struct {
 	firstFrameCloseExpected bool
 	// secondTurnCloseExpected：第二个 turn 被拒（连接被 1008 关闭）。
 	secondTurnCloseExpected bool
+	billingErrorCode        string
+	usageWorkerPool         *service.UsageRecordWorkerPool
+	onBillingReady          func(*service.BillingCacheService, *service.APIKey)
 }
 
 type openAIResponsesWSUsageLogResult struct {
@@ -2887,8 +2893,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	upstreamPayloadCh := make(chan []byte, turnCount)
 	upstreamErrCh := make(chan error, 1)
 	var channelSvc *service.ChannelService
+	var httpTurns atomic.Int64
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if tc.accountPlatform == service.PlatformGrok {
+		if tc.accountPlatform == service.PlatformGrok || tc.ingressMode == service.OpenAIWSIngressModeHTTPBridge {
 			payload, err := io.ReadAll(r.Body)
 			if err != nil {
 				upstreamErrCh <- err
@@ -2896,7 +2903,7 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 			}
 			upstreamPayloadCh <- payload
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_grok_test\",\"model\":%q,\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n", gjson.GetBytes(payload, "model").String())
+			_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_test_%d\",\"model\":%q,\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n", httpTurns.Add(1), gjson.GetBytes(payload, "model").String())
 			return
 		}
 		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{
@@ -2976,6 +2983,10 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 
 	cfg := &config.Config{}
 	cfg.RunMode = config.RunModeSimple
+	if tc.standardBillingCache != nil {
+		cfg.RunMode = config.RunModeStandard
+		cfg.Billing.InflightReservation = config.InflightReservationConfig{Enabled: true, TTLSeconds: 60}
+	}
 	cfg.Default.RateMultiplier = 1
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
@@ -3009,12 +3020,16 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		cfg.SimpleModeKeyRateLimitEnabled = true
 		keyRepo = &simpleModeWSRateLimitRepo{rejectAt: tc.simpleModeRejectAtRead}
 	}
-	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, keyRepo, nil, nil, cfg, nil)
+	var balanceCache service.BillingCache
+	if tc.standardBillingCache != nil {
+		balanceCache = tc.standardBillingCache
+	}
+	billingCacheSvc := service.NewBillingCacheService(balanceCache, nil, nil, keyRepo, nil, nil, cfg, nil)
 	t.Cleanup(billingCacheSvc.Stop)
 	gatewaySvc := service.NewOpenAIGatewayService(
 		accountRepo,
 		usageRepo,
-		nil,
+		tc.usageBillingRepo,
 		nil,
 		nil,
 		nil,
@@ -3045,12 +3060,13 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		},
 	}
 	h := &OpenAIGatewayHandler{
-		cfg:                 cfg,
-		compositeResolver:   tc.compositeResolver,
-		gatewayService:      gatewaySvc,
-		billingCacheService: billingCacheSvc,
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		cfg:                   cfg,
+		usageRecordWorkerPool: tc.usageWorkerPool,
+		compositeResolver:     tc.compositeResolver,
+		gatewayService:        gatewaySvc,
+		billingCacheService:   billingCacheSvc,
+		apiKeyService:         &service.APIKeyService{},
+		concurrencyHelper:     NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
 	}
 
 	apiKey := &service.APIKey{
@@ -3069,6 +3085,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	}
 	if tc.group != nil {
 		apiKey.Group = tc.group
+	}
+	if tc.onBillingReady != nil {
+		tc.onBillingReady(billingCacheSvc, apiKey)
 	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -3110,7 +3129,22 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	if tc.closeStatus == 0 {
 		tc.closeStatus = coderws.StatusPolicyViolation
 	}
+	readBillingError := func() {
+		t.Helper()
+		if tc.billingErrorCode == "" {
+			return
+		}
+		readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancelRead()
+		_, payload, readErr := clientConn.Read(readCtx)
+		require.NoError(t, readErr, "billing denial must send an error event before closing")
+		require.Equal(t, "error", gjson.GetBytes(payload, "type").String(), string(payload))
+		require.Equal(t, tc.billingErrorCode, gjson.GetBytes(payload, "error.code").String(), string(payload))
+		require.GreaterOrEqual(t, gjson.GetBytes(payload, "status").Int(), int64(400))
+		require.NotEmpty(t, gjson.GetBytes(payload, "error.message").String())
+	}
 	if tc.firstFrameCloseExpected {
+		readBillingError()
 		readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
 		_, _, readErr := clientConn.Read(readCtx)
 		cancelRead()
@@ -3142,6 +3176,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		clientEvents = append(clientEvents, append([]byte(nil), event...))
 	}
 	readCompleted()
+	if tc.afterFirstCompleted != nil {
+		tc.afterFirstCompleted()
+	}
 	if tc.midPayload != "" {
 		writeCtx, cancelWrite = context.WithTimeout(context.Background(), 3*time.Second)
 		err = clientConn.Write(writeCtx, coderws.MessageText, []byte(tc.midPayload))
@@ -3155,6 +3192,7 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		cancelWrite()
 		require.NoError(t, err)
 		if tc.secondTurnCloseExpected {
+			readBillingError()
 			readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
 			_, _, readErr := clientConn.Read(readCtx)
 			cancelRead()
@@ -3200,7 +3238,7 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		}
 	}
 
-	if tc.accountPlatform == service.PlatformGrok {
+	if tc.accountPlatform == service.PlatformGrok || tc.ingressMode == service.OpenAIWSIngressModeHTTPBridge {
 		upstreamErrCh <- nil
 	}
 	select {
@@ -3328,14 +3366,14 @@ func TestOpenAIResponsesWebSocketSimpleModeRechecksKeyWindows(t *testing.T) {
 		t.Run(mode+"/after-account-selection", func(t *testing.T) {
 			runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 				firstPayload: `{"type":"response.create","model":"gpt-5.1"}`,
-				ingressMode:  mode, simpleModeRejectAtRead: 2, firstFrameCloseExpected: true, closeReason: "billing check failed",
+				ingressMode:  mode, simpleModeRejectAtRead: 2, firstFrameCloseExpected: true, closeReason: "billing check failed", billingErrorCode: "rate_limit_exceeded",
 			})
 		})
 		t.Run(mode+"/followup-turn", func(t *testing.T) {
 			runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 				firstPayload:  `{"type":"response.create","model":"gpt-5.1"}`,
 				secondPayload: `{"type":"response.create","model":"gpt-5.1"}`,
-				ingressMode:   mode, simpleModeRejectAtRead: 3, secondTurnCloseExpected: true, closeReason: "billing check failed",
+				ingressMode:   mode, simpleModeRejectAtRead: 3, secondTurnCloseExpected: true, closeReason: "billing check failed", billingErrorCode: "rate_limit_exceeded",
 			})
 		})
 	}

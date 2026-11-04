@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -19,7 +20,7 @@ import (
 )
 
 func TestOpenAITTFTDoesNotInventTerminalTiming(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
 		for _, event := range []string{
 			`{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"late"}]}]}}`,
 			`{"type":"response.done","response":{"output":[]}}`,
@@ -31,7 +32,7 @@ func TestOpenAITTFTDoesNotInventTerminalTiming(t *testing.T) {
 }
 
 func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
 		for _, terminalOnly := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/terminal_only_%t", mode, terminalOnly), func(t *testing.T) {
 				gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
@@ -59,19 +60,14 @@ func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
 				var forwarded []string
 				result, err := s.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, account, "test-token", body, len(body), "gpt-6.1-sol", "", "", "", "", 1, func(frame []byte) error { forwarded = append(forwarded, string(frame)); return nil })
 				require.NoError(t, err)
-				if terminalOnly && mode != OpenAITTFTModeFirstEvent {
+				if terminalOnly {
 					require.Nil(t, result.FirstTokenMs)
 				} else {
 					require.NotNil(t, result.FirstTokenMs)
 					if !terminalOnly {
 						require.Contains(t, forwarded, output)
 					}
-					if mode == OpenAITTFTModeFirstEvent {
-						require.Less(t, *result.FirstTokenMs, 60)
-					}
-					if mode == OpenAITTFTModeVisible {
-						require.GreaterOrEqual(t, *result.FirstTokenMs, 130)
-					}
+					require.GreaterOrEqual(t, *result.FirstTokenMs, 180, "WS-to-HTTP uses WS semantic, not the empty tool shell")
 					if !terminalOnly {
 						require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
 					}
@@ -82,7 +78,7 @@ func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
 }
 
 func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
 		t.Run(mode, func(t *testing.T) {
 			gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
 			t.Cleanup(func() { gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{}) })
@@ -132,12 +128,7 @@ func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
 				select {
 				case result := <-results:
 					require.NotNil(t, result.FirstTokenMs)
-					if mode == OpenAITTFTModeFirstEvent {
-						require.Less(t, *result.FirstTokenMs, 60)
-					}
-					if mode == OpenAITTFTModeVisible {
-						require.GreaterOrEqual(t, *result.FirstTokenMs, 130)
-					}
+					require.GreaterOrEqual(t, *result.FirstTokenMs, 180, "WS timing ignores the HTTP mode and empty output items")
 					require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
@@ -147,8 +138,8 @@ func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
 	}
 }
 
-func TestHTTPToWSTTFTUsesConfiguredMode(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
+func TestHTTPToWSTTFTIgnoresHTTPMode(t *testing.T) {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
 		for _, output := range []string{
 			`{"type":"response.custom_tool_call_input.done","input":"synthetic command"}`,
 			`{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_one","name":"lookup","input":"synthetic command"}}`,
@@ -186,14 +177,105 @@ func TestHTTPToWSTTFTUsesConfiguredMode(t *testing.T) {
 				if result.FirstTokenMs == nil {
 					return
 				}
-				if mode != OpenAITTFTModeVisible {
-					require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(210))
-				} else {
-					require.GreaterOrEqual(t, *result.FirstTokenMs, 130)
-					require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
-				}
+				require.GreaterOrEqual(t, *result.FirstTokenMs, 50)
+				require.GreaterOrEqual(t, c.GetInt64(OpsOpenAIWSFirstVisibleMsKey)-int64(*result.FirstTokenMs), int64(100), "typed reasoning precedes actual content")
+				require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
 				require.Contains(t, recorder.Body.String(), output, "timing must not change forwarded events")
+				sample := buildTrafficObservation(account.ID, result, requesttiming.FromGin(c).Current().Completion(), err, false, false)
+				require.Empty(t, sample.excluded)
+				require.Equal(t, "websocket", sample.group.Transport)
+				require.Equal(t, OpenAITTFTModeWSSemantic, sample.group.Mode)
 			})
 		}
+	}
+}
+
+func TestWSTTFTOutputEventsAndDoneFallback(t *testing.T) {
+	for _, payload := range []string{
+		`{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`,
+		`{"type":"response.function_call_arguments.delta","delta":"{"}`,
+		`{"type":"response.output_text.delta","delta":"answer"}`,
+		`{"type":"response.custom_tool_call_input.done","input":"command"}`,
+		`{"type":"response.function_call_arguments.done","arguments":"{}"}`,
+		`{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}`,
+	} {
+		require.True(t, openAIWSDataStartsTTFT([]byte(payload), gjson.Get(payload, "type").String()), payload)
+	}
+	for _, payload := range []string{
+		`{"type":"response.created"}`, `{"type":"response.in_progress"}`,
+		`{"type":"codex.rate_limits"}`, `{"type":"keepalive"}`,
+		`{"type":"response.output_item.done","item":{"type":"message","content":[]}}`,
+		`{"type":"response.function_call_arguments.done","arguments":""}`,
+		`{"type":"response.completed","response":{"output":[{"type":"message","content":[{"text":"late"}]}]}}`,
+		`{"type":"response.failed"}`, `{"type":"error"}`,
+	} {
+		require.False(t, openAIWSDataStartsTTFT([]byte(payload), gjson.Get(payload, "type").String()), payload)
+	}
+}
+
+func TestNativeWSCtxPoolTTFTIgnoresHTTPMode(t *testing.T) {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
+		t.Run(mode, func(t *testing.T) {
+			useHTTPModeTTFT(t, mode)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_pool_timing"}}`))
+				time.Sleep(60 * time.Millisecond)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`))
+				time.Sleep(140 * time.Millisecond)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.reasoning_summary_text.delta","delta":"synthetic"}`))
+				time.Sleep(100 * time.Millisecond)
+				_ = conn.WriteMessage(websocket.TextMessage, autoContinuationEvent("resp_pool_timing", autoContinuationAnswer))
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+			svc.cfg.Gateway.OpenAIWS.IngressModeDefault = OpenAIWSIngressModeCtxPool
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results := make(chan *OpenAIForwardResult, 1)
+			samples := make(chan trafficObservationSample, 1)
+			server, _ := startPassthroughLifecycleServerWithHooks(t, ctx, svc, account, func(c *gin.Context) *OpenAIWSIngressHooks {
+				return &OpenAIWSIngressHooks{AfterTurn: func(_ int, r *OpenAIForwardResult, err error) {
+					if err == nil {
+						samples <- buildTrafficObservation(account.ID, r, requesttiming.FromGin(c).Current().Completion(), err, false, false)
+						results <- r
+					}
+				}}
+			})
+			defer server.Close()
+			client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			require.NoError(t, err)
+			defer client.CloseNow()
+			require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-6-astra","input":"synthetic"}`)))
+			for {
+				_, frame, err := client.Read(ctx)
+				require.NoError(t, err)
+				if gjson.GetBytes(frame, "type").String() == "response.completed" {
+					break
+				}
+			}
+			select {
+			case result := <-results:
+				sample := <-samples
+				require.Empty(t, sample.excluded)
+				require.Equal(t, "websocket", sample.group.Transport)
+				require.Equal(t, OpenAITTFTModeWSSemantic, sample.group.Mode)
+				require.NotNil(t, result.FirstTokenMs)
+				require.GreaterOrEqual(t, *result.FirstTokenMs, 50)
+				require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(180))
+				require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		})
 	}
 }

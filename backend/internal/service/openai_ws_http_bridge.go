@@ -636,7 +636,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	usage := OpenAIUsage{}
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
-	ttftMode := s.openAITTFTMode(ctx)
 	reqStream := openAIWSPayloadBoolFromRaw(body, "stream", true)
 	eventCount := 0
 	tokenEventCount := 0
@@ -723,6 +722,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	defer putSSEScannerBuf64K(scanBuf)
 
 	timing := requesttiming.FromGin(c).Current()
+	timing.SetTTFTMode(OpenAITTFTModeWSSemantic)
 	pendingSSEEventType := ""
 	finalizeBareError := func() error {
 		if !bareErrorPending {
@@ -798,7 +798,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if isOpenAIWSTokenEvent(eventType) {
 			tokenEventCount++
 		}
-		if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(upstreamMessage), eventType, false, ttftMode) {
+		if firstTokenMs == nil && openAIWSDataStartsTTFT(upstreamMessage, eventType) {
 			ms := int(time.Since(turnStart).Milliseconds())
 			firstTokenMs = &ms
 		}

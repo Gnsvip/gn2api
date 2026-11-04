@@ -13,32 +13,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func useFirstEventTTFT(t *testing.T) {
+func useHTTPModeTTFT(t *testing.T, mode string) {
 	t.Helper()
 	previous := gatewayForwardingCache.Load()
 	if previous == nil {
 		previous = &cachedGatewayForwardingSettings{}
 	}
 	t.Cleanup(func() { gatewayForwardingCache.Store(previous) })
-	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: OpenAITTFTModeFirstEvent})
+	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode})
 }
 
-func TestFirstEventTTFTClassification(t *testing.T) {
-	for _, event := range []string{"response.created", "response.queued", "response.in_progress", "response.output_item.added", "response.output_text.delta"} {
-		require.True(t, openAIStreamDataStartsTTFT(`{"type":"`+event+`"}`, "", false, OpenAITTFTModeFirstEvent))
-	}
-	for _, event := range []string{"keepalive", "ping", "metadata", "codex.rate_limits", "error", "response.completed", "response.failed", "response.incomplete", "response.done", ""} {
-		require.False(t, openAIStreamDataStartsTTFT(`{"type":"`+event+`"}`, "", true, OpenAITTFTModeFirstEvent))
-	}
-	require.False(t, openAIStreamDataStartsTTFT(`broken`, "response.created", false, OpenAITTFTModeFirstEvent))
-	require.Equal(t, OpenAITTFTModeFirstEvent, normalizeOpenAITTFTMode(" FIRST_EVENT "))
-}
-
-func TestFirstEventTTFTKeepsVisibleDiagnosticsIndependent(t *testing.T) {
+func TestHTTPSemanticTTFTKeepsVisibleDiagnosticsIndependent(t *testing.T) {
 	for _, path := range []string{"http", "guarded_http", "passthrough", "chat"} {
 		t.Run(path, func(t *testing.T) {
-			useFirstEventTTFT(t)
-			c, recorder := httpBridgeContext("first-event")
+			useHTTPModeTTFT(t, OpenAITTFTModeSemantic)
+			c, recorder := httpBridgeContext("http-semantic")
 			started := time.Now()
 			timing := requesttiming.Attach(c, started, 0)
 			timing.Begin(1, "http")
@@ -51,10 +40,12 @@ func TestFirstEventTTFTKeepsVisibleDiagnosticsIndependent(t *testing.T) {
 			defer reader.Close()
 			go func() {
 				defer writer.Close()
-				_, _ = io.WriteString(writer, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_first_event\"}}\n\n")
+				_, _ = io.WriteString(writer, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_http_semantic\"}}\n\n")
+				time.Sleep(60 * time.Millisecond)
+				_, _ = io.WriteString(writer, "data: "+`{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[]}}`+"\n\n")
 				time.Sleep(180 * time.Millisecond)
 				_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"synthetic\"}\n\n")
-				_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first_event\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+				_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_semantic\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
 			}()
 			resp := &http.Response{StatusCode: 200, Header: make(http.Header), Body: reader}
 			account := &Account{ID: 1, Platform: PlatformOpenAI}
@@ -78,22 +69,23 @@ func TestFirstEventTTFTKeepsVisibleDiagnosticsIndependent(t *testing.T) {
 			require.True(t, ok)
 			a := summary.Attempts[0]
 			require.NotNil(t, a.FirstTextMS)
-			require.GreaterOrEqual(t, *a.FirstTextMS-int64(*first), int64(150), "processing notice must not become visible text")
+			require.GreaterOrEqual(t, int64(*first)-*a.FirstEventMS, int64(50), "processing notice is excluded")
+			require.GreaterOrEqual(t, *a.FirstTextMS-int64(*first), int64(150), "semantic event must not become visible text")
 			require.Contains(t, recorder.Body.String(), "synthetic")
 		})
 	}
 }
 
-func TestFirstEventTTFTDoesNotDisarmOutputTimeout(t *testing.T) {
-	useFirstEventTTFT(t)
+func TestHTTPSemanticTTFTDoesNotDisarmOutputTimeout(t *testing.T) {
+	useHTTPModeTTFT(t, OpenAITTFTModeSemantic)
 	TestOpenAINativeMetadataAndKeepaliveDoNotDisarmFirstOutputTimeout(t)
 }
 
-func TestFirstEventTTFTDoesNotCommitFailedHTTPAttempt(t *testing.T) {
+func TestHTTPSemanticTTFTDoesNotCommitFailedHTTPAttempt(t *testing.T) {
 	for _, passthrough := range []bool{false, true} {
 		t.Run(map[bool]string{false: "http", true: "passthrough"}[passthrough], func(t *testing.T) {
-			useFirstEventTTFT(t)
-			c, recorder := httpBridgeContext("first-event-failover")
+			useHTTPModeTTFT(t, OpenAITTFTModeSemantic)
+			c, recorder := httpBridgeContext("http-semantic-failover")
 			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize, OpenAIFirstOutputTimeoutSeconds: 2}}}
 			payload := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_rejected\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n"
 			resp := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload))}
@@ -106,7 +98,7 @@ func TestFirstEventTTFTDoesNotCommitFailedHTTPAttempt(t *testing.T) {
 			}
 			var failover *UpstreamFailoverError
 			require.ErrorAs(t, err, &failover)
-			require.Empty(t, recorder.Body.String(), "first-response metric must not release a failed attempt")
+			require.Empty(t, recorder.Body.String(), "semantic metric must not release a failed attempt")
 		})
 	}
 }

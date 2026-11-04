@@ -498,7 +498,6 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	firstVisibleSeen := false
-	ttftMode := s.openAITTFTMode(ctx)
 	bufferingOutputSeen := false
 	responseID := ""
 	var finalResponse []byte
@@ -786,20 +785,14 @@ readLoop:
 		if isTerminalEvent {
 			terminalEventCount++
 		}
-		if firstTokenMs == nil && openAIStreamDataStartsTTFT(string(message), eventType, false, ttftMode) {
+		if firstTokenMs == nil && openAIWSDataStartsTTFT(message, eventType) {
 			ms := int(time.Since(startTime).Milliseconds())
 			firstTokenMs = &ms
 		}
-		visibleStarted := !firstVisibleSeen && ttftMode == OpenAITTFTModeVisible && firstTokenMs != nil
-		if !firstVisibleSeen && ttftMode != OpenAITTFTModeVisible {
-			visibleStarted = openAIStreamDataStartsTTFT(string(message), eventType, false, OpenAITTFTModeVisible)
-		}
+		visibleStarted := !firstVisibleSeen && openAIStreamDataStartsTTFT(string(message), eventType, false, OpenAITTFTModeVisible)
 		if visibleStarted {
 			firstVisibleSeen = true
 			ms := time.Since(startTime).Milliseconds()
-			if ttftMode == OpenAITTFTModeVisible && firstTokenMs != nil {
-				ms = int64(*firstTokenMs)
-			}
 			SetOpsLatencyMs(c, OpsOpenAIWSFirstVisibleMsKey, ms)
 		}
 		if debugEnabled && shouldLogOpenAIWSEvent(eventCount, eventType) {

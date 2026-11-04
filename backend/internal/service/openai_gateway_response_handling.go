@@ -123,6 +123,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	var firstTokenMs *int
 	ttftMode := s.openAITTFTMode(ctx)
+	timing.SetTTFTMode(ttftMode)
 	firstOutputProgressObserved := false
 	firstVisibleOutputObserved := false
 	bufferedWriter := bufio.NewWriterSize(w, 4*1024)

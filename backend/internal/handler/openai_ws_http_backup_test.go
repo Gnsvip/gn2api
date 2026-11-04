@@ -20,12 +20,20 @@ import (
 
 func TestOpenAIWSHTTPBackupPreservesCurrentTurnAndNextContinuation(t *testing.T) {
 	for _, failure := range []string{"rate limit", "401 after connection rotation"} {
-		t.Run(failure, func(t *testing.T) { testOpenAIWSHTTPBackupContinuation(t, failure) })
+		t.Run(failure, func(t *testing.T) { testOpenAIWSHTTPBackupContinuation(t, failure, false) })
 	}
 }
 
-func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string) {
+func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string, standardBilling bool) {
 	t.Helper()
+	var balanceCache *handlerInflightCache
+	var usageRepo service.UsageLogRepository
+	var billingRepo service.UsageBillingRepository
+	if standardBilling {
+		balanceCache = newHandlerInflightCache(0.001)
+		usageRepo = &openAIWSUsageHandlerUsageLogRepoStub{created: make(chan *service.UsageLog, 4)}
+		billingRepo = &compatStreamUsageBillingRepo{}
+	}
 	var wsRequests atomic.Int32
 	var handshakes atomic.Int32
 	upstreamWS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +66,7 @@ func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string) {
 		_ = conn.Write(ctx, coderws.MessageText, []byte(errorEvent))
 	}))
 	defer upstreamWS.Close()
-	_, upstream, _, router := newOpenAICredentialHandler(t, service.AccountTypeAPIKey, func(cfg *config.Config, accounts []service.Account) {
+	_, upstream, _, router := newOpenAICredentialHandlerWithBilling(t, service.AccountTypeAPIKey, balanceCache, usageRepo, billingRepo, func(cfg *config.Config, accounts []service.Account) {
 		cfg.Gateway.OpenAIWS.IngressModeDefault = service.OpenAIWSIngressModeCtxPool
 		cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 		accounts[0].Type = service.AccountTypeAPIKey
@@ -81,6 +89,9 @@ func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string) {
 		require.NoError(t, err)
 		require.Equal(t, "response.completed", gjson.GetBytes(response, "type").String(), string(response))
 		require.Equal(t, id, gjson.GetBytes(response, "response.id").String())
+		if standardBilling {
+			require.Eventually(t, func() bool { return balanceCache.count() == 0 }, time.Second, time.Millisecond)
+		}
 	}
 	exchange(`{"type":"response.create","model":"gpt-5.6-sol","reasoning":{"effort":"xhigh"},"instructions":"Keep all context","tools":[{"type":"function","name":"inspect","parameters":{"type":"object"}}],"input":[{"role":"user","content":"original question"}]}`, "resp_ws_first")
 	exchange(`{"type":"response.create","model":"gpt-6-astra","reasoning":{"effort":"xhigh"},"instructions":"Keep all context","tools":[{"type":"function","name":"inspect","parameters":{"type":"object"}}],"previous_response_id":"resp_ws_first","input":[{"type":"function_call_output","call_id":"call_first","output":"current tool result"}]}`, "resp_healthy")
@@ -91,6 +102,17 @@ func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string) {
 		require.Equal(t, int32(2), handshakes.Load(), "the replacement WS handshake must actually return 401")
 	} else {
 		require.Equal(t, int32(1), handshakes.Load())
+	}
+	if standardBilling {
+		r := billingRepo.(*compatStreamUsageBillingRepo)
+		r.mu.Lock()
+		commands := len(r.commands)
+		r.mu.Unlock()
+		require.Equal(t, 3, commands, "only completed logical turns are billed")
+		balanceCache.mu.Lock()
+		reservations := balanceCache.reservations
+		balanceCache.mu.Unlock()
+		require.Equal(t, 3, reservations, "failover must keep the failed turn's reservation")
 	}
 	upstream.mu.Lock()
 	defer upstream.mu.Unlock()

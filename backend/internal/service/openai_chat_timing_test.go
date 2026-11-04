@@ -16,6 +16,7 @@ import (
 )
 
 func TestChatTimingMetadataDoesNotStartVisibleTTFT(t *testing.T) {
+	useHTTPModeTTFT(t, OpenAITTFTModeVisible)
 	for _, first := range []string{
 		`{"type":"response.created","response":{"id":"resp_chat_timing"}}`,
 		`{"type":"response.output_item.added","item":{"type":"message","role":"assistant","content":[]}}`,
@@ -73,7 +74,7 @@ func TestChatTimingHonorsConfiguredMode(t *testing.T) {
 		previous = &cachedGatewayForwardingSettings{}
 	}
 	t.Cleanup(func() { gatewayForwardingCache.Store(previous) })
-	for _, mode := range []string{OpenAITTFTModeVisible, OpenAITTFTModeSemantic, OpenAITTFTModeFirstEvent} {
+	for _, mode := range []string{OpenAITTFTModeVisible, OpenAITTFTModeSemantic} {
 		t.Run(mode, func(t *testing.T) {
 			gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
 			c, _ := httpBridgeContext("configured-mode")

@@ -15,6 +15,7 @@ import (
 	coderws "github.com/coder/websocket"
 	"github.com/tidwall/gjson"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
@@ -771,7 +772,7 @@ func observeUpstreamMessage(
 	}
 	now := nowFn()
 
-	startsTTFT := isTokenEvent(eventType)
+	startsTTFT := openai.ResponseStartsSemanticOutput(message, eventType)
 	if state.startsTTFT != nil {
 		startsTTFT = state.startsTTFT(message, eventType)
 	}

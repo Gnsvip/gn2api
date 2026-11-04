@@ -305,6 +305,7 @@ type OpenAIForwardResult struct {
 	AudioUsage *AudioUsage
 
 	wsReplayInput                []json.RawMessage
+	trafficObservationHandled    bool // Transparent WS observes after the terminal write, per turn.
 	wsReplayInputExists          bool
 	wsReplayComplete             bool
 	wsAccountFailoverReplayInput []json.RawMessage
