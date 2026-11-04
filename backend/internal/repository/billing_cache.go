@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -21,6 +23,7 @@ const (
 	subCacheInvalidateChannel = "subscription:cache:invalidate"
 	billingCacheTTL           = 5 * time.Minute
 	billingCacheJitter        = 30 * time.Second
+	billingBalanceVersionTTL  = 2 * billingCacheTTL
 	rateLimitCacheTTL         = 7 * 24 * time.Hour // 7 days matches the longest window
 
 	// Rate limit window durations — must match service.RateLimitWindow* constants.
@@ -42,6 +45,10 @@ func jitteredTTL() time.Duration {
 // billingBalanceKey generates the Redis key for user balance cache.
 func billingBalanceKey(userID int64) string {
 	return fmt.Sprintf("%s%d", billingBalanceKeyPrefix, userID)
+}
+
+func billingBalanceVersionKey(userID int64) string {
+	return fmt.Sprintf("billing:balance_version:%d", userID)
 }
 
 // billingSubKey generates the Redis key for subscription cache.
@@ -74,6 +81,7 @@ const (
 
 var (
 	deductBalanceScript = redis.NewScript(`
+		redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
 		local current = redis.call('GET', KEYS[1])
 		if current == false then
 			return 0
@@ -81,6 +89,34 @@ var (
 		local newVal = tonumber(current) - tonumber(ARGV[1])
 		redis.call('SET', KEYS[1], newVal)
 		redis.call('EXPIRE', KEYS[1], ARGV[2])
+		return 1
+	`)
+
+	setBalanceScript = redis.NewScript(`
+		redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
+		redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+		return 1
+	`)
+
+	invalidateBalanceScript = redis.NewScript(`
+		redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
+		redis.call('DEL', KEYS[1])
+		return 1
+	`)
+
+	// DB settlements may finish out of order. Never raise a cached balance using
+	// an older result, nor subtract twice when a cold load already included it.
+	clampBalanceScript = redis.NewScript(`
+		redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
+		local current = redis.call('GET', KEYS[1])
+		if not current then return 0 end
+		local balance = tonumber(current)
+		if not balance or balance ~= balance or balance == math.huge or balance == -math.huge then
+			return redis.error_reply('invalid cached balance')
+		end
+		if balance > tonumber(ARGV[1]) then
+			redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+		end
 		return 1
 	`)
 
@@ -154,13 +190,51 @@ func (c *billingCache) GetUserBalance(ctx context.Context, userID int64) (float6
 }
 
 func (c *billingCache) SetUserBalance(ctx context.Context, userID int64, balance float64) error {
-	key := billingBalanceKey(userID)
-	return c.rdb.Set(ctx, key, balance, jitteredTTL()).Err()
+	return setBalanceScript.Run(ctx, c.rdb, []string{billingBalanceKey(userID), billingBalanceVersionKey(userID)},
+		balance, jitteredTTL().Milliseconds(), uuid.NewString(), billingBalanceVersionTTL.Milliseconds()).Err()
+}
+
+// LoadUserBalance fills a cold cache synchronously. WATCH prevents a DB snapshot
+// read before a deduction/invalidation from overwriting newer state. The version
+// key also fences invalidation/deduction of an already-missing balance key.
+// Cache mutations and this transaction use the same standalone Redis instance.
+func (c *billingCache) LoadUserBalance(ctx context.Context, userID int64, load func(context.Context) (float64, error)) (float64, error) {
+	key, versionKey := billingBalanceKey(userID), billingBalanceVersionKey(userID)
+	var balance float64
+	for attempt := 0; attempt < 3; attempt++ {
+		err := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			value, err := tx.Get(ctx, key).Result()
+			if err == nil {
+				balance, err = strconv.ParseFloat(value, 64)
+				return err
+			}
+			if !errors.Is(err, redis.Nil) {
+				return err
+			}
+			balance, err = load(ctx)
+			if err != nil {
+				return err
+			}
+			if math.IsNaN(balance) || math.IsInf(balance, 0) {
+				return fmt.Errorf("invalid database balance")
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, balance, jitteredTTL())
+				return nil
+			})
+			return err
+		}, key, versionKey)
+		if !errors.Is(err, redis.TxFailedErr) {
+			return balance, err
+		}
+	}
+	return 0, fmt.Errorf("balance changed repeatedly during cache load: %w", redis.TxFailedErr)
 }
 
 func (c *billingCache) DeductUserBalance(ctx context.Context, userID int64, amount float64) error {
 	key := billingBalanceKey(userID)
-	_, err := deductBalanceScript.Run(ctx, c.rdb, []string{key}, amount, int(jitteredTTL().Seconds())).Result()
+	_, err := deductBalanceScript.Run(ctx, c.rdb, []string{key, billingBalanceVersionKey(userID)},
+		amount, int(jitteredTTL().Seconds()), uuid.NewString(), billingBalanceVersionTTL.Milliseconds()).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Printf("Warning: deduct balance cache failed for user %d: %v", userID, err)
 		return err
@@ -168,9 +242,17 @@ func (c *billingCache) DeductUserBalance(ctx context.Context, userID int64, amou
 	return nil
 }
 
+func (c *billingCache) ClampUserBalanceAfterBilling(ctx context.Context, userID int64, balance float64) error {
+	if math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return fmt.Errorf("invalid settlement balance")
+	}
+	return clampBalanceScript.Run(ctx, c.rdb, []string{billingBalanceKey(userID), billingBalanceVersionKey(userID)},
+		balance, jitteredTTL().Milliseconds(), uuid.NewString(), billingBalanceVersionTTL.Milliseconds()).Err()
+}
+
 func (c *billingCache) InvalidateUserBalance(ctx context.Context, userID int64) error {
-	key := billingBalanceKey(userID)
-	return c.rdb.Del(ctx, key).Err()
+	return invalidateBalanceScript.Run(ctx, c.rdb, []string{billingBalanceKey(userID), billingBalanceVersionKey(userID)},
+		uuid.NewString(), billingBalanceVersionTTL.Milliseconds()).Err()
 }
 
 func (c *billingCache) GetSubscriptionCache(ctx context.Context, userID, groupID int64) (*service.SubscriptionCacheData, error) {

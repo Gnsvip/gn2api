@@ -636,12 +636,12 @@ func (c *cachedBillingReservationCache) reserveLocked(key, requestID string, amo
 	return others
 }
 
-func (c *cachedBillingReservationCache) ReserveInflightBalance(_ context.Context, userID int64, requestID string, amount, balance float64, _ time.Duration) (bool, float64, error) {
+func (c *cachedBillingReservationCache) ReserveInflightBalance(_ context.Context, userID int64, requestID string, amount, minimumBalance float64, _ time.Duration) (bool, float64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := fmt.Sprintf("user:%d", userID)
 	others := c.reserveLocked(key, requestID, amount)
-	if len(c.reserved[key]) > 1 && balance-others < amount {
+	if c.balance <= 0 || c.balance < minimumBalance || (len(c.reserved[key]) > 1 && c.balance-others < amount) {
 		delete(c.reserved[key], requestID)
 		return false, others, nil
 	}

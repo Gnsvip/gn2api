@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -47,14 +48,135 @@ func TestEstimateInflightReservationCost(t *testing.T) {
 	require.False(t, ok)
 }
 
-func TestReserveInflightBalance_NoReservationCacheFailsOpen(t *testing.T) {
+func TestReserveInflightBalance_NoReservationCacheFailsClosed(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Billing.InflightReservation.Enabled = true
 	svc := NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
 	t.Cleanup(svc.Stop)
 	release, err := svc.ReserveInflightBalance(context.Background(), &User{ID: 1}, nil, nil, 100)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBillingServiceUnavailable)
 	release()
+}
+
+type failingSettlementCache struct {
+	*memInflightCache
+	getErr, deductErr, invalidateErr, releaseErr error
+	invalidates, invalidatingReleases            atomic.Int32
+}
+
+func (c *failingSettlementCache) GetUserBalance(ctx context.Context, uid int64) (float64, error) {
+	if c.getErr != nil {
+		return 0, c.getErr
+	}
+	return c.memInflightCache.GetUserBalance(ctx, uid)
+}
+func (c *failingSettlementCache) DeductUserBalance(ctx context.Context, uid int64, cost float64) error {
+	c.deducts.Add(1)
+	return c.deductErr
+}
+func (c *failingSettlementCache) InvalidateUserBalance(context.Context, int64) error {
+	c.invalidates.Add(1)
+	return c.invalidateErr
+}
+func (c *failingSettlementCache) InvalidateAndReleaseInflightBalance(ctx context.Context, uid int64, id string) error {
+	c.invalidatingReleases.Add(1)
+	if c.releaseErr != nil {
+		return c.releaseErr
+	}
+	return c.memInflightCache.ReleaseInflightBalance(ctx, uid, id)
+}
+
+func TestReserveInflightBalance_ReadFailureFailsClosed(t *testing.T) {
+	cache := &failingSettlementCache{memInflightCache: newMemInflightCache(1), getErr: errors.New("Redis read failed")}
+	svc := newInflightSvc(t, cache, 60)
+	r, err := svc.ReserveInflight(context.Background(), &User{ID: 1}, nil, nil, .5)
+	require.ErrorIs(t, err, ErrBillingServiceUnavailable)
+	require.Nil(t, r)
+	require.Zero(t, cache.count())
+}
+
+func TestSyncBalanceCacheAfterDeduction_FailureNeverQueuesAnUnprotectedDeduction(t *testing.T) {
+	for _, tc := range []struct {
+		name                                       string
+		invalidationFails, releaseFails, exhausted bool
+	}{
+		{name: "invalidate before normal release"},
+		{name: "invalidate atomically with release", invalidationFails: true},
+		{name: "keep reservation on recovery failure", invalidationFails: true, releaseFails: true},
+		{name: "exhausted balance", invalidationFails: true, exhausted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := &failingSettlementCache{memInflightCache: newMemInflightCache(1), deductErr: errors.New("unknown write result")}
+			if tc.invalidationFails {
+				cache.invalidateErr = errors.New("Redis unavailable")
+			}
+			if tc.releaseFails {
+				cache.releaseErr = errors.New("Redis still unavailable")
+			}
+			svc := newInflightSvc(t, cache, 60)
+			res, err := svc.ReserveInflight(context.Background(), &User{ID: 1}, nil, nil, .9)
+			require.NoError(t, err)
+			done := res.Acquire()
+			res.HandlerDone()
+			ctx := WithInflightReservation(context.Background(), res)
+			var result *UsageBillingApplyResult
+			if tc.exhausted {
+				balance := -.2
+				result = &UsageBillingApplyResult{NewBalance: &balance}
+			}
+			syncBalanceCacheAfterDeduction(ctx, &postUsageBillingParams{Cost: &CostBreakdown{ActualCost: 1.2}, User: &User{ID: 1}}, &billingDeps{billingCacheService: svc}, result)
+			require.Equal(t, 1, cache.count(), "billing must still hold protection")
+			done()
+			svc.Stop() // Drain the queue to prove no delayed second subtraction exists.
+			if tc.exhausted {
+				require.Zero(t, cache.deducts.Load())
+			} else {
+				require.Equal(t, int32(1), cache.deducts.Load())
+			}
+			if tc.invalidationFails {
+				require.Equal(t, int32(1), cache.invalidatingReleases.Load())
+			} else {
+				require.Zero(t, cache.invalidatingReleases.Load())
+			}
+			if tc.releaseFails {
+				require.Equal(t, 1, cache.count())
+			} else {
+				require.Zero(t, cache.count())
+			}
+		})
+	}
+}
+
+type settlementClampCache struct {
+	*memInflightCache
+	clamps   int
+	clampErr error
+}
+
+func (c *settlementClampCache) ClampUserBalanceAfterBilling(_ context.Context, _ int64, balance float64) error {
+	c.clamps++
+	if c.clampErr != nil {
+		return c.clampErr
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.balance > balance {
+		c.balance = balance
+	}
+	return nil
+}
+
+func TestSyncBalanceCacheAfterDeduction_UsesAuthoritativeBalanceWithoutDoubleSubtracting(t *testing.T) {
+	cache := &settlementClampCache{memInflightCache: newMemInflightCache(.4)}
+	svc := newInflightSvc(t, cache, 60)
+	balance := .4
+	p := &postUsageBillingParams{Cost: &CostBreakdown{ActualCost: .6}, User: &User{ID: 1}}
+	syncBalanceCacheAfterDeduction(context.Background(), p, &billingDeps{billingCacheService: svc}, &UsageBillingApplyResult{NewBalance: &balance})
+	require.Equal(t, 1, cache.clamps)
+	require.Zero(t, cache.deducts.Load())
+	got, err := cache.GetUserBalance(context.Background(), 1)
+	require.NoError(t, err)
+	require.Equal(t, .4, got)
 }
 
 func TestReserveInflightBalance_SimpleModeDisabled(t *testing.T) {
@@ -205,7 +327,7 @@ func (m *memInflightCache) gc() {
 	}
 }
 
-func (m *memInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id string, amount, balance float64, ttl time.Duration) (bool, float64, error) {
+func (m *memInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id string, amount, minimumBalance float64, ttl time.Duration) (bool, float64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gc()
@@ -213,7 +335,7 @@ func (m *memInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id
 	for _, v := range m.res {
 		sum += v
 	}
-	if len(m.res) > 0 && balance-sum < amount {
+	if m.balance <= 0 || m.balance < minimumBalance || (len(m.res) > 0 && m.balance-sum < amount) {
 		return false, sum, nil
 	}
 	m.res[id] = amount

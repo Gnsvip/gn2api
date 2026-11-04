@@ -3,10 +3,12 @@ package repository
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -14,7 +16,8 @@ import (
 //   - billing:inflight:{uid}      ZSET  member=requestID score=过期时间(ms)
 //   - billing:inflight_amt:{uid}  HASH  field=requestID value=预留金额(USD)
 //
-// 两个 key 使用同一 hash tag，保证 Redis Cluster 下 Lua 可同时访问。
+// Admission also reads billing:balance:<uid>. The existing standalone redis.Client
+// supports this; the legacy balance key is not co-slotted for Redis Cluster.
 const (
 	billingInflightKeyPrefix    = "billing:inflight:"
 	billingInflightAmtKeyPrefix = "billing:inflight_amt:"
@@ -40,12 +43,18 @@ func billingInflightScopeKeys(scope string) (string, string) {
 }
 
 var (
-	// KEYS: [1]=zset [2]=hash
-	// ARGV: [1]=now_ms [2]=expire_at_ms [3]=member [4]=amount [5]=balance [6]=key_ttl_ms
+	// KEYS: [1]=zset [2]=hash [3]=current balance
+	// ARGV: [1]=now_ms [2]=expire_at_ms [3]=member [4]=amount [5]=minimum_balance [6]=key_ttl_ms
 	// 返回 {allowed, inflight_sum(string), inflight_count}
-	// 规则：先清理已过期成员；若无在途预留则直接放行（与旧行为一致，外层已校验余额 > 阈值）；
-	// 否则要求 balance - sum(在途) >= amount。放行时登记预留。
+	// A lone estimated request may exceed its starting balance, but the current
+	// balance must be positive and meet minimum_balance at admission time.
 	reserveInflightBalanceScript = redis.NewScript(`
+		local raw = redis.call('GET', KEYS[3])
+		if not raw then return {-1, '0', 0} end
+		local balance = tonumber(raw)
+		if not balance or balance ~= balance or balance == math.huge or balance == -math.huge then
+			return redis.error_reply('invalid cached balance')
+		end
 		local now = tonumber(ARGV[1])
 		local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now)
 		if #expired > 0 then
@@ -59,7 +68,9 @@ var (
 		end
 		local count = redis.call('ZCARD', KEYS[1])
 		local amount = tonumber(ARGV[4])
-		local balance = tonumber(ARGV[5])
+		if balance <= 0 or balance < tonumber(ARGV[5]) then
+			return {0, tostring(sum), count}
+		end
 		if count > 0 and (balance - sum) < amount then
 			return {0, tostring(sum), count}
 		end
@@ -100,6 +111,14 @@ var (
 		return 1
 	`)
 
+	invalidateAndReleaseInflightBalanceScript = redis.NewScript(`
+		redis.call('SET', KEYS[4], ARGV[2], 'PX', ARGV[3])
+		redis.call('DEL', KEYS[3])
+		redis.call('ZREM', KEYS[1], ARGV[1])
+		redis.call('HDEL', KEYS[2], ARGV[1])
+		return 1
+	`)
+
 	// KEYS: [1]=zset [2]=hash
 	// ARGV: [1]=now_ms [2]=expire_at_ms [3]=member [4]=amount [5]=key_ttl_ms
 	// 先清理已过期成员，再登记本次预留；返回登记前其他在途预留的合计（string），是否放行由调用方按权威用量判定。
@@ -124,19 +143,22 @@ var (
 )
 
 // ReserveInflightBalance 实现 service.InflightBalanceReservationCache。
-func (c *billingCache) ReserveInflightBalance(ctx context.Context, userID int64, requestID string, amount, balance float64, ttl time.Duration) (bool, float64, error) {
+func (c *billingCache) ReserveInflightBalance(ctx context.Context, userID int64, requestID string, amount, minimumBalance float64, ttl time.Duration) (bool, float64, error) {
+	if amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) || minimumBalance < 0 || math.IsNaN(minimumBalance) || math.IsInf(minimumBalance, 0) {
+		return false, 0, fmt.Errorf("invalid balance reservation amount or minimum")
+	}
 	zkey, hkey := billingInflightKeys(userID)
 	now := time.Now().UnixMilli()
 	ttlMs := ttl.Milliseconds()
 	if ttlMs <= 0 {
 		ttlMs = 1
 	}
-	res, err := reserveInflightBalanceScript.Run(ctx, c.rdb, []string{zkey, hkey},
+	res, err := reserveInflightBalanceScript.Run(ctx, c.rdb, []string{zkey, hkey, billingBalanceKey(userID)},
 		now,
 		now+ttlMs,
 		requestID,
 		strconv.FormatFloat(amount, 'f', -1, 64),
-		strconv.FormatFloat(balance, 'f', -1, 64),
+		strconv.FormatFloat(minimumBalance, 'f', -1, 64),
 		ttlMs,
 	).Slice()
 	if err != nil {
@@ -146,11 +168,21 @@ func (c *billingCache) ReserveInflightBalance(ctx context.Context, userID int64,
 		return false, 0, fmt.Errorf("unexpected inflight reservation reply: %v", res)
 	}
 	allowed, _ := res[0].(int64)
+	if allowed == -1 {
+		return false, 0, service.ErrBalanceCacheMiss
+	}
 	var sum float64
 	if s, ok := res[1].(string); ok {
 		sum, _ = strconv.ParseFloat(s, 64)
 	}
 	return allowed == 1, sum, nil
+}
+
+func (c *billingCache) InvalidateAndReleaseInflightBalance(ctx context.Context, userID int64, requestID string) error {
+	zkey, hkey := billingInflightKeys(userID)
+	return invalidateAndReleaseInflightBalanceScript.Run(ctx, c.rdb,
+		[]string{zkey, hkey, billingBalanceKey(userID), billingBalanceVersionKey(userID)},
+		requestID, uuid.NewString(), billingBalanceVersionTTL.Milliseconds()).Err()
 }
 
 // ReleaseInflightBalance 实现 service.InflightBalanceReservationCache。

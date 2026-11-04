@@ -1180,7 +1180,8 @@ billing:
   # The first in-flight request of a user is always admitted (same as before).
   # Fails open when the estimate cannot be computed or Redis is unavailable.
   # 余额模式在途预留：准入时估算单请求费用，要求 缓存余额 - 在途预留合计 >= 估算；
-  # 用户无在途请求时始终放行（与旧行为一致）；估算失败/Redis 不可用时 fail-open。
+  # 用户无在途请求时仍须原子核对当前余额为正且达到最低门槛；已准入单笔可超额结算。
+  # Redis 不可用时拒绝准入（503）；无法估价是否放行由 fail_closed_on_unpriced 控制。
   inflight_reservation:
     enabled: true
     # Reservation TTL. Renewed every ttl/3 while the request is running; after the

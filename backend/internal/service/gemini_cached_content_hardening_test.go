@@ -386,10 +386,10 @@ func (s *fixedChargeCacheStub) reserve(key, requestID string, amount float64) fl
 	return sum
 }
 
-func (s *fixedChargeCacheStub) ReserveInflightBalance(_ context.Context, userID int64, requestID string, amount, balance float64, _ time.Duration) (bool, float64, error) {
+func (s *fixedChargeCacheStub) ReserveInflightBalance(_ context.Context, userID int64, requestID string, amount, minimumBalance float64, _ time.Duration) (bool, float64, error) {
 	key := fmt.Sprintf("user:%d", userID)
 	others := s.reserve(key, requestID, amount)
-	if len(s.reserved[key]) > 1 && balance-others < amount {
+	if s.balance <= 0 || s.balance < minimumBalance || (len(s.reserved[key]) > 1 && s.balance-others < amount) {
 		delete(s.reserved[key], requestID)
 		return false, others, nil
 	}

@@ -104,7 +104,7 @@ func (m *handlerInflightCache) GetUserPlatformQuotaCache(context.Context, int64,
 	return nil, false, nil
 }
 
-func (m *handlerInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id string, amount, balance float64, _ time.Duration) (bool, float64, error) {
+func (m *handlerInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id string, amount, minimumBalance float64, _ time.Duration) (bool, float64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.reservations++
@@ -112,7 +112,7 @@ func (m *handlerInflightCache) ReserveInflightBalance(_ context.Context, _ int64
 	for _, v := range m.res {
 		sum += v
 	}
-	if len(m.res) > 0 && balance-sum < amount {
+	if m.balance <= 0 || m.balance < minimumBalance || (len(m.res) > 0 && m.balance-sum < amount) {
 		return false, sum, nil
 	}
 	m.res[id] = amount
@@ -153,7 +153,10 @@ func TestWrapUsageRecordTaskContext_HandsReservationToBillingTask(t *testing.T) 
 	require.Equal(t, 1, cache.count())
 
 	ran := false
-	task, abandon := wrapUsageRecordTaskContext(c.Request.Context(), func(context.Context) { ran = true })
+	task, abandon := wrapUsageRecordTaskContext(c.Request.Context(), func(ctx context.Context) {
+		ran = true
+		require.Same(t, service.InflightReservationFromContext(c.Request.Context()), service.InflightReservationFromContext(ctx), "settlement failures must reach the same reservation")
+	})
 	done() // handler returns; billing still pending
 	require.Equal(t, 1, cache.count(), "reservation held until the billing task finishes")
 	task(context.Background())

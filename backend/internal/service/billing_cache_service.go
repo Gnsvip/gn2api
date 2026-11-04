@@ -308,6 +308,11 @@ func (s *BillingCacheService) logCacheWriteDrop(task cacheWriteTask, reason stri
 // 余额缓存方法
 // ============================================
 
+// balanceCacheLoader protects cold loads against concurrent settlement/invalidation.
+type balanceCacheLoader interface {
+	LoadUserBalance(context.Context, int64, func(context.Context) (float64, error)) (float64, error)
+}
+
 // GetUserBalance 获取用户余额（优先从缓存读取）
 func (s *BillingCacheService) GetUserBalance(ctx context.Context, userID int64) (float64, error) {
 	if s.cache == nil {
@@ -325,6 +330,21 @@ func (s *BillingCacheService) GetUserBalance(ctx context.Context, userID int64) 
 	value, err, _ := s.balanceLoadSF.Do(strconv.FormatInt(userID, 10), func() (any, error) {
 		loadCtx, cancel := context.WithTimeout(context.Background(), balanceLoadTimeout)
 		defer cancel()
+
+		if cache, ok := s.cache.(balanceCacheLoader); ok {
+			balance, err := cache.LoadUserBalance(loadCtx, userID, func(ctx context.Context) (float64, error) {
+				return s.getUserBalanceFromDB(ctx, userID)
+			})
+			if err == nil || s.InflightReservationEnabled() {
+				return balance, err
+			}
+			// Explicitly disabled reservations keep DB fallback, without queuing
+			// an unguarded cache write that could overwrite a later settlement.
+			return s.getUserBalanceFromDB(loadCtx, userID)
+		}
+		if s.InflightReservationEnabled() {
+			return nil, fmt.Errorf("balance cache cannot safely load reservation balance")
+		}
 
 		balance, err := s.getUserBalanceFromDB(loadCtx, userID)
 		if err != nil {
@@ -351,6 +371,9 @@ func (s *BillingCacheService) GetUserBalance(ctx context.Context, userID int64) 
 
 // getUserBalanceFromDB 从数据库获取用户余额
 func (s *BillingCacheService) getUserBalanceFromDB(ctx context.Context, userID int64) (float64, error) {
+	if s.userRepo == nil {
+		return 0, fmt.Errorf("balance repository unavailable")
+	}
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return 0, fmt.Errorf("get user balance: %w", err)

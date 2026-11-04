@@ -174,7 +174,7 @@ func (d *downReserveCache) ReleaseInflightBalance(ctx context.Context, userID in
 	return d.down.ReleaseInflightBalance(ctx, userID, requestID)
 }
 
-func TestInflightReservation_RedisDownFailsOpen(t *testing.T) {
+func TestInflightReservation_RedisDownFailsClosed(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -194,7 +194,7 @@ func TestInflightReservation_RedisDownFailsOpen(t *testing.T) {
 	user := &service.User{ID: 5}
 	for i := 0; i < 3; i++ {
 		release, err := svc.ReserveInflightBalance(context.Background(), user, nil, nil, 100)
-		require.NoError(t, err)
+		require.ErrorIs(t, err, service.ErrBillingServiceUnavailable)
 		release()
 	}
 }

@@ -40,7 +40,7 @@ func inflightNoop() {}
 // 成功时把预留句柄挂到 c.Request 的 context 上：之后通过 submit*UsageRecordTask 提交的
 // 计费任务会接管一个引用，直到余额缓存实际扣减后才释放。返回的 done 必须 defer 调用
 // （停止续期并归还 handler 引用；没有提交计费任务时即刻释放）。
-// 开关关闭、订阅模式、Redis 故障时返回 no-op（fail-open）；无法定价时默认 fail-open，
+// 开关关闭、订阅模式时返回 no-op；Redis 故障返回计费服务不可用。无法定价时默认 fail-open，
 // 配置 fail_closed_on_unpriced=true 时返回 ErrInsufficientBalance。
 func reserveInflightBalance(
 	c *gin.Context,

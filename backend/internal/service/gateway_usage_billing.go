@@ -163,6 +163,7 @@ func postUsageBilling(ctx context.Context, p *postUsageBillingParams, deps *bill
 				slog.Error("deduct balance failed", "user_id", p.User.ID, "error", err)
 			} else if deps.billingCacheService != nil {
 				if err := deps.billingCacheService.InvalidateUserBalance(billingCtx, p.User.ID); err != nil {
+					recoverBalanceCacheAfterSettlement(billingCtx, deps.billingCacheService, p.User.ID)
 					slog.Warn("invalidate balance cache after legacy deduction failed", "user_id", p.User.ID, "error", err)
 				}
 			}
@@ -465,12 +466,17 @@ func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, de
 	go notifyAccountQuota(p, deps, result)
 }
 
+type balanceCacheSettlementClamper interface {
+	ClampUserBalanceAfterBilling(context.Context, int64, float64) error
+}
+
 func syncBalanceCacheAfterDeduction(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult) {
 	if p == nil || p.Cost == nil || p.User == nil || deps == nil || deps.billingCacheService == nil {
 		return
 	}
 	if result != nil && result.NewBalance != nil && deps.billingCacheService.balanceBelowEligibilityThreshold(*result.NewBalance) {
 		if err := deps.billingCacheService.InvalidateUserBalance(ctx, p.User.ID); err != nil {
+			recoverBalanceCacheAfterSettlement(ctx, deps.billingCacheService, p.User.ID)
 			slog.Warn("invalidate balance cache after exhausted deduction failed",
 				"user_id", p.User.ID,
 				"new_balance", *result.NewBalance,
@@ -484,13 +490,34 @@ func syncBalanceCacheAfterDeduction(ctx context.Context, p *postUsageBillingPara
 		// 在途预留开启时同步扣减余额缓存：计费任务结束后才会释放预留，
 		// 必须保证此时准入读取的缓存余额已反映本次扣费，否则释放与扣减之间
 		// 仍存在「在途=0 且余额未扣」的窗口。本函数运行在计费 worker 中，不在请求热路径。
-		err := deps.billingCacheService.DeductBalanceCache(ctx, p.User.ID, p.Cost.ActualCost)
+		var err error
+		if cache, ok := deps.billingCacheService.cache.(balanceCacheSettlementClamper); ok && result != nil && result.NewBalance != nil {
+			err = cache.ClampUserBalanceAfterBilling(ctx, p.User.ID, *result.NewBalance)
+		} else {
+			err = deps.billingCacheService.DeductBalanceCache(ctx, p.User.ID, p.Cost.ActualCost)
+		}
 		if err == nil {
 			return
 		}
-		logger.LegacyPrintf("service.gateway", "Warning: sync deduct balance cache failed for user %d, falling back to queue: %v", p.User.ID, err)
+		logger.LegacyPrintf("service.gateway", "Warning: sync deduct balance cache failed for user %d, invalidating before release: %v", p.User.ID, err)
+		recoverBalanceCacheAfterSettlement(ctx, deps.billingCacheService, p.User.ID)
+		return
 	}
 	deps.billingCacheService.QueueDeductBalance(p.User.ID, p.Cost.ActualCost)
+}
+
+// Do not retry a possibly-applied subtraction asynchronously after releasing the
+// reservation. Invalidate with a fresh context; if Redis is still unavailable,
+// release must atomically invalidate the stale value before removing protection.
+func recoverBalanceCacheAfterSettlement(ctx context.Context, svc *BillingCacheService, userID int64) {
+	retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cacheWriteTimeout)
+	defer cancel()
+	if err := svc.InvalidateUserBalance(retryCtx, userID); err != nil {
+		if reservation := InflightReservationFromContext(ctx); reservation != nil {
+			reservation.cacheDirty.Store(true)
+		}
+		logger.LegacyPrintf("service.gateway", "Warning: balance cache invalidation failed after settlement for user %d: %v", userID, err)
+	}
 }
 
 // notifyBalanceLow sends balance low notification after deduction.
