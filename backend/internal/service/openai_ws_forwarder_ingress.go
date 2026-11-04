@@ -94,8 +94,31 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if wsSessionScope.Ephemeral {
 		defer s.clearOpenAIWSSessionDisabled(wsSessionScope)
 	}
-	if s.openAIWSSessionDisabledReason(wsSessionScope) != "" {
+	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
+	c.Set(openAIWSSessionRecoveryContextKey, (*openAIWSSessionRecovery)(nil))
+	var wsRecovery *openAIWSSessionRecovery
+	disabledReason := s.openAIWSSessionDisabledReason(wsSessionScope)
+	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
+		disabledReason, wsRecovery = s.beginOpenAIWSSessionRecovery(wsSessionScope, firstClientMessage)
+	}
+	if disabledReason != "" {
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "websocket is unavailable for this session; use HTTP", nil)
+	}
+	c.Set(openAIWSSessionRecoveryContextKey, wsRecovery)
+	defer wsRecovery.finish(false)
+	if wsRecovery != nil {
+		wrapped := OpenAIWSIngressHooks{}
+		if hooks != nil {
+			wrapped = *hooks
+		}
+		afterTurn := wrapped.AfterTurn
+		wrapped.AfterTurn = func(turn int, result *OpenAIForwardResult, err error) {
+			wsRecovery.finish(openAIWSRecoverySucceeded(result, err))
+			if afterTurn != nil {
+				afterTurn(turn, result, err)
+			}
+		}
+		hooks = &wrapped
 	}
 	restoreClientSession := stageCodexHTTPClientSession(c, account, firstClientMessage)
 	defer restoreClientSession()
@@ -125,7 +148,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}()
 	}
 
-	wsDecision := s.getOpenAIWSProtocolResolver().Resolve(account)
 	forceHTTPBridge := account.Platform == PlatformGrok ||
 		(s.pluginManager != nil && s.pluginManager.ShouldRouteOpenAIOAuth(account))
 	modeRouterV2Enabled := s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled
@@ -564,9 +586,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		preferredConnID = ""
 		storeDisabled = s.isOpenAIWSStoreDisabledInRequestRaw(payload.payloadRaw, account)
-		if useHTTPBridge {
+		if useHTTPBridge || openAIWSRecoveryActive(c) {
 			// Sticky account affinity may be shared, but an HTTP bridge must not
 			// inherit another connection's native WS turn state or socket binding.
+			if openAIWSRecoveryActive(c) && stateStore != nil && sessionHash != "" {
+				stateStore.DeleteSessionTurnState(groupID, sessionHash)
+				stateStore.DeleteSessionConn(groupID, sessionHash)
+			}
 			return
 		}
 		if turnState == "" && stateStore != nil && sessionHash != "" {
@@ -899,6 +925,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// dedicated 模式下每次获取均新建连接，避免跨会话复用残留上下文；
 		// 上游读写失败后的重试同样新建，避免再拿到同批陈旧的空闲连接。
 		req.ForceNewConn = dedicatedMode || forceNewConn
+		if openAIWSRecoveryActive(c) {
+			req.PreferredConnID, req.ForcePreferredConn, req.ForceNewConn = "", false, true
+		}
 		req.LifetimeReserve = s.openAIWSLifetimeReserve(ctx)
 		timing.Stage("acquire_websocket")
 		acquireStarted := time.Now()

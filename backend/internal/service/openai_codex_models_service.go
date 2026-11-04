@@ -2346,6 +2346,12 @@ func applySyncedAPIKeyCodexModelMetadata(body []byte, account *Account, overwrit
 		if metadata.ContextWindow > 0 {
 			fields = append(fields, "context_window", "max_context_window")
 		}
+		if validCodexContextSetting(metadata.AutoCompactTokenLimit, 0) != nil {
+			fields = append(fields, "auto_compact_token_limit")
+		}
+		if validCodexContextSetting(metadata.EffectiveContextWindowPercent, 100) != nil {
+			fields = append(fields, "effective_context_window_percent")
+		}
 
 		// List conversion has already applied live fields over account capabilities.
 		modelChanged := applyCodexToolCapabilities(model, metadata.CodexToolCapabilities, false)
@@ -2356,6 +2362,10 @@ func applySyncedAPIKeyCodexModelMetadata(body []byte, account *Account, overwrit
 			}
 			current, currentExists := model[field]
 			current = bytes.TrimSpace(current)
+			// A live null means use the model default, not a stale synced limit.
+			if field == "auto_compact_token_limit" && !overwriteLocalDefaults && currentExists {
+				continue
+			}
 			if !overwriteLocalDefaults && currentExists && len(current) > 0 && !bytes.Equal(current, []byte("null")) {
 				continue
 			}

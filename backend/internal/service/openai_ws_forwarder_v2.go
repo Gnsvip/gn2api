@@ -154,7 +154,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if executionScope = strings.TrimSpace(executionScope); executionScope != "" {
 		sessionHash = executionScope
 	}
-	if turnState == "" && stateStore != nil && sessionHash != "" {
+	if turnState == "" && stateStore != nil && sessionHash != "" && !openAIWSRecoveryActive(c) {
 		if savedTurnState, ok := stateStore.GetSessionTurnState(groupID, sessionHash); ok {
 			turnState = savedTurnState
 		}
@@ -175,6 +175,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	storeDisabledConnMode := s.openAIWSStoreDisabledConnMode()
 	forceNewConnByPolicy := shouldForceNewConnOnStoreDisabled(storeDisabledConnMode, lastFailureReason)
 	forceNewConn := forceNewConnByPolicy && storeDisabled && previousResponseID == "" && sessionHash != "" && preferredConnID == ""
+	if openAIWSRecoveryActive(c) {
+		preferredConnID, forceNewConn = "", true
+		if stateStore != nil && sessionHash != "" {
+			stateStore.DeleteSessionTurnState(groupID, sessionHash)
+			stateStore.DeleteSessionConn(groupID, sessionHash)
+		}
+	}
 	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
 		c,
@@ -232,8 +239,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		account.ProxyID != nil && account.Proxy != nil,
 	)
 
-	acquireCtx, acquireCancel := context.WithTimeout(ctx, s.openAIWSAcquireTimeout())
-	defer acquireCancel()
+	acquireCtx, acquireCancel := s.newOpenAIWSAcquireContext(ctx)
 
 	timing.Stage("acquire_websocket")
 	acquireStarted := time.Now()
@@ -254,6 +260,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return ""
 		}(),
 	})
+	acquireCancel()
 	SetOpsLatencyMs(c, OpsOpenAIWSAcquireMsKey, time.Since(acquireStarted).Milliseconds())
 	if err != nil {
 		var agentDialErr *openAIWSDialError

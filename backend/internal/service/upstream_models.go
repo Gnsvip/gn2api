@@ -33,17 +33,19 @@ const (
 )
 
 type UpstreamModelMetadata struct {
-	ID                       string                     `json:"id"`
-	DisplayName              string                     `json:"display_name,omitempty"`
-	Description              string                     `json:"description,omitempty"`
-	Reasoning                *bool                      `json:"reasoning,omitempty"`
-	DefaultReasoningLevel    string                     `json:"default_reasoning_level,omitempty"`
-	SupportedReasoningLevels []string                   `json:"supported_reasoning_levels,omitempty"`
-	InputModalities          []string                   `json:"input_modalities,omitempty"`
-	ContextWindow            int64                      `json:"context_window,omitempty"`
-	MaxContextWindow         int64                      `json:"max_context_window,omitempty"`
-	MaxOutputTokens          int64                      `json:"max_output_tokens,omitempty"`
-	CodexToolCapabilities    map[string]json.RawMessage `json:"codex_tool_capabilities,omitempty"`
+	ID                            string                     `json:"id"`
+	DisplayName                   string                     `json:"display_name,omitempty"`
+	Description                   string                     `json:"description,omitempty"`
+	Reasoning                     *bool                      `json:"reasoning,omitempty"`
+	DefaultReasoningLevel         string                     `json:"default_reasoning_level,omitempty"`
+	SupportedReasoningLevels      []string                   `json:"supported_reasoning_levels,omitempty"`
+	InputModalities               []string                   `json:"input_modalities,omitempty"`
+	ContextWindow                 int64                      `json:"context_window,omitempty"`
+	MaxContextWindow              int64                      `json:"max_context_window,omitempty"`
+	AutoCompactTokenLimit         *int64                     `json:"auto_compact_token_limit,omitempty"`
+	EffectiveContextWindowPercent *int64                     `json:"effective_context_window_percent,omitempty"`
+	MaxOutputTokens               int64                      `json:"max_output_tokens,omitempty"`
+	CodexToolCapabilities         map[string]json.RawMessage `json:"codex_tool_capabilities,omitempty"`
 }
 
 type UpstreamModelMetadataSnapshot struct {
@@ -442,6 +444,8 @@ func upstreamModelMetadataIsUseful(metadata UpstreamModelMetadata) bool {
 		len(metadata.CodexToolCapabilities) > 0 ||
 		metadata.ContextWindow > 0 ||
 		metadata.MaxContextWindow > 0 ||
+		metadata.AutoCompactTokenLimit != nil ||
+		metadata.EffectiveContextWindowPercent != nil ||
 		metadata.MaxOutputTokens > 0
 }
 
@@ -1477,24 +1481,26 @@ type upstreamModelEntryMetadata struct {
 
 type upstreamModelCapabilityEntry struct {
 	upstreamModelEntry
-	DisplayName              string                     `json:"display_name"`
-	Description              string                     `json:"description"`
-	Reasoning                *bool                      `json:"reasoning"`
-	DefaultReasoningLevel    string                     `json:"default_reasoning_level"`
-	SupportedReasoningLevels []json.RawMessage          `json:"supported_reasoning_levels"`
-	ReasoningOptions         []modelsDevReasoningOption `json:"reasoning_options"`
-	InputModalities          []string                   `json:"input_modalities"`
-	Modalities               modelsDevModalities        `json:"modalities"`
-	ContextWindow            int64                      `json:"context_window"`
-	MaxContextWindow         int64                      `json:"max_context_window"`
-	MaxOutputTokens          int64                      `json:"max_output_tokens"`
-	Limit                    modelsDevLimit             `json:"limit"`
-	DisplayNameCamel         string                     `json:"displayName"`
-	SupportsImages           *bool                      `json:"supportsImages"`
-	SupportsThinking         *bool                      `json:"supportsThinking"`
-	ThinkingBudget           *int64                     `json:"thinkingBudget"`
-	MaxTokens                int64                      `json:"maxTokens"`
-	MaxOutputTokensCamel     int64                      `json:"maxOutputTokens"`
+	DisplayName                   string                     `json:"display_name"`
+	Description                   string                     `json:"description"`
+	Reasoning                     *bool                      `json:"reasoning"`
+	DefaultReasoningLevel         string                     `json:"default_reasoning_level"`
+	SupportedReasoningLevels      []json.RawMessage          `json:"supported_reasoning_levels"`
+	ReasoningOptions              []modelsDevReasoningOption `json:"reasoning_options"`
+	InputModalities               []string                   `json:"input_modalities"`
+	Modalities                    modelsDevModalities        `json:"modalities"`
+	ContextWindow                 int64                      `json:"context_window"`
+	MaxContextWindow              int64                      `json:"max_context_window"`
+	AutoCompactTokenLimit         *int64                     `json:"auto_compact_token_limit"`
+	EffectiveContextWindowPercent *int64                     `json:"effective_context_window_percent"`
+	MaxOutputTokens               int64                      `json:"max_output_tokens"`
+	Limit                         modelsDevLimit             `json:"limit"`
+	DisplayNameCamel              string                     `json:"displayName"`
+	SupportsImages                *bool                      `json:"supportsImages"`
+	SupportsThinking              *bool                      `json:"supportsThinking"`
+	ThinkingBudget                *int64                     `json:"thinkingBudget"`
+	MaxTokens                     int64                      `json:"maxTokens"`
+	MaxOutputTokensCamel          int64                      `json:"maxOutputTokens"`
 }
 
 func extractUpstreamModelIDs(body []byte) ([]string, error) {
@@ -1657,16 +1663,18 @@ func upstreamMetadataFromCapabilityEntry(modelID string, entry upstreamModelCapa
 		displayName = strings.TrimSpace(entry.Name)
 	}
 	return UpstreamModelMetadata{
-		ID:                       modelID,
-		DisplayName:              displayName,
-		Description:              strings.TrimSpace(entry.Description),
-		Reasoning:                reasoning,
-		DefaultReasoningLevel:    defaultReasoningLevel,
-		SupportedReasoningLevels: levels,
-		InputModalities:          normalizeCodexInputModalities(modalities),
-		ContextWindow:            contextWindow,
-		MaxContextWindow:         entry.MaxContextWindow,
-		MaxOutputTokens:          maxOutputTokens,
+		ID:                            modelID,
+		DisplayName:                   displayName,
+		Description:                   strings.TrimSpace(entry.Description),
+		Reasoning:                     reasoning,
+		DefaultReasoningLevel:         defaultReasoningLevel,
+		SupportedReasoningLevels:      levels,
+		InputModalities:               normalizeCodexInputModalities(modalities),
+		ContextWindow:                 contextWindow,
+		MaxContextWindow:              entry.MaxContextWindow,
+		AutoCompactTokenLimit:         validCodexContextSetting(entry.AutoCompactTokenLimit, 0),
+		EffectiveContextWindowPercent: validCodexContextSetting(entry.EffectiveContextWindowPercent, 100),
+		MaxOutputTokens:               maxOutputTokens,
 	}
 }
 

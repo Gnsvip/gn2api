@@ -53,6 +53,28 @@ HTTP → WS 的已有访问记录增加最后一次尝试的数字诊断：`ops_
 
 这项改动作用于已有 HTTP Responses→WS 路径，不将所有端点强制改为 WS；Chat Completions 兼容端点、compact、显式禁用 WS、透传等保留各自传输规则。它优化传输与续传，不保证上游 prompt cache 命中率或模型能力。
 
+## 临时故障后的会话恢复
+
+网关不再因一次 `dial_failed` 等临时错误将活跃会话长期固定在 HTTP。首次失败冷却 30 秒；恢复失败依次延长为 60、120、240、300 秒，之后上限为 5 分钟。冷却从失败计时，成功 HTTP 请求只更新空闲淘汰时间，不推迟恢复。`upgrade_required` / `ws_unsupported` 等能力信号仍保留会话禁用；401、策略拒绝、限流和单次 403 维持各自已有处理。
+
+冷却结束后，同一凭据归属、账号、分组、API Key 和客户端执行会话只放行一个恢复请求。请求必须没有显式 `previous_response_id`、没有纯 item 引用，且工具结果具备配对调用；否则不拿增量内容建立新根。恢复强制新建上游 WS，清理该执行会话的旧连接/turn-state 关联，完整发送当前历史。只有成功终态完成后才解除回退；新连接的检查点继续按现有规则完整校验，后续工具结果才能自动增量。
+
+HTTP→WS 的获取连接、握手与普通重试共用原有总重试预算；该预算仅作为获取连接的截止时间传递，不给正常推理/生成设置同样的总超时。原有单次凭据任务、失效锚点或密文修复仍分别保留其有界重试机会。恢复请求失败或取消会释放探测资格；已输出的响应不回放。原生 WS 的上下文池和透传入口也使用同一恢复准入规则。
+
+新增 `session_recovery_probe`、`session_recovery_succeeded`、`session_recovery_deferred` 日志只包含账号 ID、错误分类、次数和冷却毫秒数，不保存正文、图片、密文或完整请求头。恢复策略用于减少连接故障的额外等待，不保证上游内容生成时间或首字小于 10 秒。
+
+## 模型目录与压缩设置
+
+2026-11-03 的只读官方 Codex `client_version=0.166.0` 清单中，Astra 的默认/最大窗口是 272000 / 872000；公共 API 的 1050000 不能直接作为 OAuth Codex 默认窗口。OAuth Astra 缺少已同步窗口时使用上述 Codex 回退值，账号明确同步的窗口仍优先，API Key 默认不受此修改影响。2026-11-04 只读检查确认账号 #12249、#12250 没有保存模型元数据，因此会走回退分支。
+
+目录同步及生成补齐 `auto_compact_token_limit` 和 `effective_context_window_percent`。上游明确的有效数值随快照保留；未声明/null 保留模型默认，不推算或强制统一提前压缩阈值。实时清单的 null 不被旧快照的阈值覆盖。多个路由候选必须都明确声明相应设置才生成公共覆盖值，采用其中较小值。
+
+配置参考：[官方 Codex 配置说明](https://learn.chatgpt.com/docs/config-file/config-reference)、[网关模型目录说明](https://learn.chatgpt.com/docs/model-catalogs)。客户端实际是否读取新目录、是否存在本地覆盖以及当前会话已缓存的窗口，仍应以客户端日志核验。此修改不主动压缩、删减历史或改动推理等级；先前本机原生压缩实测不等于本次变更已在生产验收。
+
+本次最终验证命令：`go test -tags=unit ./internal/service ./internal/handler ./internal/server/middleware ./internal/pkg/requesttiming -run 'Test.*(WS|WebSocket|HTTPToWS|Codex|UpstreamModel|ExtractUpstream|RequestTiming|RequestAccessLogger|Logger_|OpenAIEnsureForwardErrorResponse|OpenAIForwardErrorAlreadyCommunicated)' -count=1 -timeout=240s -json`。2,526 项测试及子用例通过，0 失败；1 项 `TestScopedCodexWriteAuthorizationAndTransactions` 因未配置独立 `SCOPED_ADMIN_TEST_DSN` 跳过。
+
+新增本地网络验收覆盖 HTTP 回退→新 WS 完整历史→下一轮工具增量，以及原生 WS 上下文池/透传的恢复与工具续传。另验证单探测并发准入、冷却不被 HTTP 延长、能力拒绝保持禁用、过期探测不能清除新状态、慢握手受连接预算约束、正常生成可超过连接预算，以及目录同步和实时 null 的优先级。测试没有向真实上游发起新生成；前端、客户端配置和生产服务未修改，尚未发布部署。
+
 ## 可观察字段
 
 现有 `http request completed` 日志增加 `openai_ws_auto_incremental` 和 `openai_ws_auto_incremental_reason`。字段反映本请求最终 WS 尝试；退回 HTTP 时为 false/http_fallback。无问答正文、缓存键原文或密文日志。

@@ -129,11 +129,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		wsDecision = openAIWSHTTPDecision("compact_http")
 	}
 	httpWSBridge := GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP && account.IsOpenAI() && account.IsOpenAIOAuthLike() && !compactPath && !passthroughEnabled
+	c.Set(openAIWSSessionRecoveryContextKey, (*openAIWSSessionRecovery)(nil))
+	var wsRecovery *openAIWSSessionRecovery
 	// A WS continuation cannot be replayed as stateless HTTP without its history.
-	if httpWSBridge && strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
-		if reason := s.openAIWSSessionDisabledReason(wsSessionScope); reason != "" {
+	if httpWSBridge && wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 && strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		var reason string
+		reason, wsRecovery = s.beginOpenAIWSSessionRecovery(wsSessionScope, body)
+		if reason != "" {
 			wsDecision = openAIWSHTTPDecision("ws_session_disabled:" + reason)
 		}
+		c.Set(openAIWSSessionRecoveryContextKey, wsRecovery)
+		defer wsRecovery.finish(false)
 	}
 	// Explicit HTTP passthrough bypasses the WS forwarder; report the actual route.
 	if passthroughEnabled {
@@ -970,11 +976,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		retryBudget := s.openAIWSRetryTotalBudget()
 		retryStartedAt := time.Now()
+		connectCtx := withOpenAIWSConnectBudget(ctx, retryStartedAt, retryBudget)
 	wsRetryLoop:
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			wsAttempts = attempt
 			wsResult, wsErr = s.forwardOpenAIWSV2(
-				ctx,
+				connectCtx,
 				c,
 				account,
 				wsReqBody,
@@ -999,6 +1006,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			var taskRecoveredErr *agentIdentityTaskRecoveredError
 			if errors.As(wsErr, &taskRecoveredErr) {
+				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
 				continue
 			}
 
@@ -1009,9 +1017,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			// previous_response_not_found 说明续链锚点不可用：
 			// 对非 function_call_output 场景，允许一次“去掉 previous_response_id 后重放”。
 			if reason == "previous_response_not_found" && recoverPrevResponseNotFound(attempt) {
+				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
 				continue
 			}
 			if reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
+				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
 				continue
 			}
 			if retryable && attempt < maxAttempts {
@@ -1073,6 +1083,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			break
 		}
 		if wsErr == nil {
+			wsRecovery.finish(openAIWSRecoverySucceeded(wsResult, nil))
 			firstTokenMs := int64(0)
 			hasFirstTokenMs := wsResult != nil && wsResult.FirstTokenMs != nil
 			if hasFirstTokenMs {

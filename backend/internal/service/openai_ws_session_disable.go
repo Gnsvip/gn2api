@@ -3,26 +3,18 @@ package service
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 )
 
-// 官方 Codex CLI 的传输回退语义（codex-rs core/src/client.rs）：
-// provider.supports_websockets 默认开启、每请求优先 WS；两类触发会置位
-// 会话级 disable_websockets，会话余生全部走 HTTP——
-//   1. WS 握手收到 426 Upgrade Required（能力信号）
-//   2. 流式重试预算耗尽（stream_max_retries=5）
-//
-// 网关按凭据归属、账号、分组和隔离后的客户端执行会话保存标记。
-// 活跃会话不会因故障 TTL 到期重新探测；24h 空闲或容量淘汰结束本地会话。
-// 匿名请求仅共享本次请求的状态。
-//
-// 分类原则与官方一致：能力信号与「重试预算耗尽的可重试错误」禁用本会话
-// 的 WS 传输；本地连接池争用（acquire/queue）只让本请求透明回退；请求内容级与凭据级
-// 错误（policy/auth/dead-anchor/invalid-encrypted）在 HTTP 上会以同形失败，
-// 不触发回退也不标记。
+// Gateway recovery policy, scoped by credential owner, account, group and
+// client execution session. Capability failures remain disabled for the session;
+// transient failures allow one full-history WS probe after a bounded cooldown.
+// HTTP traffic updates idle eviction only, never the recovery deadline.
 
 type openAIWSSessionScope struct {
 	AccountID           int64
@@ -64,16 +56,124 @@ func resolveOpenAIWSSessionScope(c *gin.Context, account *Account, body []byte) 
 	return scope
 }
 
-// openAIWSSessionDisableState lasts for the logical session, not a retry TTL.
 type openAIWSSessionDisableState struct {
 	reason         string
 	since          time.Time
 	prewarmStarted bool
 	lastUsed       time.Time
+	retryAt        time.Time
+	failures       int
+	probeID        string
 }
 
 const openAIWSSessionRegistryLimit = 8192
 const openAIWSSessionIdleLifetime = 24 * time.Hour
+const openAIWSSessionRecoveryContextKey = "openai_ws_session_recovery"
+
+type openAIWSSessionRecovery struct {
+	service  *OpenAIGatewayService
+	scope    openAIWSSessionScope
+	probeID  string
+	finished atomic.Bool
+}
+
+func openAIWSSessionRecoveryCooldown(failures int) time.Duration {
+	delay := 30 * time.Second
+	for i := 1; i < failures && delay < 5*time.Minute; i++ {
+		delay *= 2
+	}
+	return min(delay, 5*time.Minute)
+}
+
+func openAIWSRecoveryActive(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	value, _ := c.Get(openAIWSSessionRecoveryContextKey)
+	probe, _ := value.(*openAIWSSessionRecovery)
+	return probe != nil && !probe.finished.Load()
+}
+
+// A bare continuation or an orphaned tool result cannot establish a fresh root.
+func openAIWSCanStartRecovery(body []byte) bool {
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		return false
+	}
+	items, exists, err := openAIWSExtractNormalizedInputSequence(body)
+	if err != nil || !exists || (openAIWSRawItemsHasFunctionCallOutput(items) && !openAIWSRawItemsHaveToolCallContextForOutputs(items)) {
+		return false
+	}
+	for _, item := range items {
+		if gjson.GetBytes(item, "type").String() == "item_reference" {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *OpenAIGatewayService) beginOpenAIWSSessionRecovery(scope openAIWSSessionScope, body []byte) (string, *openAIWSSessionRecovery) {
+	if s == nil || scope.AccountID <= 0 || scope.Session == "" {
+		return "", nil
+	}
+	openAIWSSessionRegistryMu.Lock()
+	state := s.openAIWSSessionStateLocked(scope)
+	if state.reason == "" {
+		openAIWSSessionRegistryMu.Unlock()
+		return "", nil
+	}
+	s.storeOpenAIWSSessionStateLocked(scope, state)
+	if openAIWSSessionFallbackActionFor(state.reason).capability || state.probeID != "" ||
+		time.Now().Before(state.retryAt) {
+		openAIWSSessionRegistryMu.Unlock()
+		return state.reason, nil
+	}
+	openAIWSSessionRegistryMu.Unlock()
+	// Long histories are validated outside the registry lock so one session's
+	// recovery cannot delay unrelated requests. Recheck admission afterwards.
+	if !openAIWSCanStartRecovery(body) {
+		return state.reason, nil
+	}
+	openAIWSSessionRegistryMu.Lock()
+	defer openAIWSSessionRegistryMu.Unlock()
+	state = s.openAIWSSessionStateLocked(scope)
+	if state.reason == "" || openAIWSSessionFallbackActionFor(state.reason).capability ||
+		state.probeID != "" || time.Now().Before(state.retryAt) {
+		return state.reason, nil
+	}
+	state.probeID = uuid.NewString()
+	s.storeOpenAIWSSessionStateLocked(scope, state)
+	logOpenAIWSModeInfo("session_recovery_probe account_id=%d reason=%s failures=%d", scope.AccountID, normalizeOpenAIWSLogValue(state.reason), state.failures)
+	return "", &openAIWSSessionRecovery{service: s, scope: scope, probeID: state.probeID}
+}
+
+// A late probe must not clear a newer failure, an evicted/replaced state or a
+// capability signal. Completion is called once, including cancellation paths.
+func (p *openAIWSSessionRecovery) finish(success bool) {
+	if p == nil || !p.finished.CompareAndSwap(false, true) {
+		return
+	}
+	openAIWSSessionRegistryMu.Lock()
+	defer openAIWSSessionRegistryMu.Unlock()
+	state := p.service.openAIWSSessionStateLocked(p.scope)
+	if state.probeID != p.probeID {
+		return
+	}
+	if success {
+		p.service.openaiWSSessionDisabled.Delete(p.scope)
+		logOpenAIWSModeInfo("session_recovery_succeeded account_id=%d", p.scope.AccountID)
+		return
+	}
+	state.probeID = ""
+	state.failures++
+	state.retryAt = time.Now().Add(openAIWSSessionRecoveryCooldown(state.failures))
+	p.service.storeOpenAIWSSessionStateLocked(p.scope, state)
+	logOpenAIWSModeInfo("session_recovery_deferred account_id=%d cooldown_ms=%d", p.scope.AccountID, openAIWSSessionRecoveryCooldown(state.failures).Milliseconds())
+}
+
+func openAIWSRecoverySucceeded(result *OpenAIForwardResult, err error) bool {
+	return err == nil && result != nil && result.OpenAIWSMode && !result.ClientDisconnect &&
+		(result.UpstreamTerminalEvent == "response.completed" || result.UpstreamTerminalEvent == "response.done")
+}
 
 // Serializes insertions and eviction, without changing the service's shared map.
 var openAIWSSessionRegistryMu sync.Mutex
@@ -199,8 +299,11 @@ func (s *OpenAIGatewayService) markOpenAIWSSessionDisabled(scope openAIWSSession
 	openAIWSSessionRegistryMu.Lock()
 	defer openAIWSSessionRegistryMu.Unlock()
 	state := s.openAIWSSessionStateLocked(scope)
-	if state.reason == "" {
+	if !openAIWSSessionFallbackActionFor(state.reason).capability {
 		state.reason, state.since = reason, time.Now()
+		state.failures++
+		state.probeID = ""
+		state.retryAt = state.since.Add(openAIWSSessionRecoveryCooldown(state.failures))
 	}
 	s.storeOpenAIWSSessionStateLocked(scope, state)
 }

@@ -221,6 +221,15 @@ func groupCodexModelMetadata(
 			missingMetadata = true
 		}
 		metadata.CodexToolCapabilities = accountCodexToolCapabilities(account, lookupModel)
+		// OAuth Codex defaults differ from the public API's maximum context.
+		// Use the observed 0.166 Codex fallback only when account metadata is
+		// absent; explicit upstream windows, including larger ones, still win.
+		if account.IsOpenAI() && account.IsOpenAIOAuthLike() && isOpenAIGPT6AstraModel(lookupModel) && metadata.ContextWindow <= 0 {
+			metadata.ContextWindow = configuredCodexFallbackContext
+			if metadata.MaxContextWindow <= 0 {
+				metadata.MaxContextWindow = configuredCodexGPT56MaxContext
+			}
+		}
 		candidates = append(candidates, metadata)
 	}
 	if len(candidates) == 0 {
@@ -229,7 +238,11 @@ func groupCodexModelMetadata(
 	metadata := intersectUpstreamModelMetadata(modelID, candidates)
 	if missingMetadata {
 		metadata = codexModelMetadataOverride{UpstreamModelMetadata: UpstreamModelMetadata{
-			CodexToolCapabilities: metadata.CodexToolCapabilities,
+			CodexToolCapabilities:         metadata.CodexToolCapabilities,
+			ContextWindow:                 metadata.ContextWindow,
+			MaxContextWindow:              metadata.MaxContextWindow,
+			AutoCompactTokenLimit:         metadata.AutoCompactTokenLimit,
+			EffectiveContextWindowPercent: metadata.EffectiveContextWindowPercent,
 		}}
 	}
 	if publicAlias {
@@ -395,6 +408,32 @@ func intersectUpstreamModelMetadata(modelID string, candidates []UpstreamModelMe
 			result.MaxContextWindow = maxContextWindow
 		}
 	}
+	result.AutoCompactTokenLimit = intersectCodexContextSetting(candidates, func(m UpstreamModelMetadata) *int64 { return m.AutoCompactTokenLimit }, 0)
+	result.EffectiveContextWindowPercent = intersectCodexContextSetting(candidates, func(m UpstreamModelMetadata) *int64 { return m.EffectiveContextWindowPercent }, 100)
+	return result
+}
+
+func validCodexContextSetting(value *int64, maximum int64) *int64 {
+	if value == nil || *value <= 0 || (maximum > 0 && *value > maximum) {
+		return nil
+	}
+	return value
+}
+
+// Only publish a shared, explicitly declared setting. Missing/null settings
+// keep the client's model default; they are not inferred from the API maximum.
+func intersectCodexContextSetting(candidates []UpstreamModelMetadata, get func(UpstreamModelMetadata) *int64, maximum int64) *int64 {
+	var result *int64
+	for _, candidate := range candidates {
+		value := validCodexContextSetting(get(candidate), maximum)
+		if value == nil {
+			return nil
+		}
+		if result == nil || *value < *result {
+			copy := *value
+			result = &copy
+		}
+	}
 	return result
 }
 
@@ -453,6 +492,12 @@ func applyUpstreamModelMetadataToCodexDescriptor(
 	if metadata.MaxContextWindow > 0 {
 		descriptor.MaxContextWindow = metadata.MaxContextWindow
 		descriptor.ContextWindow = min(descriptor.ContextWindow, metadata.MaxContextWindow)
+	}
+	if value := validCodexContextSetting(metadata.AutoCompactTokenLimit, 0); value != nil {
+		descriptor.AutoCompactTokenLimit = *value
+	}
+	if value := validCodexContextSetting(metadata.EffectiveContextWindowPercent, 100); value != nil {
+		descriptor.EffectiveContextWindowPercent = *value
 	}
 }
 
