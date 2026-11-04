@@ -160,27 +160,38 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 	setOpenAIWSTurnStateMetadata(payload, turnState)
+	recordOpenAIWSScopeHash(c, sessionHash)
 	preferredConnID := ""
+	bindingStatus := "not_applicable"
 	if stateStore != nil && previousResponseID != "" {
+		bindingStatus = "response_not_present"
 		if connID, ok := stateStore.GetResponseConn(previousResponseID); ok {
 			preferredConnID = connID
+			bindingStatus = "response_hit"
 		}
 	}
 	storeDisabled := s.isOpenAIWSStoreDisabledInRequest(reqBody, account)
-	if stateStore != nil && storeDisabled && previousResponseID == "" && sessionHash != "" {
-		if connID, ok := stateStore.GetSessionConn(groupID, sessionHash); ok {
-			preferredConnID = connID
-		}
+	if storeDisabled && previousResponseID == "" {
+		preferredConnID, bindingStatus = openAIWSSessionConnDiagnostic(stateStore, groupID, sessionHash)
 	}
 	storeDisabledConnMode := s.openAIWSStoreDisabledConnMode()
 	forceNewConnByPolicy := shouldForceNewConnOnStoreDisabled(storeDisabledConnMode, lastFailureReason)
 	forceNewConn := forceNewConnByPolicy && storeDisabled && previousResponseID == "" && sessionHash != "" && preferredConnID == ""
+	newConnReason := ""
+	if forceNewConn {
+		newConnReason = "binding_" + bindingStatus
+	}
 	if openAIWSRecoveryActive(c) {
+		newConnReason = "recovery"
 		preferredConnID, forceNewConn = "", true
 		if stateStore != nil && sessionHash != "" {
 			stateStore.DeleteSessionTurnState(groupID, sessionHash)
 			stateStore.DeleteSessionConn(groupID, sessionHash)
 		}
+	}
+	if c != nil {
+		c.Set("openai_ws_binding_status", bindingStatus)
+		c.Set("openai_ws_preferred_conn_id", preferredConnID)
 	}
 	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
@@ -252,6 +263,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		},
 		PreferredConnID: preferredConnID,
 		ForceNewConn:    forceNewConn,
+		newConnReason:   newConnReason,
 		LifetimeReserve: s.openAIWSLifetimeReserve(ctx),
 		ProxyURL: func() string {
 			if account.ProxyID != nil && account.Proxy != nil {
@@ -306,6 +318,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	cleanExit := false
 	defer func() {
 		if !cleanExit {
+			lease.conn.invalidateCheckpoint("turn_failed")
+			lease.conn.recordEviction("turn_failed")
+			if c != nil {
+				c.Set("openai_ws_checkpoint_after", "turn_failed")
+			}
 			lease.MarkBroken()
 		}
 		lease.Release()
@@ -315,6 +332,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if c != nil {
 		c.Set("openai_upstream_transport", "websocket")
 		c.Set("openai_upstream_ws_connected", true)
+		c.Set("openai_ws_acquire_reason", lease.acquireReason)
+		c.Set("openai_ws_preferred_status", lease.preferredStatus)
+		c.Set("openai_ws_checkpoint_before", lease.conn.checkpointStatus())
 	}
 	logOpenAIWSModeDebug(
 		"connected account_id=%d account_type=%s transport=%s conn_id=%s conn_reused=%v conn_idle_ms=%d conn_age_ms=%d upstream_pings=%d conn_pick_ms=%d queue_wait_ms=%d has_previous_response_id=%v",
@@ -1009,10 +1029,22 @@ readLoop:
 		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), ttl)
 	}
 	if cleanExit && !clientDisconnected {
-		lease.conn.autoContinuation.Store(continuationCompleted)
+		if continuationCompleted != nil {
+			lease.conn.autoContinuation.Store(continuationCompleted)
+		} else if continuationDraft == nil {
+			lease.conn.invalidateCheckpoint("ineligible_input")
+		} else {
+			lease.conn.invalidateCheckpoint("incomplete_output")
+		}
 		if c != nil && autoContinuation && continuationSucceeded {
 			c.Set("openai_ws_auto_incremental_succeeded", true)
 		}
+	}
+	if clientDisconnected {
+		lease.conn.invalidateCheckpoint("downstream_disconnected")
+	}
+	if c != nil {
+		c.Set("openai_ws_checkpoint_after", lease.conn.checkpointStatus())
 	}
 	firstTokenMsValue := -1
 	if firstTokenMs != nil {

@@ -405,6 +405,13 @@ func TestLoggerCorrelatesResponsesID(t *testing.T) {
 		requesttiming.Context(c, c.Request.Context())
 		a := requesttiming.FromGin(c).Begin(123, "websocket")
 		a.Event("resp_correlated", "text", "completed", 100, true, true)
+		a.Written(true)
+		a.Flushed()
+		c.Set("ops_openai_ws_conn_id", "oa_ws_123_1")
+		c.Set("openai_ws_scope_hash", "0123456789abcdef")
+		c.Set("openai_ws_execution_lane", "main")
+		c.Set("openai_ws_acquire_reason", "preferred_reused")
+		c.Set("openai_ws_checkpoint_before", "ready")
 		c.Status(http.StatusOK)
 	})
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -416,6 +423,11 @@ func TestLoggerCorrelatesResponsesID(t *testing.T) {
 		}
 		if event.Fields["openai_response_id"] != "resp_correlated" || event.Fields["request_id"] != "gateway-correlated" {
 			t.Fatalf("missing direct correlation: %+v", event.Fields)
+		}
+		for _, key := range []string{"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms", "openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms", "ops_openai_ws_conn_id", "openai_ws_scope_hash", "openai_ws_execution_lane", "openai_ws_acquire_reason", "openai_ws_checkpoint_before"} {
+			if _, ok := event.Fields[key]; !ok {
+				t.Fatalf("missing metadata %s", key)
+			}
 		}
 		return
 	}

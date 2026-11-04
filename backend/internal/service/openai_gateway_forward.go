@@ -53,6 +53,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	// 请求体里的 client_metadata / prompt_cache_key，用改写后的值取键会让不同会话
 	// 落到同一个键，也会与 WS 接入路径按原始报文算出的键对不上。
 	wsExecutionScope, _ := resolveOpenAIWSExecutionScope(c, body, apiKeyID)
+	recordOpenAIWSExecutionDiagnostics(c, body, wsExecutionScope)
 	wsSessionScope := resolveOpenAIWSSessionScope(c, account, body)
 	if wsSessionScope.Ephemeral {
 		defer s.clearOpenAIWSSessionDisabled(wsSessionScope)

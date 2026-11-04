@@ -5,11 +5,31 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/tidwall/gjson"
 )
 
 type openAIRequestTimingHTTPKey struct{}
+
+// A role, tool name/ID, finish reason or usage chunk is not content. Classify
+// the converted chunk so withheld/upstream-only events do not imply a write.
+func openAIChatChunkHasContent(chunk apicompat.ChatCompletionsChunk) bool {
+	for _, choice := range chunk.Choices {
+		delta := choice.Delta
+		for _, text := range []*string{delta.Content, delta.Refusal, delta.ReasoningContent, delta.Reasoning} {
+			if text != nil && *text != "" {
+				return true
+			}
+		}
+		for _, call := range delta.ToolCalls {
+			if call.Function.Arguments != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // Only callers that observe response events may create timing attempts. The
 // shared HTTP transport also serves compatibility and account-usage requests;

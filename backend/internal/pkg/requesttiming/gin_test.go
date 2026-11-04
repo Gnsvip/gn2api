@@ -48,3 +48,27 @@ func TestRequestTimingGinTurnsCorrelateAndArchiveOnce(t *testing.T) {
 	require.Equal(t, 1, s.Turn)
 	require.Equal(t, "resp_slow", s.Attempts[0].ResponseID)
 }
+
+func TestRequestTimingFastMilestonesAndEmptyTurnDoNotLeak(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/responses", nil)
+	BeginTurn(c, 1)
+	a := FromGin(c).Begin(10, "websocket")
+	a.Event("resp_first", "text", "completed", 10, true, true)
+	a.Written(true)
+	a.Flushed()
+	Finish(c, 101)
+	for _, key := range []string{"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms", "openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms"} {
+		value, exists := c.Get(key)
+		require.True(t, exists)
+		require.IsType(t, int64(0), value)
+	}
+	BeginTurn(c, 2)
+	a = FromGin(c).Begin(10, "websocket")
+	a.Event("resp_second", "other_content", "completed", 10, false, false)
+	Finish(c, 101)
+	for _, key := range []string{"openai_timing_first_visible_ms", "openai_timing_first_text_ms", "openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms"} {
+		value, _ := c.Get(key)
+		require.Nil(t, value, key)
+	}
+}

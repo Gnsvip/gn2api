@@ -114,6 +114,21 @@ func FinishRecorder(c *gin.Context, recorder *Recorder, status int) {
 	}
 	last := s.Attempts[len(s.Attempts)-1]
 	c.Set("openai_response_id", last.ResponseID)
+	// Preserve these bounded milestones in the existing access record even
+	// when a fast request does not qualify for a separate evidence file.
+	for key, value := range map[string]*int64{
+		"openai_timing_first_event_ms":                last.FirstEventMS,
+		"openai_timing_first_visible_ms":              last.FirstVisibleMS,
+		"openai_timing_first_text_ms":                 last.FirstTextMS,
+		"openai_timing_first_content_write_ms":        last.FirstWriteMS,
+		"openai_timing_first_content_flush_return_ms": last.FirstFlushMS,
+	} {
+		if value != nil {
+			c.Set(key, *value)
+		} else {
+			c.Set(key, nil) // A later WS turn must not inherit an earlier milestone.
+		}
+	}
 	if s.Turn > 0 {
 		// A native WS can contain many turns: correlate each at completion, not
 		// just the final turn when the HTTP upgrade eventually closes.

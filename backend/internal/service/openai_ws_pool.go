@@ -78,7 +78,8 @@ type openAIWSAcquireRequest struct {
 	ProxyURL        string
 	PreferredConnID string
 	// ForceNewConn: 强制本次获取新连接（避免复用导致连接内续链状态互相污染）。
-	ForceNewConn bool
+	ForceNewConn  bool
+	newConnReason string // Code-generated diagnostic, not client input.
 	// ForcePreferredConn: 强制本次只使用 PreferredConnID，禁止漂移到其它连接。
 	ForcePreferredConn bool
 	// Calculated from the turn context, not the short connection-acquire deadline.
@@ -97,15 +98,17 @@ type openAIWSHandshakeCompatibilityKey struct {
 }
 
 type openAIWSConnLease struct {
-	pool       *openAIWSConnPool
-	accountID  int64
-	conn       *openAIWSConn
-	queueWait  time.Duration
-	connPick   time.Duration
-	idleBefore time.Duration
-	ageBefore  time.Duration
-	reused     bool
-	released   atomic.Bool
+	pool            *openAIWSConnPool
+	accountID       int64
+	conn            *openAIWSConn
+	queueWait       time.Duration
+	connPick        time.Duration
+	idleBefore      time.Duration
+	ageBefore       time.Duration
+	acquireReason   string
+	preferredStatus string
+	reused          bool
+	released        atomic.Bool
 }
 
 func (l *openAIWSConnLease) activeConn() (*openAIWSConn, error) {
@@ -282,8 +285,11 @@ func (l *openAIWSConnLease) Release() {
 }
 
 type openAIWSConn struct {
-	id string
-	ws openAIWSClientConn
+	accountID        int64
+	evictionReason   atomic.Pointer[string]
+	checkpointReason atomic.Pointer[string]
+	id               string
+	ws               openAIWSClientConn
 
 	handshakeHeaders       http.Header
 	handshakeCompatibility openAIWSHandshakeCompatibilityKey
@@ -316,10 +322,11 @@ type openAIWSConn struct {
 	autoContinuation atomic.Pointer[openAIWSAutoContinuation]
 }
 
-func newOpenAIWSConn(id string, _ int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
+func newOpenAIWSConn(id string, accountID int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
 	now := time.Now()
 	conn := &openAIWSConn{
 		id:               id,
+		accountID:        accountID,
 		ws:               ws,
 		handshakeHeaders: cloneHeader(handshakeHeaders),
 		leaseCh:          make(chan struct{}, 1),
@@ -556,6 +563,7 @@ func (c *openAIWSConn) closeWith(force bool) {
 		return
 	}
 	c.closeOnce.Do(func() {
+		c.recordEviction("closed")
 		close(c.closedCh)
 		if c.ws != nil {
 			if forceCloser, ok := c.ws.(openAIWSForceCloser); ok && force {
@@ -597,7 +605,7 @@ func (c *openAIWSConn) writeJSONWithTimeout(parent context.Context, value any, t
 func (c *openAIWSConn) writeJSON(value any, writeCtx context.Context) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	c.autoContinuation.Store(nil)
+	c.invalidateCheckpoint("upstream_write")
 	if c.ws == nil {
 		return errOpenAIWSConnClosed
 	}
@@ -1012,7 +1020,7 @@ func (p *openAIWSConnPool) runBackgroundPingSweep() {
 					item.conn.upstreamPingCount(),
 					truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
 				)
-				p.evictConn(item.accountID, item.conn.id)
+				p.evictConn(item.accountID, item.conn.id, "background_ping_failed")
 				return nil
 			}
 			logOpenAIWSModeDebug(
@@ -1134,8 +1142,10 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 			break
 		}
 		logOpenAIWSModeInfo("connection_lifetime_rotate account_id=%d conn_id=%s age_ms=%d reserve_ms=%d", req.Account.ID, lease.ConnID(), lease.conn.age(time.Now()).Milliseconds(), req.LifetimeReserve.Milliseconds())
+		lease.conn.recordEviction("lifetime_rotation")
 		lease.MarkBroken()
 		lease.Release()
+		req.newConnReason = "lifetime_rotation"
 		if req.ForcePreferredConn && !req.ForceNewConn {
 			return nil, errOpenAIWSConnLifetime
 		}
@@ -1156,6 +1166,7 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 		now := time.Now()
 		lease.idleBefore = lease.conn.idleDuration(now)
 		lease.ageBefore = lease.conn.age(now)
+		logOpenAIWSModeInfo("connection_acquired account_id=%d conn_id=%s reused=%v reason=%s preferred_conn_id=%s preferred_status=%s idle_ms=%d age_ms=%d", req.Account.ID, lease.ConnID(), lease.Reused(), lease.acquireReason, normalizeOpenAIWSLogValue(req.PreferredConnID), lease.preferredStatus, lease.idleBefore.Milliseconds(), lease.ageBefore.Milliseconds())
 	}
 	return lease, err
 }
@@ -1192,6 +1203,7 @@ retryAcquire:
 	allowReuse := !req.ForceNewConn
 	preferredConnID := stringsTrim(req.PreferredConnID)
 	forcePreferredConn := allowReuse && req.ForcePreferredConn
+	preferredStatus := openAIWSPreferredStatus(ap, preferredConnID, compatibility)
 
 	if allowReuse {
 		if forcePreferredConn {
@@ -1215,6 +1227,7 @@ retryAcquire:
 				closeOpenAIWSConns(evicted)
 				if p.shouldHealthCheckConn(preferredConn) {
 					if err := preferredConn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
+						preferredConn.recordEviction("health_check_failed")
 						preferredConn.close()
 						p.evictConn(accountID, preferredConn.id)
 						if retry < 1 {
@@ -1233,7 +1246,7 @@ retryAcquire:
 				p.metrics.acquireReuseTotal.Add(1)
 				p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 				p.ensureTargetIdleAsync(accountID)
-				return lease, nil
+				return describeOpenAIWSLease(lease, req, preferredStatus), nil
 			}
 
 			if p.dropDeadConnLocked(ap, preferredConn, &evicted) {
@@ -1268,6 +1281,7 @@ retryAcquire:
 			if p.shouldHealthCheckConn(preferredConn) {
 				if err := preferredConn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
 					preferredConn.release()
+					preferredConn.recordEviction("health_check_failed")
 					preferredConn.close()
 					p.evictConn(accountID, preferredConn.id)
 					if retry < 1 {
@@ -1290,7 +1304,7 @@ retryAcquire:
 			p.metrics.acquireReuseTotal.Add(1)
 			p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 			p.ensureTargetIdleAsync(accountID)
-			return lease, nil
+			return describeOpenAIWSLease(lease, req, preferredStatus), nil
 		}
 
 		if preferredConnID != "" {
@@ -1301,6 +1315,7 @@ retryAcquire:
 				closeOpenAIWSConns(evicted)
 				if p.shouldHealthCheckConn(conn) {
 					if err := conn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
+						conn.recordEviction("health_check_failed")
 						conn.close()
 						p.evictConn(accountID, conn.id)
 						if retry < 1 {
@@ -1313,7 +1328,7 @@ retryAcquire:
 				p.metrics.acquireReuseTotal.Add(1)
 				p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 				p.ensureTargetIdleAsync(accountID)
-				return lease, nil
+				return describeOpenAIWSLease(lease, req, preferredStatus), nil
 			} else if conn, ok := ap.conns[preferredConnID]; ok {
 				p.dropDeadConnLocked(ap, conn, &evicted)
 			}
@@ -1330,6 +1345,7 @@ retryAcquire:
 			closeOpenAIWSConns(evicted)
 			if p.shouldHealthCheckConn(best) {
 				if err := best.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
+					best.recordEviction("health_check_failed")
 					best.close()
 					p.evictConn(accountID, best.id)
 					if retry < 1 {
@@ -1342,7 +1358,7 @@ retryAcquire:
 			p.metrics.acquireReuseTotal.Add(1)
 			p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 			p.ensureTargetIdleAsync(accountID)
-			return lease, nil
+			return describeOpenAIWSLease(lease, req, preferredStatus), nil
 		} else if best != nil {
 			p.dropDeadConnLocked(ap, best, &evicted)
 		}
@@ -1358,6 +1374,7 @@ retryAcquire:
 					closeOpenAIWSConns(evicted)
 					if p.shouldHealthCheckConn(conn) {
 						if err := conn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
+							conn.recordEviction("health_check_failed")
 							conn.close()
 							p.evictConn(accountID, conn.id)
 							if retry < 1 {
@@ -1370,7 +1387,7 @@ retryAcquire:
 					p.metrics.acquireReuseTotal.Add(1)
 					p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 					p.ensureTargetIdleAsync(accountID)
-					return lease, nil
+					return describeOpenAIWSLease(lease, req, preferredStatus), nil
 				}
 				p.dropDeadConnLocked(ap, conn, &evicted)
 			}
@@ -1381,6 +1398,7 @@ retryAcquire:
 		affine := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity)
 		if idle := p.pickOldestIdleConnWithoutHandshakeCompatibilityLocked(ap, compatibility); idle != nil {
 			delete(ap.conns, idle.id)
+			idle.recordEviction("capacity_replacement")
 			evicted = append(evicted, idle)
 			p.metrics.scaleDownTotal.Add(1)
 		} else if affine == nil {
@@ -1417,6 +1435,7 @@ retryAcquire:
 	if req.ForceNewConn && len(ap.conns)+ap.creating >= effectiveMaxConns {
 		if idle := p.pickOldestIdleConnLocked(ap); idle != nil {
 			delete(ap.conns, idle.id)
+			idle.recordEviction("capacity_replacement")
 			evicted = append(evicted, idle)
 			p.metrics.scaleDownTotal.Add(1)
 		}
@@ -1438,6 +1457,7 @@ retryAcquire:
 			ap.signalChangedLocked()
 			ap.mu.Unlock()
 			if conn != nil {
+				conn.recordEviction("account_generation_changed")
 				conn.close()
 			}
 			if retry < 1 {
@@ -1458,6 +1478,7 @@ retryAcquire:
 		if !conn.tryAcquire() {
 			ap.signalChangedLocked()
 			ap.mu.Unlock()
+			conn.recordEviction("unusable_after_dial")
 			conn.close()
 			return nil, errOpenAIWSConnClosed
 		}
@@ -1473,7 +1494,7 @@ retryAcquire:
 		lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick}
 		p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 		p.ensureTargetIdleAsync(accountID)
-		return lease, nil
+		return describeOpenAIWSLease(lease, req, preferredStatus), nil
 	}
 
 	if req.ForceNewConn {
@@ -1532,6 +1553,7 @@ acquireAtCapacity:
 	if p.shouldHealthCheckConn(target) {
 		if err := target.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
 			target.release()
+			target.recordEviction("health_check_failed")
 			target.close()
 			p.evictConn(accountID, target.id)
 			if retry < 1 {
@@ -1545,7 +1567,7 @@ acquireAtCapacity:
 	p.metrics.acquireReuseTotal.Add(1)
 	p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
 	p.ensureTargetIdleAsync(accountID)
-	return lease, nil
+	return describeOpenAIWSLease(lease, req, preferredStatus), nil
 }
 
 func (p *openAIWSConnPool) recordConnPickDuration(duration time.Duration) {
@@ -1684,6 +1706,7 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			continue
 		}
 		if conn.isClosed() || conn.isUnusable() {
+			conn.recordEviction("unusable")
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
@@ -1697,6 +1720,7 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 		if !conn.isLeased() && conn.waiters.Load() == 0 &&
 			!conn.supportsIdlePingWithoutReader() &&
 			conn.idleDuration(now) >= openAIWSConnIdleRecycleAfter {
+			conn.recordEviction("idle_without_keepalive")
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
@@ -1706,6 +1730,7 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			continue
 		}
 		if maxAge > 0 && !conn.isLeased() && conn.age(now) > maxAge {
+			conn.recordEviction("max_age")
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
@@ -1740,12 +1765,14 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 		sort.SliceStable(idleConns, func(i, j int) bool {
 			return idleConns[i].lastUsedAt().Before(idleConns[j].lastUsedAt())
 		})
-		redundant := len(ap.conns) - maxIdle
+		// Active/pinned/waiting connections do not consume the idle budget.
+		redundant := len(idleConns) - maxIdle
 		if redundant > len(idleConns) {
 			redundant = len(idleConns)
 		}
 		for i := 0; i < redundant; i++ {
 			conn := idleConns[i]
+			conn.recordEviction("idle_limit")
 			delete(ap.conns, conn.id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, conn.id)
@@ -2038,6 +2065,7 @@ func (p *openAIWSConnPool) ClearAccount(accountID int64) {
 		delete(ap.conns, id)
 		delete(ap.pinnedConns, id)
 		if conn != nil {
+			conn.recordEviction("account_cleared")
 			conns = append(conns, conn)
 		}
 	}
@@ -2068,7 +2096,7 @@ func (p *openAIWSConnPool) dropDeadConnLocked(ap *openAIWSAccountPool, conn *ope
 	return true
 }
 
-func (p *openAIWSConnPool) evictConn(accountID int64, connID string) {
+func (p *openAIWSConnPool) evictConn(accountID int64, connID string, reasons ...string) {
 	if p == nil || accountID <= 0 || stringsTrim(connID) == "" {
 		return
 	}
@@ -2087,6 +2115,11 @@ func (p *openAIWSConnPool) evictConn(accountID int64, connID string) {
 		ap.mu.Unlock()
 	}
 	if conn != nil {
+		reason := "broken"
+		if len(reasons) > 0 {
+			reason = reasons[0]
+		}
+		conn.recordEviction(reason)
 		conn.close()
 	}
 }
@@ -2178,7 +2211,7 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	id := p.nextConnID(req.Account.ID)
 	pooledConn := newOpenAIWSConn(id, req.Account.ID, conn, handshakeHeaders)
 	accountID := req.Account.ID
-	evict := func() { p.evictConn(accountID, id) }
+	evict := func() { p.evictConn(accountID, id, "upstream_closed") }
 	pooledConn.onPeerClosed.Store(&evict)
 	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)

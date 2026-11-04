@@ -45,7 +45,9 @@
 
 覆盖 HTTP/SSE（普通与透传）、HTTP→WS、原生 WS 连接池、WS 透传和 WS→HTTP 桥接。WS 透传后续轮次从收到 `response.create` 开始记录，包含准入处理，不含此前的客户端空闲。
 
-上述覆盖指已接入 Responses 事件观察器的链路。共用 HTTP 传输的 Chat Completions/其他兼容转换、账号用量查询等未接入对应观察器的调用，只保留既有日志，不创建耗时尝试，也不会因缺少 Responses 终止事件而记为 `incomplete`。v0.2.53 曾错误纳入这些调用；调查该版本期间的摘要时，须结合入口路径确认，不能仅凭这类摘要认定请求失败。v0.2.54 已限制采集范围。
+v0.2.56 起，Chat Completions → Responses → Chat Completions 的流式转换也接入上述观察器，仍使用 HTTP/SSE。该分支的 `first_token_ms` 遵守全局 `visible` / `semantic` 设置；`visible` 可包含推理内容或工具输入，并不等同于正文。结构事件、空增量、无效 JSON、仅终止事件不会伪造 visible 首字。转换后的内容实际写出及 Flush 返回单独计时，包括被暂存后释放的内容。
+
+仅已接入事件观察器的链路创建耗时尝试。Chat 非流式缓冲转换、其他未接入的兼容路径和账号用量查询仍只保留既有日志，不会因缺少 Responses 终止事件而记为 `incomplete`。v0.2.53 曾错误纳入这些调用；调查该版本期间的摘要时，须结合入口路径确认，不能仅凭这类摘要认定请求失败。v0.2.54 已限制采集范围。
 
 这些时间只能定位网关准备/获取连接/发送/缓冲与等待上游内容的边界。不能将全部上游等待归因为推理，也不能分辨上游内部队列或客户端渲染延迟。
 
@@ -60,3 +62,18 @@ rg -F 'resp_要查询的ID' /实际日志目录/request-timing -g 'timing-*.json
 也可用网关 UUID 或 `client_request_id` 搜索，摘要内包含各次尝试，不需要按时间猜测关联。找不到时同时检查普通完成日志：请求可能没有达到留证条件，或旧记录已按期限/容量淘汰。
 
 明确要长期保留某次异常时，导出匹配的单条 JSON 到管理员本地调查目录；只保留一次，不复制整个日志目录，不启用正文抓取。导出的文件不在服务器自动淘汰范围。此功能不自动替用户永久保留所有异常。
+
+## v0.2.56 完成日志中的精简元数据
+
+即使快速请求不生成单独摘要，完成日志也保留最终尝试的 `openai_timing_first_event_ms`、`openai_timing_first_visible_ms`、`openai_timing_first_text_ms`、`openai_timing_first_content_write_ms`、`openai_timing_first_content_flush_return_ms`。这些时间沿用入口/WS 轮次的零点，缺失即未观察到；后续轮次不会继承旧值。服务端 Flush 返回仍不代表客户端已渲染。
+
+HTTP→WS 完成日志额外记录：
+
+- `ops_openai_ws_conn_id`、`openai_ws_preferred_conn_id`：实际连接与绑定指向的连接，可关联连接池日志。
+- `openai_ws_scope_hash`、`openai_ws_scope_source`、`openai_ws_execution_lane`：原始线程/显式会话作用域的摘要和固定用途分类。记录不含真实线程标识或任意客户端 request-kind 值；未知用途统一记为 `other`，实际隔离仍使用完整原始作用域。
+- `openai_ws_binding_status`：`hit`、`expired`、`not_present`、`missing_scope` 等。已被先前清理的绑定只能观察为 `not_present`，不猜测历史原因。
+- `openai_ws_preferred_status`：首选连接是否可用、忙碌、握手条件变化或已不在该账号池。
+- `openai_ws_acquire_reason`：复用首选/其他连接、新会话绑定缺失、寿命轮换、恢复等代码生成的原因。
+- `openai_ws_checkpoint_before` / `openai_ws_checkpoint_after`：`ready`、`expired`、`no_completed_turn`、`upstream_write`、`ineligible_input`、`incomplete_output`、`downstream_disconnected`、`turn_failed`；配合既有 `openai_ws_auto_incremental_reason` 判断压缩边界、历史/参数变化。
+
+连接池的 `connection_acquired` / `connection_evicted` 日志覆盖借出、新建和淘汰，包含连接 ID、账号、复用标记、原因、空闲时长/年龄及是否带检查点等元数据。寿命轮换、空闲额度、无保活连接超时、健康探测失败、上游关闭、账号清理和失败轮次分别标记。没有记录请求/回答正文、工具参数、凭据或原始错误消息。

@@ -80,7 +80,11 @@ func Logger() gin.HandlerFunc {
 		if model != "" {
 			fields = append(fields, zap.String("model", model))
 		}
-		for _, key := range []string{"openai_response_id", "openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type", "openai_ws_auto_incremental_changed_fields"} {
+		for _, key := range []string{"openai_response_id", "openai_upstream_transport", "openai_ws_transport_decision", "openai_ws_transport_reason", "openai_ws_auto_incremental_reason", "openai_ws_auto_incremental_item_type", "openai_ws_auto_incremental_previous_item_type", "openai_ws_auto_incremental_changed_fields",
+			"ops_openai_ws_conn_id", "openai_ws_scope_hash", "openai_ws_scope_source", "openai_ws_execution_lane",
+			"openai_ws_binding_status", "openai_ws_preferred_conn_id", "openai_ws_preferred_status",
+			"openai_ws_acquire_reason", "openai_ws_checkpoint_before", "openai_ws_checkpoint_after",
+		} {
 			if value := c.GetString(key); value != "" {
 				fields = append(fields, zap.String(key, value))
 			}
@@ -105,6 +109,8 @@ func Logger() gin.HandlerFunc {
 			"ops_openai_ws_acquire_ms", "ops_openai_ws_queue_wait_ms", "ops_openai_ws_conn_pick_ms",
 			"ops_openai_ws_write_ms", "ops_openai_ws_request_sent_ms",
 			"ops_openai_ws_first_event_ms", "ops_openai_ws_first_visible_ms",
+			"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms",
+			"openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms",
 		} {
 			if value, exists := c.Get(key); exists {
 				if ms, ok := value.(int64); ok && ms >= 0 {

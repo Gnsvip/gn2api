@@ -21,6 +21,9 @@ func clearOpenAIWSLatency(c *gin.Context) {
 	if c == nil {
 		return
 	}
+	for _, key := range openAIWSDiagnosticKeys {
+		c.Set(key, nil)
+	}
 	for _, key := range []string{
 		OpsOpenAIWSAttemptKey, OpsOpenAIWSAttemptStartMsKey,
 		OpsOpenAIWSRequestSentMsKey, OpsOpenAIWSFirstEventMsKey,

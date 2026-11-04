@@ -395,20 +395,30 @@ func (s *defaultOpenAIWSStateStore) BindSessionConn(groupID int64, sessionHash, 
 }
 
 func (s *defaultOpenAIWSStateStore) GetSessionConn(groupID int64, sessionHash string) (string, bool) {
+	conn, reason := s.GetSessionConnWithReason(groupID, sessionHash)
+	return conn, reason == "hit"
+}
+
+func (s *defaultOpenAIWSStateStore) GetSessionConnWithReason(groupID int64, sessionHash string) (string, string) {
 	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
 	if key == "" {
-		return "", false
+		return "", "missing_scope"
 	}
-	s.maybeCleanup()
-
-	now := time.Now()
+	// Observe expiry before this lookup's cleanup can remove the binding.
+	defer s.maybeCleanup()
 	s.sessionToConnMu.RLock()
 	binding, ok := s.sessionToConn[key]
 	s.sessionToConnMu.RUnlock()
-	if !ok || now.After(binding.expiresAt) || strings.TrimSpace(binding.connID) == "" {
-		return "", false
+	if !ok {
+		return "", "not_present"
 	}
-	return binding.connID, true
+	if time.Now().After(binding.expiresAt) {
+		return "", "expired"
+	}
+	if strings.TrimSpace(binding.connID) == "" {
+		return "", "empty_binding"
+	}
+	return binding.connID, "hit"
 }
 
 func (s *defaultOpenAIWSStateStore) DeleteSessionConn(groupID int64, sessionHash string) {
