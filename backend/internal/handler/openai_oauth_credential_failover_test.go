@@ -57,9 +57,10 @@ func (e *openAICredentialHandlerRefresher) Refresh(context.Context, *service.Acc
 }
 
 type openAICredentialHandlerUpstream struct {
-	mu     sync.Mutex
-	hits   []int64
-	bodies []string
+	mu           sync.Mutex
+	hits         []int64
+	bodies       []string
+	responseBody string
 }
 
 func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64, _ int) (*http.Response, error) {
@@ -68,7 +69,11 @@ func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64
 	u.hits = append(u.hits, id)
 	u.bodies = append(u.bodies, string(body))
 	u.mu.Unlock()
-	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"model\":\"gpt-6-astra\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"))}, nil
+	responseBody := u.responseBody
+	if responseBody == "" {
+		responseBody = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"model\":\"gpt-6-astra\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+	}
+	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(responseBody))}, nil
 }
 func (u *openAICredentialHandlerUpstream) DoWithTLS(r *http.Request, p string, id int64, n int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(r, p, id, n)

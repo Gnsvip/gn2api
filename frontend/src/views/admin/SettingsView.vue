@@ -5325,6 +5325,9 @@
                   class="input mt-2 w-full"
                   data-testid="openai-ttft-mode"
                 >
+                  <option value="first_event">
+                    {{ t("admin.settings.gatewayForwarding.openaiTTFTModeFirstEvent") }}
+                  </option>
                   <option value="visible">
                     {{ t("admin.settings.gatewayForwarding.openaiTTFTModeVisible") }}
                   </option>
@@ -11620,7 +11623,8 @@ async function saveSettings() {
       max_claude_code_version: form.max_claude_code_version,
       allow_ungrouped_key_scheduling: form.allow_ungrouped_key_scheduling,
       openai_ttft_mode:
-        form.openai_ttft_mode === "semantic" ? "semantic" : "visible",
+        ["semantic", "first_event"].includes(form.openai_ttft_mode)
+          ? form.openai_ttft_mode : "visible",
       enable_fingerprint_unification: form.enable_fingerprint_unification,
       enable_metadata_passthrough: form.enable_metadata_passthrough,
       enable_cch_signing: form.enable_cch_signing,

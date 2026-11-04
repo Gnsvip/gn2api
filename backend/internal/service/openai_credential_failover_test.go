@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	coderws "github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type openAIFailureCASRepo struct {
@@ -221,7 +222,12 @@ func TestOpenAIWSLaterTurn401NeverReplaysInitialTurn(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
 		payload, current := OpenAIWSCurrentTurnRetryPayload(err)
 		require.True(t, current, "never expose a later-turn auth failure as an initial-turn replay")
-		require.Empty(t, payload, "require client context recovery instead of an unsafe cross-account replay")
+		require.Empty(t, gjson.GetBytes(payload, "previous_response_id").String())
+		items := gjson.GetBytes(payload, "input").Array()
+		require.Len(t, items, 3, "retry must contain the initial user, completed assistant and current user")
+		require.Equal(t, "initial", items[0].Get("content").String())
+		require.Equal(t, "assistant", items[1].Get("role").String())
+		require.Equal(t, "followup", items[2].Get("content").String())
 		require.Equal(t, int32(2), dialer.calls.Load())
 	case <-ctx.Done():
 		t.Fatal("later-turn rejection did not terminate")

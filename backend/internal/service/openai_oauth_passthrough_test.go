@@ -1315,7 +1315,7 @@ func TestOpenAIGatewayService_APIKeyPassthrough_RebuildsUpstreamErrors(t *testin
 			wantRetryAfter: "17",
 		},
 		{
-			name:         "upstream unauthorized is reported as gateway failure",
+			name:         "upstream unauthorized requests account failover",
 			statusCode:   http.StatusUnauthorized,
 			contentType:  "application/json",
 			responseBody: `{"error":{"message":"invalid secret-upstream.example token","type":"authentication_error","code":"invalid_api_key","param":"api_key"},"rate_limit":{"remaining":0}}`,
@@ -1405,6 +1405,16 @@ func TestOpenAIGatewayService_APIKeyPassthrough_RebuildsUpstreamErrors(t *testin
 			_, err := svc.Forward(context.Background(), c, account, requestBody)
 
 			require.Error(t, err)
+			if tt.statusCode == http.StatusUnauthorized {
+				var failover *UpstreamFailoverError
+				require.ErrorAs(t, err, &failover)
+				require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
+				require.True(t, failover.ShouldRetryNextAccount())
+				require.False(t, c.Writer.Written(), "the handler owns the final response after account failover")
+				require.Empty(t, rec.Body.String())
+				require.Empty(t, rec.Header(), "do not leak rejected upstream headers to the client")
+				return
+			}
 			require.Equal(t, tt.wantStatus, rec.Code)
 			opsValue, ok := c.Get(OpsUpstreamErrorsKey)
 			require.True(t, ok)

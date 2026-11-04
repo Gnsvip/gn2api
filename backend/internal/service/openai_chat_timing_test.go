@@ -73,7 +73,7 @@ func TestChatTimingHonorsConfiguredMode(t *testing.T) {
 		previous = &cachedGatewayForwardingSettings{}
 	}
 	t.Cleanup(func() { gatewayForwardingCache.Store(previous) })
-	for _, mode := range []string{OpenAITTFTModeVisible, OpenAITTFTModeSemantic} {
+	for _, mode := range []string{OpenAITTFTModeVisible, OpenAITTFTModeSemantic, OpenAITTFTModeFirstEvent} {
 		t.Run(mode, func(t *testing.T) {
 			gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
 			c, _ := httpBridgeContext("configured-mode")
@@ -82,7 +82,7 @@ func TestChatTimingHonorsConfiguredMode(t *testing.T) {
 			resp := &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 			result, err := svc.handleChatStreamingResponse(resp, c, &Account{ID: 10, Platform: PlatformOpenAI}, "model", "model", "model", time.Now(), 0)
 			require.NoError(t, err)
-			require.Equal(t, mode == OpenAITTFTModeSemantic, result.FirstTokenMs != nil)
+			require.Equal(t, mode != OpenAITTFTModeVisible, result.FirstTokenMs != nil)
 		})
 	}
 }

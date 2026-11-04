@@ -1367,6 +1367,11 @@ func openAIStreamDataStartsTTFT(data, eventType string, forceOutput bool, mode s
 	if eventType == "error" || eventType == "codex.rate_limits" || isOpenAIWSTerminalEvent(eventType) {
 		return false
 	}
+	if mode == OpenAITTFTModeFirstEvent {
+		// Measure the first upstream Responses event, including processing
+		// notifications. This is a metric only, never a client-output/commit guard.
+		return strings.HasPrefix(eventType, "response.") && gjson.Valid(data)
+	}
 	if mode == OpenAITTFTModeVisible {
 		return openAIStreamDataStartsVisibleOutput(data, eventType)
 	}

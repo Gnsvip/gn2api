@@ -31,6 +31,18 @@ func TestBuildOpenAIWSCurrentTurnRetryPayloadRejectsOrphanToolOutput(t *testing.
 	require.Nil(t, retryPayload)
 }
 
+func TestBuildOpenAIWSCurrentTurnRetryPayloadRejectsAccountLocalReference(t *testing.T) {
+	payload := []byte(`{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_old"}`)
+	input := []json.RawMessage{
+		json.RawMessage(`{"role":"user","content":"initial"}`),
+		json.RawMessage(`{"type":"item_reference","id":"msg_stored_on_old_account"}`),
+	}
+	retryPayload, safe, err := buildOpenAIWSCurrentTurnRetryPayload(payload, input, true, "gpt-6-astra")
+	require.NoError(t, err)
+	require.False(t, safe)
+	require.Nil(t, retryPayload)
+}
+
 func TestProxyOpenAIWSHTTPBridgeTurnLaterTurn429FailsOverBeforeClientWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

@@ -642,6 +642,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	tokenEventCount := 0
 	terminalEventCount := 0
 	replayCollector := &openAIWSToolCallReplayCollector{}
+	var replayOutputCollector openAIWSContinuationOutputCollector
+	var completeReplayOutput []json.RawMessage
+	replayComplete := false
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
@@ -687,11 +690,16 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			Duration:                      time.Since(turnStart),
 			FirstTokenMs:                  firstTokenMs,
 		}
-		if replayInput := replayCollector.Items(); len(replayInput) > 0 {
+		replayInput := replayCollector.AllItems()
+		if replayComplete {
+			replayInput = completeReplayOutput
+		}
+		if len(replayInput) > 0 {
 			result.wsReplayInput = replayInput
 			result.wsReplayInputExists = true
 		}
-		result.wsAccountFailoverReplayInput = replayCollector.AllItems()
+		result.wsAccountFailoverReplayInput = replayInput
+		result.wsReplayComplete = replayComplete
 		if imageCount > 0 {
 			result.ImageCount = imageCount
 			result.ImageSize = imageSizeTier
@@ -814,6 +822,14 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			upstreamMessage = stamped
 		}
 		replayCollector.AddEvent(eventType, upstreamMessage)
+		replayOutputCollector.observe(upstreamMessage, eventType)
+		if eventType == "response.completed" || eventType == "response.done" {
+			ordered, complete := openAIWSLifetimeOutputReplay(&replayOutputCollector, replayCollector.AllItems(), upstreamMessage)
+			replayComplete = complete && (tokenEventCount == 0 || len(ordered) > 0)
+			if replayComplete {
+				completeReplayOutput = ordered
+			}
+		}
 
 		var upstreamEventErr error
 		if officialOpenAIResponses && bareErrorPending && (eventType == "response.completed" || eventType == "response.done") {

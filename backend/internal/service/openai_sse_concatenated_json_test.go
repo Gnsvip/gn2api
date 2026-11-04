@@ -30,6 +30,12 @@ func TestOpenAIStreamingPassthroughRepairsConcatenatedJSONDocumentsInSingleDataL
 
 func TestOpenAIWSv2StreamingRepairsConcatenatedJSONDocumentsInSingleMessage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	previousSettings := gatewayForwardingCache.Load()
+	if previousSettings == nil {
+		previousSettings = &cachedGatewayForwardingSettings{}
+	}
+	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: OpenAITTFTModeVisible})
+	t.Cleanup(func() { gatewayForwardingCache.Store(previousSettings) })
 
 	largeInProgress, outputItemAdded, completed := openAIConcatenatedJSONTestEvents(t)
 	captureConn := &openAIWSCaptureConn{events: [][]byte{

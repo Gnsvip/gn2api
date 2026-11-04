@@ -981,6 +981,13 @@ func buildOpenAIWSCurrentTurnRetryPayload(
 	if !fullInputExists {
 		return nil, false, nil
 	}
+	for _, item := range fullInput {
+		if gjson.GetBytes(item, "type").String() == "item_reference" {
+			// An item stored on the old account is not portable conversation
+			// history, even when all visible tool call IDs happen to match.
+			return nil, false, nil
+		}
+	}
 	retryPayload, err := setOpenAIWSPayloadInputSequence(payload, fullInput, true)
 	if err != nil {
 		return nil, false, err
@@ -997,6 +1004,24 @@ func buildOpenAIWSCurrentTurnRetryPayload(
 		return nil, false, nil
 	}
 	return retryPayload, true, nil
+}
+
+// Preserve the current turn on every later-turn failover. A typed error with
+// no replay body explicitly prevents the handler from replaying the first turn.
+func prepareOpenAIWSCurrentTurnFailover(cause error, payload []byte, replay []json.RawMessage, complete bool, originalModel string) error {
+	var failover *UpstreamFailoverError
+	if !errors.As(cause, &failover) {
+		return cause
+	}
+	var turnErr *openAIWSIngressTurnError
+	if errors.As(cause, &turnErr) && turnErr.wroteDownstream {
+		complete = false
+	}
+	retryPayload, safe, err := buildOpenAIWSCurrentTurnRetryPayload(payload, replay, complete, originalModel)
+	if err != nil || !safe {
+		retryPayload = nil
+	}
+	return newOpenAIWSCurrentTurnFailoverError(cause, retryPayload)
 }
 
 func shouldKeepIngressPreviousResponseID(

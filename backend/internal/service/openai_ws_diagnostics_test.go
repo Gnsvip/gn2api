@@ -96,6 +96,9 @@ func TestHTTPToWSAutoContinuationSurvivesAnotherActiveThread(t *testing.T) {
 	s, account, _ := httpBridgeFixture(t, server.URL)
 	s.cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 3
 	s.cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	// This test counts the two active threads' dials, not speculative warm
+	// connections from the default utilization target below one.
+	s.cfg.Gateway.OpenAIWS.PoolTargetUtilization = 1
 	s.cfg.Gateway.OpenAIWS.StoreDisabledConnMode = openAIWSStoreDisabledConnModeStrict
 	defer func() { unblock(); s.openaiWSPool.Close() }()
 	first, _ := httpBridgeContext("shared-session")

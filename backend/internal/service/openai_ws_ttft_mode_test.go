@@ -19,7 +19,7 @@ import (
 )
 
 func TestOpenAITTFTDoesNotInventTerminalTiming(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
 		for _, event := range []string{
 			`{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"late"}]}]}}`,
 			`{"type":"response.done","response":{"output":[]}}`,
@@ -31,7 +31,7 @@ func TestOpenAITTFTDoesNotInventTerminalTiming(t *testing.T) {
 }
 
 func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
 		for _, terminalOnly := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/terminal_only_%t", mode, terminalOnly), func(t *testing.T) {
 				gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
@@ -43,6 +43,7 @@ func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
 					defer writer.Close()
 					_, _ = io.WriteString(writer, "data: "+`{"type":"response.created","response":{"id":"resp_bridge_ttft"}}`+"\n\n")
 					if !terminalOnly {
+						time.Sleep(60 * time.Millisecond)
 						_, _ = io.WriteString(writer, "data: "+`{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","input":""}}`+"\n\n")
 						time.Sleep(140 * time.Millisecond)
 						_, _ = fmt.Fprintln(writer, "data: "+output+"\n")
@@ -58,15 +59,22 @@ func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
 				var forwarded []string
 				result, err := s.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, account, "test-token", body, len(body), "gpt-6.1-sol", "", "", "", "", 1, func(frame []byte) error { forwarded = append(forwarded, string(frame)); return nil })
 				require.NoError(t, err)
-				if terminalOnly {
+				if terminalOnly && mode != OpenAITTFTModeFirstEvent {
 					require.Nil(t, result.FirstTokenMs)
 				} else {
 					require.NotNil(t, result.FirstTokenMs)
-					require.Contains(t, forwarded, output)
+					if !terminalOnly {
+						require.Contains(t, forwarded, output)
+					}
+					if mode == OpenAITTFTModeFirstEvent {
+						require.Less(t, *result.FirstTokenMs, 60)
+					}
 					if mode == OpenAITTFTModeVisible {
 						require.GreaterOrEqual(t, *result.FirstTokenMs, 130)
 					}
-					require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
+					if !terminalOnly {
+						require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(80))
+					}
 				}
 			})
 		}
@@ -74,7 +82,7 @@ func TestWSHTTPBridgeTTFTToolDoneAndTerminalOnly(t *testing.T) {
 }
 
 func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
 		t.Run(mode, func(t *testing.T) {
 			gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{openAITTFTMode: mode, expiresAt: time.Now().Add(time.Minute).UnixNano()})
 			t.Cleanup(func() { gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{}) })
@@ -105,6 +113,7 @@ func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
 					t.Fatal(ctx.Err())
 				}
 				upstream.Send(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp_ttft_%d"}}`, turn))
+				time.Sleep(60 * time.Millisecond)
 				upstream.Send(`{"type":"response.output_item.added","item":{"type":"custom_tool_call","input":""}}`)
 				time.Sleep(140 * time.Millisecond)
 				upstream.Send(output) // No response_id, including on the second turn.
@@ -123,6 +132,9 @@ func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
 				select {
 				case result := <-results:
 					require.NotNil(t, result.FirstTokenMs)
+					if mode == OpenAITTFTModeFirstEvent {
+						require.Less(t, *result.FirstTokenMs, 60)
+					}
 					if mode == OpenAITTFTModeVisible {
 						require.GreaterOrEqual(t, *result.FirstTokenMs, 130)
 					}
@@ -136,7 +148,7 @@ func TestNativeWSPassthroughTTFTLaterToolTurns(t *testing.T) {
 }
 
 func TestHTTPToWSTTFTUsesConfiguredMode(t *testing.T) {
-	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {
+	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible, OpenAITTFTModeFirstEvent} {
 		for _, output := range []string{
 			`{"type":"response.custom_tool_call_input.done","input":"synthetic command"}`,
 			`{"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_one","name":"lookup","input":"synthetic command"}}`,
@@ -157,6 +169,7 @@ func TestHTTPToWSTTFTUsesConfiguredMode(t *testing.T) {
 						return
 					}
 					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ttft"}}`))
+					time.Sleep(60 * time.Millisecond)
 					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_one","summary":[]}}`))
 					time.Sleep(140 * time.Millisecond)
 					_ = conn.WriteMessage(websocket.TextMessage, []byte(output))
@@ -173,7 +186,7 @@ func TestHTTPToWSTTFTUsesConfiguredMode(t *testing.T) {
 				if result.FirstTokenMs == nil {
 					return
 				}
-				if mode == OpenAITTFTModeSemantic {
+				if mode != OpenAITTFTModeVisible {
 					require.GreaterOrEqual(t, result.Duration.Milliseconds()-int64(*result.FirstTokenMs), int64(210))
 				} else {
 					require.GreaterOrEqual(t, *result.FirstTokenMs, 130)

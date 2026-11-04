@@ -1004,6 +1004,9 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 }
 
 func normalizeOpenAITTFTMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeFirstEvent) {
+		return OpenAITTFTModeFirstEvent
+	}
 	if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeSemantic) {
 		return OpenAITTFTModeSemantic
 	}
