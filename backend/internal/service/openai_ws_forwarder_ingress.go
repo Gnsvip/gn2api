@@ -1968,7 +1968,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 
-		timing.Continuation(openAIWSPayloadStringFromRaw(currentPayload, "previous_response_id") != "")
+		recordOpenAIRequestShape(timing, currentPayload)
 		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false

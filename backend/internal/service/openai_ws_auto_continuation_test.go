@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -269,6 +270,7 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 			require.NoError(t, err)
 			<-requests
 			second, _ := httpBridgeContext("recover-incremental")
+			timing := requesttiming.Attach(second, time.Now(), 0)
 			_, err = s.Forward(context.Background(), second, a, autoContinuationBody(true, autoContinuationCall, autoContinuationTool))
 			require.NoError(t, err)
 			if mode != "http_fallback" {
@@ -283,6 +285,16 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 			if mode == "http_fallback" {
 				require.Equal(t, 1, httpUpstream.callCount)
 				replay = httpUpstream.bodies[0]
+				summary, _ := timing.Finish(200)
+				require.Len(t, summary.Attempts, 2)
+				ws, httpAttempt := summary.Attempts[0], summary.Attempts[1]
+				require.Equal(t, "websocket", ws.Transport)
+				require.NotNil(t, ws.InputItems)
+				require.Equal(t, 1, *ws.InputItems)
+				require.True(t, *ws.ContinuationAnchor)
+				require.Equal(t, "http", httpAttempt.Transport)
+				require.Equal(t, 4, *httpAttempt.InputItems)
+				require.False(t, *httpAttempt.ContinuationAnchor)
 			} else {
 				require.Zero(t, httpUpstream.callCount)
 				replay = <-requests

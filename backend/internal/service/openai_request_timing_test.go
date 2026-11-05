@@ -133,6 +133,33 @@ func TestRequestTimingAlreadyEncodedHTTPBody(t *testing.T) {
 	require.Nil(t, s.Attempts[0].SentMS, "mock transport has no write callback; do not invent a send time")
 }
 
+func TestRequestTimingHTTPShapeDoesNotRetainOrConsumeBody(t *testing.T) {
+	for _, anchor := range []bool{false, true} {
+		r := requesttiming.New(time.Now(), "shape-request", "", 0)
+		body := `{"input":[{"role":"user","content":"PRIVATE_QUESTION"},{"type":"function_call_output","call_id":"private_call","output":"PRIVATE_TOOL"}]}`
+		if anchor {
+			body = `{"previous_response_id":"resp_private",` + body[1:]
+		}
+		req, err := http.NewRequest("POST", "https://example.test/v1/responses", strings.NewReader(body))
+		require.NoError(t, err)
+		req = req.WithContext(r.Context(req.Context()))
+		upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}}
+		svc := &OpenAIGatewayService{httpUpstream: upstream}
+		resp, err := svc.doTimedOpenAIUpstream(req, "", &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, []byte(body))
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.JSONEq(t, body, string(upstream.lastBody))
+		s, _ := r.Finish(200)
+		require.Equal(t, anchor, *s.Attempts[0].ContinuationAnchor)
+		require.Equal(t, 2, *s.Attempts[0].InputItems)
+		encoded, err := json.Marshal(s)
+		require.NoError(t, err)
+		require.NotContains(t, string(encoded), "PRIVATE")
+		require.NotContains(t, string(encoded), "private_call")
+		require.NotContains(t, string(encoded), "resp_private")
+	}
+}
+
 func TestRequestTimingSharedTransportDoesNotRecordUnobservedRequests(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/backend-api/codex/usage", "/v1/responses"} {
 		t.Run(path, func(t *testing.T) {

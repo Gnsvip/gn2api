@@ -387,7 +387,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 
 		upstreamStart := time.Now()
-		resp, err = s.doTimedOpenAIUpstream(upstreamReq, proxyURL, account)
+		resp, err = s.doTimedOpenAIUpstream(upstreamReq, proxyURL, account, body)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if err != nil {
 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
@@ -1146,7 +1146,7 @@ func openAIStreamEventIsMetadata(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
 	// Queuing and moderation metadata do not commit model output or disarm the
 	// first-output timeout; a following overload must remain safe to retry.
-	case "response.created", "response.queued", "response.in_progress", "response.metadata", "keepalive":
+	case "response.created", "response.queued", "response.in_progress", "response.metadata", "keepalive", "ping", "codex.rate_limits":
 		return true
 	default:
 		return false
@@ -1239,6 +1239,29 @@ func openAIStreamDataStartsClientOutput(data, eventType string) bool {
 	}
 	field := ""
 	switch strings.TrimSpace(eventType) {
+	case "response.output_item.done":
+		// An empty message/reasoning envelope is still only preamble. A tool
+		// completion can trigger execution even with empty arguments; retain its
+		// commit boundary, as well as unknown or encrypted output.
+		item := gjson.Get(trimmed, "item")
+		if item.Get("encrypted_content").String() != "" {
+			return true
+		}
+		switch item.Get("type").String() {
+		case "message":
+			if !item.Get("content").IsArray() {
+				return true // Malformed/unknown done shapes are not proven empty.
+			}
+			return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), "response.output_item.added")
+		case "reasoning":
+			content := item.Get("content")
+			if !item.Get("summary").IsArray() || (content.Exists() && (!content.IsArray() || len(content.Array()) > 0)) {
+				return true
+			}
+			return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), "response.output_item.added")
+		default:
+			return true
+		}
 	case "response.failed":
 		return false
 	case "error":
@@ -1998,6 +2021,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	semanticOutputSeen := false
 	capacityFailoverSuppressedLogged := false
 	failedMessage := ""
+	var terminalFailureErr error
 	clientOutputStarted := false
 	codexFailureTerminal := account != nil && account.Platform == PlatformOpenAI
 	failureDelivered := false
@@ -2186,6 +2210,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				if failedMessage == "" {
 					failedMessage = "Upstream response failed"
 				}
+				terminalFailureErr = newOpenAIStreamTerminalError(dataBytes, failedMessage)
 				// response.failed 自带上游已消耗的 usage（input token 通常已扣）；必须先解析
 				// 再打 cyber 标记，否则 mark 记到的是解析前的 0，导致流式 cyber 按 0 token 计费
 				// 而漏记真实用量。对齐 WS V2 / Chat 流式路径（均先解析 usage 再 Mark）。
@@ -2202,6 +2227,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					})
 				}
 				outputStarted := openAIStreamClientOutputStarted(c, clientOutputStarted)
+				retryableFailure := !cyberHit && openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
+				if eventType == "error" {
+					retryableFailure = !cyberHit && openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
+				}
+				timing.StreamFailure(outputStarted, clientOutputStarted, retryableFailure, OpenAICompactKeepaliveAdjustedWrittenSize(c))
 				if !outputStarted && !cyberHit {
 					if compactErr := newOpenAICompactFallbackSignal(c, dataBytes, failedMessage); compactErr != nil {
 						return resultWithUsage(), compactErr
@@ -2223,15 +2253,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					}
 				}
 				if !outputStarted {
-					shouldFailover := false
-					if !cyberHit {
-						if eventType == "error" {
-							shouldFailover = openAIStreamErrorEventShouldFailover(dataBytes, failedMessage)
-						} else {
-							shouldFailover = openAIStreamFailedEventShouldFailover(dataBytes, failedMessage)
-						}
-					}
-					if shouldFailover {
+					if retryableFailure {
 						return resultWithUsage(),
 							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 					}
@@ -2353,7 +2375,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			return resultWithUsage(), nil
 		}
 		if sawFailedEvent {
-			return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
+			return resultWithUsage(), terminalFailureErr
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", err)
@@ -2383,7 +2405,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		return resultWithUsage(), fmt.Errorf("stream read error: %w", err)
 	}
 	if sawFailedEvent {
-		return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
+		return resultWithUsage(), terminalFailureErr
 	}
 	if !clientDisconnected && !sawDone && !sawTerminalEvent && ctx.Err() == nil {
 		logger.FromContext(ctx).With(

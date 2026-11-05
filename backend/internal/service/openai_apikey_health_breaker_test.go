@@ -101,6 +101,22 @@ func TestOpenAIAPIKeyHealthBreakerDefaultDisabled(t *testing.T) {
 	require.Zero(t, cache.recordCalls)
 }
 
+func TestOpenAIAPIKeyHealthBreakerCountsDeliveredStreamFailure(t *testing.T) {
+	settings := NewSettingService(&openAIAPIKeyHealthSettingRepo{value: `{"enabled":true,"window_minutes":2,"failure_threshold":3,"cooldown_minutes":5}`}, &config.Config{})
+	cache := &openAIAPIKeyHealthCacheStub{tripped: true}
+	repo := &openAIAPIKeyHealthAccountRepo{}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, cache)
+	svc.SetSettingService(settings)
+	svc.SetOpenAIAPIKeyHealthCache(cache)
+	account := openAIHealthPoolAccount()
+	err := newOpenAIStreamTerminalError([]byte(`{"response":{"error":{"code":"upstream_error"},"output":[{"text":"PRIVATE_OUTPUT"}]}}`), "failure")
+	require.True(t, svc.ObserveOpenAIAPIKeyHealthFailure(context.Background(), account, err))
+	require.Equal(t, 1, cache.recordCalls)
+	require.Equal(t, 1, repo.setCalls)
+	require.NotNil(t, account.TempUnschedulableUntil)
+	require.NotContains(t, repo.reason, "PRIVATE_OUTPUT")
+}
+
 func TestOpenAIAPIKeyHealthBreakerTripsPersistedAndRuntimeState(t *testing.T) {
 	encoded, err := json.Marshal(OpenAIAPIKeyHealthBreakerSettings{Enabled: true, WindowMinutes: 1, FailureThreshold: 3, CooldownMinutes: 5})
 	require.NoError(t, err)

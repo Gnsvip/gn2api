@@ -24,8 +24,118 @@ func TestOpenAIWSHTTPBackupPreservesCurrentTurnAndNextContinuation(t *testing.T)
 	}
 }
 
-func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string, standardBilling bool) {
+func TestOpenAIWSPassthroughHTTPBackupPreservesCurrentTurnAndNextContinuation(t *testing.T) {
+	for _, failure := range []string{"rate limit", "stream 401", "failed 401", "failed 502"} {
+		t.Run(failure, func(t *testing.T) {
+			testOpenAIWSHTTPBackupContinuation(t, failure, false, service.OpenAIWSIngressModePassthrough)
+		})
+	}
+}
+
+func TestOpenAIWSPassthroughHTTPBackupPreservesBillingReservation(t *testing.T) {
+	for _, failure := range []string{"rate limit", "failed 401", "failed 502"} {
+		t.Run(failure, func(t *testing.T) {
+			testOpenAIWSHTTPBackupContinuation(t, failure, true, service.OpenAIWSIngressModePassthrough)
+		})
+	}
+}
+
+func TestOpenAIWSPassthroughHTTPBackupRejectsUnsafeReplay(t *testing.T) {
+	for _, scenario := range []string{"text delivered", "tool delivered", "encrypted output delivered", "unknown anchor", "incomplete prior output", "orphan tool result"} {
+		t.Run(scenario, func(t *testing.T) {
+			var wsRequests atomic.Int32
+			upstreamWS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := coderws.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.CloseNow()
+				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+				if _, _, err := conn.Read(ctx); err != nil {
+					return
+				}
+				wsRequests.Add(1)
+				first := `{"type":"response.completed","response":{"id":"resp_first","output":[{"type":"message","id":"msg_first","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}]}}`
+				if scenario == "incomplete prior output" {
+					first = `{"type":"response.completed","response":{"id":"resp_first"}}`
+				}
+				if conn.Write(ctx, coderws.MessageText, []byte(first)) != nil {
+					return
+				}
+				if _, _, err := conn.Read(ctx); err != nil {
+					return
+				}
+				wsRequests.Add(1)
+				_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.created","response":{"id":"resp_failed"}}`))
+				switch scenario {
+				case "text delivered":
+					_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.output_text.delta","delta":"already shown"}`))
+				case "tool delivered":
+					_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_run","call_id":"run","name":"run","arguments":"{}"}}`))
+				case "encrypted output delivered":
+					_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_done","encrypted_content":"opaque","summary":[]}}`))
+				}
+				_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"code":"invalid_api_key","message":"Invalid API key"}}}`))
+				_, _, _ = conn.Read(ctx)
+			}))
+			defer upstreamWS.Close()
+			_, upstream, _, router := newOpenAICredentialHandler(t, service.AccountTypeAPIKey, func(cfg *config.Config, accounts []service.Account) {
+				cfg.Gateway.OpenAIWS.IngressModeDefault = service.OpenAIWSIngressModePassthrough
+				cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+				accounts[0].Type = service.AccountTypeAPIKey
+				accounts[0].Credentials = map[string]any{"api_key": "first-key", "base_url": upstreamWS.URL + "/v1"}
+				accounts[1].Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": service.OpenAIWSIngressModeHTTPBridge}
+			})
+			server := httptest.NewServer(router)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+			require.NoError(t, err)
+			defer conn.CloseNow()
+			require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"root"}]}`)))
+			_, first, err := conn.Read(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "response.completed", gjson.GetBytes(first, "type").String())
+			next := `{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_first","input":[{"role":"user","content":"next"}]}`
+			if scenario == "unknown anchor" {
+				next = strings.ReplaceAll(next, "resp_first", "resp_unknown")
+			}
+			if scenario == "orphan tool result" {
+				next = `{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_first","input":[{"type":"function_call_output","call_id":"missing","output":"result"}]}`
+			}
+			require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(next)))
+			for {
+				_, frame, readErr := conn.Read(ctx)
+				if scenario == "orphan tool result" {
+					var closed coderws.CloseError
+					require.ErrorAs(t, readErr, &closed)
+					require.Equal(t, coderws.StatusPolicyViolation, closed.Code)
+					require.Contains(t, closed.Reason, "full history")
+					break
+				}
+				require.NoError(t, readErr)
+				require.NotEqual(t, "response.completed", gjson.GetBytes(frame, "type").String(), "must not replace a committed or incomplete turn with a new answer")
+				if gjson.GetBytes(frame, "type").String() == "response.failed" {
+					break
+				}
+			}
+			_ = conn.Close(coderws.StatusNormalClosure, "done")
+			require.Equal(t, int32(2), wsRequests.Load())
+			upstream.mu.Lock()
+			defer upstream.mu.Unlock()
+			require.Empty(t, upstream.hits, "unsafe replay must never reach the HTTP backup")
+		})
+	}
+}
+
+func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string, standardBilling bool, modes ...string) {
 	t.Helper()
+	mode := service.OpenAIWSIngressModeCtxPool
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
 	var balanceCache *handlerInflightCache
 	var usageRepo service.UsageLogRepository
 	var billingRepo service.UsageBillingRepository
@@ -63,11 +173,23 @@ func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string, standardBi
 		if failure == "401 after connection rotation" {
 			errorEvent = `{"type":"error","error":{"code":"websocket_connection_limit_reached","message":"Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue."}}`
 		}
+		switch failure {
+		case "stream 401":
+			errorEvent = `{"type":"error","status":401,"error":{"type":"authentication_error","code":"invalid_api_key","message":"Invalid API key"}}`
+		case "failed 401":
+			errorEvent = `{"type":"response.failed","response":{"id":"resp_bad","status":"failed","error":{"code":"invalid_api_key","message":"Invalid API key"}}}`
+		case "failed 502":
+			errorEvent = `{"type":"response.failed","response":{"id":"resp_bad","status":"failed","error":{"code":"upstream_error","message":"Upstream request failed"}}}`
+		}
+		if mode == service.OpenAIWSIngressModePassthrough {
+			_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.created","response":{"id":"resp_bad"}}`))
+			_ = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"codex.rate_limits","rate_limits":{}}`))
+		}
 		_ = conn.Write(ctx, coderws.MessageText, []byte(errorEvent))
 	}))
 	defer upstreamWS.Close()
 	_, upstream, _, router := newOpenAICredentialHandlerWithBilling(t, service.AccountTypeAPIKey, balanceCache, usageRepo, billingRepo, func(cfg *config.Config, accounts []service.Account) {
-		cfg.Gateway.OpenAIWS.IngressModeDefault = service.OpenAIWSIngressModeCtxPool
+		cfg.Gateway.OpenAIWS.IngressModeDefault = mode
 		cfg.Security.URLAllowlist.AllowInsecureHTTP = true
 		accounts[0].Type = service.AccountTypeAPIKey
 		accounts[0].Credentials = map[string]any{"api_key": "first-key", "base_url": upstreamWS.URL + "/v1"}
@@ -113,6 +235,16 @@ func testOpenAIWSHTTPBackupContinuation(t *testing.T, failure string, standardBi
 		reservations := balanceCache.reservations
 		balanceCache.mu.Unlock()
 		require.Equal(t, 3, reservations, "failover must keep the failed turn's reservation")
+		logs := usageRepo.(*openAIWSUsageHandlerUsageLogRepoStub).created
+		for _, expectedModel := range []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-astra"} {
+			select {
+			case usage := <-logs:
+				require.Equal(t, expectedModel, usage.RequestedModel, "usage must identify the failed/current turn, not the connection's initial model")
+				require.Equal(t, expectedModel, usage.Model, "retry must retain the current model's billing")
+			case <-time.After(time.Second):
+				t.Fatal("missing completed-turn usage")
+			}
+		}
 	}
 	upstream.mu.Lock()
 	defer upstream.mu.Unlock()

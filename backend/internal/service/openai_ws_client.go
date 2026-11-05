@@ -318,6 +318,7 @@ func (c *coderOpenAIWSClientConn) WriteJSON(ctx context.Context, value any) erro
 	}
 	if raw, ok := prepared.(json.RawMessage); ok {
 		requesttiming.AttemptFromContext(ctx).PayloadSize(int64(len(raw)))
+		recordOpenAIRequestShape(requesttiming.AttemptFromContext(ctx), raw)
 	}
 	return wsjson.Write(ctx, c.conn, prepared)
 }

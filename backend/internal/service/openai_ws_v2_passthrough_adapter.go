@@ -30,6 +30,8 @@ type openAIWSClientFrameConn struct {
 	// model identifier they supplied for the current turn.
 	restoreResponseModel func([]byte) []byte
 	restoreToolNames     func([]byte) []byte
+	recovery             *openAIWSPassthroughRecovery
+	lastWriteDelivered   bool
 }
 
 // openAIWSPolicyEnforcingFrameConn wraps a client-side FrameConn and runs
@@ -613,6 +615,7 @@ func (c *openAIWSClientFrameConn) ReadFrame(ctx context.Context) (coderws.Messag
 		"websocket idle timeout",
 		c.interTurnStarted,
 		func() bool { return c.waitingForNextTurn.Load() },
+		ctx,
 	)
 	return msgType, payload, err
 }
@@ -652,6 +655,12 @@ func (c *openAIWSClientFrameConn) WriteFrame(ctx context.Context, msgType coderw
 			payload = c.restoreToolNames(payload)
 		}
 	}
+	if c.recovery != nil {
+		delivered, err := c.recovery.write(ctx, c.conn, msgType, payload)
+		c.lastWriteDelivered = delivered
+		return err
+	}
+	c.lastWriteDelivered = true
 	return c.conn.Write(ctx, msgType, payload)
 }
 
@@ -686,6 +695,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if account == nil {
 		return errors.New("account is nil")
 	}
+	ctx = WithOpenAIWSClientReadHandoff(ctx, clientConn)
 	requesttiming.BeginTurn(c, 1)
 	ctx = requesttiming.Context(c, ctx)
 	timingRecorder := requesttiming.FromGin(c)
@@ -985,8 +995,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 
 	completedTurns := atomic.Int32{}
 	turnLifecycle := newOpenAIWSPassthroughTurnLifecycle(true)
+	recovery := &openAIWSPassthroughRecovery{limit: ResolveOpenAIWSClientReadLimitBytes(s.cfg)}
+	recovery.begin(originalFirstClientMessage, initialRequestModel)
 	var acceptedTurnStartedAt atomic.Pointer[time.Time]
 	clientFrameConn := &openAIWSClientFrameConn{
+		recovery:             recovery,
 		conn:                 clientConn,
 		controlCtx:           ctx,
 		interTurnIdleTimeout: s.openAIWSIngressInterTurnIdleTimeout(),
@@ -1010,11 +1023,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		// capturedSessionModel 的读写都发生在该 goroutine 内，因此无需
 		// 加锁/原子化。
 		filter: func(msgType coderws.MessageType, payload []byte) (out []byte, blocked *OpenAIFastBlockedError, filterErr error) {
+			clientPayload := payload // Before account identity/model/tool rewrites.
 			if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 				return payload, nil, nil
 			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
+			if !isResponseCreate {
+				recovery.clientControl()
+			}
 			responseCreateAt := time.Time{}
 			acceptedTurn := false
 			if isResponseCreate {
@@ -1144,6 +1161,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     覆盖（Store(nil)），因为 OpenAI 上游对该帧实际不传
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if policyErr == nil && blocked == nil && isResponseCreate {
+				recovery.begin(clientPayload, requestModelForThisFrame)
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
@@ -1231,6 +1249,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			FirstMessageType:                coderws.MessageText,
 			FirstMessageSent:                upstreamFirstMessageSent,
 			StartClientAfterFirstDownstream: true,
+			JoinClientReaderOnCancel:        true,
 			ReadClientFrame:                 readNextClientFrame,
 			OnUsageParseFailure: func(eventType string, usageRaw string) {
 				logOpenAIWSV2Passthrough(
@@ -1298,7 +1317,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}
 			},
 			AfterClientWrite: func(msgType coderws.MessageType, payload []byte, writeErr error) {
-				timingFrames.afterClientWrite(msgType, payload, writeErr)
+				if clientFrameConn.lastWriteDelivered || writeErr != nil {
+					timingFrames.afterClientWrite(msgType, payload, writeErr)
+				}
 				if msgType == coderws.MessageText && writeErr == nil {
 					eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 					markOpenAIWSClientVisibleFailure(c, eventType, payload)
@@ -1315,6 +1336,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			BeforeRelayCancel: func(exit openaiwsv2.RelayExit) {
 				if context.Cause(ctx) != nil {
 					return
+				}
+				var currentTurn *openAIWSCurrentTurnFailoverError
+				if errors.As(exit.Err, &currentTurn) {
+					return // Keep the client socket for the replacement account.
 				}
 				status, reason, ok := openAIWSPassthroughRelayClientClose(exit, int(completedTurns.Load()))
 				if !ok {
@@ -1339,6 +1364,20 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					return nil
 				}
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
+				if (eventType == "error" || eventType == "response.failed") && recovery.canRetry() {
+					retryable := openAIStreamFailedEventShouldFailover(payload, errMsgRaw)
+					if eventType == "error" {
+						retryable = openAIStreamErrorEventShouldFailover(payload, errMsgRaw)
+					}
+					if retryable {
+						_, currentModel := usageMeta.turnModels("")
+						failure := s.newOpenAIStreamFailoverErrorWithModel(c, account, true,
+							openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"), payload, errMsgRaw, currentModel, handshakeHeaders)
+						// Build the replay only after joining the client reader: a
+						// concurrent cancel/session edit can still invalidate it.
+						return newOpenAIWSCurrentTurnFailoverError(failure, nil)
+					}
+				}
 				isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw)
 				if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
 					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
@@ -1511,6 +1550,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		relayErr,
 		relayExit.WroteDownstream,
 	)
+	var currentTurn *openAIWSCurrentTurnFailoverError
+	if errors.As(relayErr, &currentTurn) {
+		turnErr = recovery.failover(currentTurn.Unwrap())
+	}
 	if hooks != nil && hooks.AfterTurn != nil {
 		if hooks.TurnStarted != nil {
 			hooks.TurnStarted(turnCount+1, time.Now().Add(-result.Duration))

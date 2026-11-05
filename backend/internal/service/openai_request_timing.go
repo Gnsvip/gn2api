@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -11,6 +12,48 @@ import (
 )
 
 type openAIRequestTimingHTTPKey struct{}
+type openAIRequestTimingShapeKey struct{}
+type openAIRequestTimingShape struct {
+	anchor     bool
+	inputItems int
+}
+
+func openAIRequestShape(body []byte) openAIRequestTimingShape {
+	values := gjson.GetManyBytes(body, "previous_response_id", "input.#")
+	shape := openAIRequestTimingShape{anchor: values[0].String() != "", inputItems: -1}
+	if values[1].Exists() {
+		shape.inputItems = int(values[1].Int())
+	}
+	return shape
+}
+
+func recordOpenAIRequestShape(a *requesttiming.Attempt, body []byte) {
+	if a == nil {
+		return
+	}
+	shape := openAIRequestShape(body)
+	a.RequestShape(shape.anchor, shape.inputItems)
+}
+
+// The WS forwarder already holds a decoded payload. Count its actual delta
+// without serializing the full history again just for diagnostics.
+func recordOpenAIWSRequestShape(a *requesttiming.Attempt, payload map[string]any) {
+	if a == nil {
+		return
+	}
+	count := -1
+	switch input := payload["input"].(type) {
+	case []any:
+		count = len(input)
+	case []json.RawMessage:
+		count = len(input)
+	case json.RawMessage:
+		if n := gjson.GetBytes(input, "#"); n.Exists() {
+			count = int(n.Int())
+		}
+	}
+	a.RequestShape(openAIWSPayloadString(payload, "previous_response_id") != "", count)
+}
 
 // A role, tool name/ID, finish reason or usage chunk is not content. Classify
 // the converted chunk so withheld/upstream-only events do not imply a write.
@@ -34,8 +77,13 @@ func openAIChatChunkHasContent(chunk apicompat.ChatCompletionsChunk) bool {
 // Only callers that observe response events may create timing attempts. The
 // shared HTTP transport also serves compatibility and account-usage requests;
 // those have no matching observer and must not be classified as incomplete.
-func (s *OpenAIGatewayService) doTimedOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+func (s *OpenAIGatewayService) doTimedOpenAIUpstream(request *http.Request, proxyURL string, account *Account, rawBody ...[]byte) (*http.Response, error) {
 	ctx := context.WithValue(request.Context(), openAIRequestTimingHTTPKey{}, true)
+	// Callers already have the serialized JSON: retain counts only, and never
+	// reread/copy large HTTP bodies just for diagnostics. Retries inherit this value.
+	if len(rawBody) == 1 && requesttiming.FromContext(ctx) != nil {
+		ctx = context.WithValue(ctx, openAIRequestTimingShapeKey{}, openAIRequestShape(rawBody[0]))
+	}
 	return s.doOpenAIUpstream(request.WithContext(ctx), proxyURL, account)
 }
 
@@ -45,6 +93,8 @@ func observeOpenAIRequestTiming(a *requesttiming.Attempt, data []byte, eventType
 	if a == nil {
 		return
 	}
+	a.StreamEvent(eventType, gjson.GetBytes(data, "item.type").String(),
+		openAIStreamDataStartsClientOutput(string(data), eventType) && eventType != "error" && !openAIStreamEventTypeIsTerminal(eventType))
 	visible := openAIStreamDataStartsTTFT(string(data), eventType, false, OpenAITTFTModeVisible)
 	text := false
 	kind := "other_content"

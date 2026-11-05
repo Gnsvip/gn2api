@@ -22,6 +22,9 @@ func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxy
 	var timing *requesttiming.Attempt
 	if recorder := requesttiming.FromContext(request.Context()); recorder != nil && request.Context().Value(openAIRequestTimingHTTPKey{}) == true {
 		timing = recorder.Begin(account.ID, "http")
+		if shape, ok := request.Context().Value(openAIRequestTimingShapeKey{}).(openAIRequestTimingShape); ok {
+			timing.RequestShape(shape.anchor, shape.inputItems)
+		}
 		trace := &httptrace.ClientTrace{
 			GotConn: func(info httptrace.GotConnInfo) { timing.Connection("", info.Reused, -1, -1, -1) },
 			WroteRequest: func(info httptrace.WroteRequestInfo) {

@@ -49,7 +49,7 @@ func (f *openAITimingFrameConn) WriteFrame(ctx context.Context, typ coderws.Mess
 			f.attempt.Connection("", true, time.Since(f.connectedAt).Milliseconds(), 0, 0)
 		}
 		f.writes++
-		f.attempt.Continuation(gjson.GetBytes(payload, "previous_response_id").String() != "")
+		recordOpenAIRequestShape(f.attempt, payload)
 	}
 	a := f.attempt
 	f.mu.Unlock()

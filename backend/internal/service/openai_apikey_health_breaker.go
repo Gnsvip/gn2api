@@ -23,6 +23,12 @@ func classifyOpenAIAPIKeyHealthFailure(err error) (int, []byte, bool) {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0, nil, false
 	}
+	var streamErr *openAIStreamTerminalError
+	if errors.As(err, &streamErr) {
+		// Keep health classification independent of permission to replay. Retain
+		// no upstream payload (which can include output) in the cooldown reason.
+		return streamErr.statusCode, []byte("Upstream stream failed"), streamErr.healthEligible
+	}
 
 	var failoverErr *UpstreamFailoverError
 	if errors.As(err, &failoverErr) {

@@ -80,7 +80,10 @@ type RelayOptions struct {
 	FirstMessageType                coderws.MessageType
 	FirstMessageSent                bool
 	StartClientAfterFirstDownstream bool
-	OnUsageParseFailure             func(eventType string, usageRaw string)
+	// The adapter's session reader can relinquish a waiter without closing the
+	// client socket. Join it before another upstream attempt starts reading.
+	JoinClientReaderOnCancel bool
+	OnUsageParseFailure      func(eventType string, usageRaw string)
 	// StartsTTFT only controls measurement, never forwarding or retry policy.
 	StartsTTFT        func(payload []byte, eventType string) bool
 	OnTurnComplete    func(turn RelayTurnResult)
@@ -287,11 +290,15 @@ func Relay(
 	exitCh := make(chan relayExitSignal, 3)
 	dropDownstreamWrites := atomic.Bool{}
 	clientReaderStarted := atomic.Bool{}
+	clientDone := make(chan struct{})
 	startClientReader := func() {
 		if !clientReaderStarted.CompareAndSwap(false, true) {
 			return
 		}
-		go runClientToUpstream(relayCtx, clientConn, options.ReadClientFrame, writeClientFrameUpstream, markActivity, clientToUpstreamFrames, onTrace, exitCh)
+		go func() {
+			defer close(clientDone)
+			runClientToUpstream(relayCtx, clientConn, options.ReadClientFrame, writeClientFrameUpstream, markActivity, clientToUpstreamFrames, onTrace, exitCh)
+		}()
 	}
 	if !options.StartClientAfterFirstDownstream {
 		startClientReader()
@@ -381,6 +388,9 @@ func Relay(
 	// fallback. Join the reader before touching relayState or firing the final
 	// turn callback; otherwise a late read can race Relay's result settlement.
 	<-upstreamDone
+	if options.JoinClientReaderOnCancel && clientReaderStarted.Load() {
+		<-clientDone
+	}
 
 	emitTurnComplete(options.OnTurnComplete, state, finalizePendingBareError(state, nowFn()))
 	enrichResult(&result, state, nowFn().Sub(startAt))

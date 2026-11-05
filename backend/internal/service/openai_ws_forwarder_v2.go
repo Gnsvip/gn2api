@@ -428,6 +428,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		timing.Incremental(autoContinuation, continuationReason)
 		logOpenAIWSModeDebug("auto_continuation account_id=%d conn_id=%s incremental=%v reason=%s", account.ID, connID, autoContinuation, continuationReason)
 	}
+	recordOpenAIWSRequestShape(timing, payload)
 
 	// Decide after continuation: a huge full history can still have a tiny
 	// delta. Measure the serialized Codex message before compression, including

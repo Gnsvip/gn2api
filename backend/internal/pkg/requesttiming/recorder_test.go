@@ -170,6 +170,11 @@ func TestRequestTimingMaxAttemptsFitFixedRecordBound(t *testing.T) {
 		a.Headers(200, strings.Repeat("u", 128))
 		a.Sent(10000000)
 		a.Incremental(true, "prefix_matched")
+		a.RequestShape(true, 32768)
+		for j := 0; j < MaxStreamEvents; j++ {
+			a.StreamEvent("response.custom_tool_call_input.delta", "code_interpreter_call", true)
+		}
+		a.StreamFailure(true, true, true, 10000000)
 		a.Event("resp_"+strings.Repeat("a", 123), "tool_input", "completed", 100000, true, true)
 		a.Written(true)
 		a.Flushed()

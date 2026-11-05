@@ -62,7 +62,7 @@ func TestReadOpenAIWSClientMessage_ControlCloseFrames(t *testing.T) {
 				defer func() { _ = conn.CloseNow() }()
 				close(readStarted)
 				_, _, err = ReadOpenAIWSClientMessage(
-					controlCtx,
+					WithOpenAIWSClientReadHandoff(controlCtx, conn),
 					conn,
 					tt.timeout,
 					tt.timeoutStatus,
@@ -99,6 +99,61 @@ func TestReadOpenAIWSClientMessage_ControlCloseFrames(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("server read goroutine did not exit after close handshake")
 			}
+		})
+	}
+}
+
+func TestReadOpenAIWSClientMessage_HandoffKeepsPendingFrame(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pending socket read", true: "already queued frame"}[queued], func(t *testing.T) {
+			serverConnCh := make(chan *coderws.Conn, 1)
+			finished := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				conn, err := coderws.Accept(w, req, nil)
+				if err != nil {
+					return
+				}
+				defer conn.CloseNow()
+				serverConnCh <- conn
+				<-finished
+			}))
+			defer server.Close()
+			defer close(finished)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			require.NoError(t, err)
+			defer client.CloseNow()
+			conn := <-serverConnCh
+			defer conn.CloseNow()
+			control := WithOpenAIWSClientReadHandoff(ctx, conn)
+			require.Same(t, control, WithOpenAIWSClientReadHandoff(control, conn))
+			reader := control.Value(openAIWSClientReadHandoffKey{}).(*openAIWSClientReadHandoff)
+			pending := reader.start()
+			if queued {
+				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte("next turn")))
+				select {
+				case frame := <-pending:
+					pending <- frame
+				case <-ctx.Done():
+					t.Fatal("frame was not queued")
+				}
+			}
+			waiterCtx, cancelWaiter := context.WithCancel(control)
+			cancelWaiter()
+			_, _, err = readOpenAIWSClientMessageWithTimeoutStart(control, conn, 0, 0, "", nil, nil, waiterCtx)
+			require.ErrorIs(t, err, context.Canceled)
+			if !queued {
+				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte("next turn")))
+			}
+			_, payload, err := ReadOpenAIWSClientMessage(control, conn, time.Second, coderws.StatusGoingAway, "timeout")
+			require.NoError(t, err)
+			require.Equal(t, "next turn", string(payload))
+			require.NoError(t, client.Write(ctx, coderws.MessageText, []byte("following turn")))
+			_, payload, err = ReadOpenAIWSClientMessage(control, conn, time.Second, coderws.StatusGoingAway, "timeout")
+			require.NoError(t, err)
+			require.Equal(t, "following turn", string(payload), "handoff must neither lose nor duplicate a frame")
+			require.Nil(t, reader.pending)
 		})
 	}
 }

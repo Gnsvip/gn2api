@@ -686,6 +686,39 @@ func TestPassthroughLifecycle_PreambleAllowsPromptClientCancel(t *testing.T) {
 	}
 }
 
+func TestPassthroughLifecycle_BufferedPreambleAllowsPromptClientCancel(t *testing.T) {
+	controlCtx, cancelControl := context.WithCancel(context.Background())
+	defer cancelControl()
+	cfg := passthroughLifecycleConfig()
+	cfg.Gateway.OpenAIFirstOutputTimeoutSeconds = 3
+	upstream := newStagedPassthroughConn()
+	upstream.Send(`{"type":"response.created","response":{"id":"resp_cancel"}}`)
+	server, serverErr := startPassthroughLifecycleServer(t, controlCtx, newPassthroughLifecycleService(cfg, upstream), passthroughLifecycleAccount())
+	defer server.Close()
+	clientConn := dialPassthroughLifecycleClientWithPayload(t, server, `{"type":"response.create","model":"gpt-5.1","input":[{"role":"user","content":"hello"}]}`)
+	defer clientConn.CloseNow()
+	requirePassthroughUpstreamWrite(t, upstream, time.Second)
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWrite()
+	require.NoError(t, clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.cancel"}`)))
+	cancelFrame := requirePassthroughUpstreamWrite(t, upstream, time.Second)
+	require.Equal(t, "response.cancel", gjson.GetBytes(cancelFrame, "type").String(), "buffering metadata must not block the client reader")
+	upstream.Send(`{"type":"response.failed","response":{"id":"resp_cancel","error":{"code":"invalid_api_key","message":"Invalid API key"}}}`)
+	for _, eventType := range []string{"response.created", "response.failed"} {
+		event, err := readPassthroughLifecycleFrame(t, clientConn, time.Second)
+		require.NoError(t, err)
+		require.Equal(t, eventType, gjson.GetBytes(event, "type").String())
+	}
+	require.NoError(t, clientConn.Close(coderws.StatusNormalClosure, "done"))
+	select {
+	case err := <-serverErr:
+		var retry *UpstreamFailoverError
+		require.NotErrorAs(t, err, &retry, "canceled turn must not be reissued to a replacement account")
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled passthrough reader did not exit")
+	}
+}
+
 func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())

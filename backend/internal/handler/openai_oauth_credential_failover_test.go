@@ -57,10 +57,11 @@ func (e *openAICredentialHandlerRefresher) Refresh(context.Context, *service.Acc
 }
 
 type openAICredentialHandlerUpstream struct {
-	mu           sync.Mutex
-	hits         []int64
-	bodies       []string
-	responseBody string
+	mu               sync.Mutex
+	hits             []int64
+	bodies           []string
+	responseBody     string
+	accountResponses map[int64]string
 }
 
 func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64, _ int) (*http.Response, error) {
@@ -70,6 +71,9 @@ func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64
 	u.bodies = append(u.bodies, string(body))
 	u.mu.Unlock()
 	responseBody := u.responseBody
+	if override, ok := u.accountResponses[id]; ok {
+		responseBody = override
+	}
 	if responseBody == "" {
 		responseBody = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"model\":\"gpt-6-astra\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
 	}
