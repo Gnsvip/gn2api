@@ -398,6 +398,16 @@ func newOpenAIUpstreamFailoverError(
 	if requestScopedCapacity {
 		failoverErr.SameAccountRetryDelay = openAIRequestScopedRetryDelay(responseHeaders, responseBody)
 	}
+	if isOpenAIClientSignatureRejection(statusCode, responseHeaders, responseBody) {
+		// Replaying the same rejected identity cannot recover this request.
+		// Allow the scheduler to try another route without poisoning the account.
+		failoverErr.RetryableOnSameAccount = false
+		failoverErr.RequestScopedTransient = false
+		failoverErr.Reason = openAIClientSignatureReason
+		failoverErr.NextAccountAction = NextAccountRetry
+		failoverErr.ClientStatusCode = http.StatusBadGateway
+		failoverErr.ClientMessage = "Upstream rejected the gateway client signature (Cloudflare 1010)"
+	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, responseBody) {
 		failoverErr.RetryableOnSameAccount = false
 		failoverErr.RequestScopedTransient = false

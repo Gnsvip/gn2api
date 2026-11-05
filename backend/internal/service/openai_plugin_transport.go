@@ -19,6 +19,7 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 }
 
 func (s *OpenAIGatewayService) doOpenAIUpstreamOnce(request *http.Request, proxyURL string, account *Account) (response *http.Response, resultErr error) {
+	applyOpenAIAPIKeyUserAgent(account, request.Header)
 	var timing *requesttiming.Attempt
 	if recorder := requesttiming.FromContext(request.Context()); recorder != nil && request.Context().Value(openAIRequestTimingHTTPKey{}) == true {
 		timing = recorder.Begin(account.ID, "http")
@@ -77,6 +78,7 @@ func (s *AccountTestService) doOpenAIAccountTestUpstream(
 	account *Account,
 	useTLSFallback bool,
 ) (*http.Response, error) {
+	applyOpenAIAPIKeyUserAgent(account, request.Header)
 	account = s.openaiGatewayService.accountWithEgressTimezone(request.Context(), account, proxyURL)
 	prepared, err := prepareCodexTimezoneRequest(request, account)
 	if err != nil {

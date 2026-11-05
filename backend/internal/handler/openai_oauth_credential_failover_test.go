@@ -62,6 +62,8 @@ type openAICredentialHandlerUpstream struct {
 	bodies           []string
 	responseBody     string
 	accountResponses map[int64]string
+	accountStatuses  map[int64]int
+	userAgents       []string
 }
 
 func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64, _ int) (*http.Response, error) {
@@ -69,6 +71,7 @@ func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64
 	u.mu.Lock()
 	u.hits = append(u.hits, id)
 	u.bodies = append(u.bodies, string(body))
+	u.userAgents = append(u.userAgents, r.UserAgent())
 	u.mu.Unlock()
 	responseBody := u.responseBody
 	if override, ok := u.accountResponses[id]; ok {
@@ -77,7 +80,11 @@ func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64
 	if responseBody == "" {
 		responseBody = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"model\":\"gpt-6-astra\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
 	}
-	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(responseBody))}, nil
+	status := http.StatusOK
+	if override := u.accountStatuses[id]; override != 0 {
+		status = override
+	}
+	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(responseBody))}, nil
 }
 func (u *openAICredentialHandlerUpstream) DoWithTLS(r *http.Request, p string, id int64, n int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(r, p, id, n)

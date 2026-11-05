@@ -93,6 +93,10 @@ func isOpenAIAccount(account *Account) bool {
 // handleOpenAIAccountUpstreamError expects canonicalModel to be the model used
 // for scheduling after applying account mapping exactly once.
 func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, canonicalModel ...string) bool {
+	// A client-signature rejection says nothing about the credential's health.
+	if account != nil && account.Platform == PlatformOpenAI && isOpenAIClientSignatureRejection(statusCode, headers, responseBody) {
+		return false
+	}
 	if account != nil && account.Platform == PlatformGrok && isGrokContentPolicyRejection(statusCode, responseBody) {
 		return false
 	}
