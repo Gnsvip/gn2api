@@ -7,17 +7,18 @@ import (
 
 // TempUnschedState 临时不可调度状态
 type TempUnschedState struct {
-	UntilUnix            int64  `json:"until_unix"`                       // 解除时间（Unix 时间戳）
-	TriggeredAtUnix      int64  `json:"triggered_at_unix"`                // 触发时间（Unix 时间戳）
-	StatusCode           int    `json:"status_code"`                      // 触发的错误码
-	MatchedKeyword       string `json:"matched_keyword"`                  // 匹配的关键词
-	RuleIndex            int    `json:"rule_index"`                       // 触发的规则索引
-	ErrorMessage         string `json:"error_message"`                    // 错误消息
-	TriggerCount         int64  `json:"trigger_count,omitempty"`          // 本次触发累计命中次数
-	TriggerThreshold     int    `json:"trigger_threshold,omitempty"`      // 触发阈值
-	TriggerWindowMinutes int    `json:"trigger_window_minutes,omitempty"` // 计数窗口（分钟）
-	Scope                string `json:"scope,omitempty"`                  // 隔离粒度：account / model
-	Model                string `json:"model,omitempty"`                  // 模型级时被冷却的模型键
+	TrafficGuard         *TrafficGuardEvidence `json:"traffic_guard,omitempty"`
+	UntilUnix            int64                 `json:"until_unix"`                       // 解除时间（Unix 时间戳）
+	TriggeredAtUnix      int64                 `json:"triggered_at_unix"`                // 触发时间（Unix 时间戳）
+	StatusCode           int                   `json:"status_code"`                      // 触发的错误码
+	MatchedKeyword       string                `json:"matched_keyword"`                  // 匹配的关键词
+	RuleIndex            int                   `json:"rule_index"`                       // 触发的规则索引
+	ErrorMessage         string                `json:"error_message"`                    // 错误消息
+	TriggerCount         int64                 `json:"trigger_count,omitempty"`          // 本次触发累计命中次数
+	TriggerThreshold     int                   `json:"trigger_threshold,omitempty"`      // 触发阈值
+	TriggerWindowMinutes int                   `json:"trigger_window_minutes,omitempty"` // 计数窗口（分钟）
+	Scope                string                `json:"scope,omitempty"`                  // 隔离粒度：account / model
+	Model                string                `json:"model,omitempty"`                  // 模型级时被冷却的模型键
 }
 
 // TempUnschedCache 临时不可调度缓存接口

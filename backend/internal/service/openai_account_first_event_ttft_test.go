@@ -184,3 +184,64 @@ func TestAccountFirstEventTTFTObservationIsolated(t *testing.T) {
 		require.Equal(t, 1, group.Stats.Count)
 	}
 }
+
+func TestAccountFirstEventTTFTWSHTTPBridge(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(map[bool]string{true: "account_exception", false: "ordinary_ws_semantic"}[enabled], func(t *testing.T) {
+			useHTTPModeTTFT(t, OpenAITTFTModeVisible)
+			account := firstEventHTTPAccount()
+			account.Concurrency = 1
+			if !enabled {
+				account.ID = 12141
+				account.Extra = nil
+			}
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			go func() {
+				defer writer.Close()
+				for i, event := range []string{
+					`{"type":"response.created","response":{"id":"resp_bridge_override"}}`,
+					`{"type":"response.output_text.delta","delta":"answer"}`,
+					string(autoContinuationEvent("resp_bridge_override", autoContinuationAnswer)),
+				} {
+					if i == 1 {
+						time.Sleep(150 * time.Millisecond)
+					}
+					_, _ = io.WriteString(writer, "data: "+event+"\n\n")
+				}
+			}()
+			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}, httpUpstream: &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: reader}}}
+			c, _ := httpBridgeContext("first-event-bridge")
+			body := []byte(`{"type":"response.create","model":"model","stream":true,"input":"synthetic"}`)
+			var frames []string
+			r, err := svc.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, account, "fixture", body, len(body), "model", "", "", "", "", 2, func(frame []byte) error { frames = append(frames, string(frame)); return nil })
+			require.NoError(t, err)
+			require.NotNil(t, r.FirstTokenMs)
+			mode := requesttiming.FromGin(c).Current().Completion().TTFTMode
+			summary, ok := requesttiming.FromGin(c).Finish(101)
+			require.True(t, ok)
+			a := summary.Attempts[0]
+			if enabled {
+				require.Equal(t, OpenAITTFTModeFirstEvent, mode)
+				require.GreaterOrEqual(t, *a.FirstTextMS-int64(*r.FirstTokenMs), int64(120))
+			} else {
+				require.Equal(t, OpenAITTFTModeWSSemantic, mode)
+				require.GreaterOrEqual(t, int64(*r.FirstTokenMs)-*a.FirstEventMS, int64(120))
+			}
+			sample := buildTrafficObservation(account.ID, r, requesttiming.FromGin(c).Current().Completion(), nil, false, false)
+			require.Equal(t, mode, sample.group.Mode)
+			require.Contains(t, strings.Join(frames, "\n"), `"delta":"answer"`)
+		})
+	}
+}
+
+func TestAccountFirstEventTTFTBridgeRetainsPreOutputFailover(t *testing.T) {
+	c, output := httpBridgeContext("first-event-bridge-failure")
+	payload := []byte(`{"type":"response.create","model":"model","input":"synthetic"}`)
+	body := "data: " + `{"type":"response.created","response":{"id":"resp_fail"}}` + "\n\ndata: " + `{"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}` + "\n\n"
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}, httpUpstream: &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}}}
+	_, err := svc.proxyOpenAIWSHTTPBridgeTurn(context.Background(), c, firstEventHTTPAccount(), "fixture", payload, len(payload), "model", "", "", "", "", 1, func(b []byte) error { _, e := output.Write(b); return e })
+	var failover *UpstreamFailoverError
+	require.ErrorAs(t, err, &failover)
+	require.Empty(t, output.Body.String(), "first-event timing must not commit processing notifications before failure")
+}

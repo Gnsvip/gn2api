@@ -14,8 +14,8 @@ import (
 const trafficObservationRetention = 24 * time.Hour
 const trafficObservationCapacity = 100000
 
-// Process-local, bounded metadata only. No timers, model calls, persistence,
-// account writes, cancellation or scheduler dependencies belong in this observer.
+// Process-local, bounded metadata only. The optional guard consumes completed
+// samples separately; the observer never cancels or probes a model request.
 var openAITrafficObservations = newTrafficObservationStore(time.Now(), trafficObservationCapacity)
 
 type TrafficObservationGroup struct {
@@ -32,6 +32,9 @@ type trafficObservationSample struct {
 	account  int64
 	group    TrafficObservationGroup
 	ms       int
+	output   int
+	duration time.Duration
+	cache    string
 	excluded string
 }
 
@@ -95,6 +98,7 @@ func (s *OpenAIGatewayService) observeOpenAITraffic(c *gin.Context, account *Acc
 	sample := buildTrafficObservation(account.ID, result, trace, forwardErr, cancelled, blocked)
 	sample.at = time.Now()
 	openAITrafficObservations.add(sample)
+	s.applyOpenAITrafficGuard(c, account, sample)
 }
 
 func buildTrafficObservation(account int64, r *OpenAIForwardResult, trace requesttiming.Completion, err error, cancelled, blocked bool) trafficObservationSample {
@@ -169,6 +173,8 @@ func buildTrafficObservation(account int64, r *OpenAIForwardResult, trace reques
 	}
 	sample.group = TrafficObservationGroup{Model: strings.Clone(model), Effort: strings.Clone(effort), Tier: strings.Clone(tier), Transport: transport, Mode: mode, Context: trafficContextBucket(r.Usage.InputTokens)}
 	sample.ms = *r.FirstTokenMs
+	sample.output, sample.duration = r.Usage.OutputTokens, r.Duration
+	sample.cache = trafficGuardCacheBucket(r)
 	return sample
 }
 
@@ -192,6 +198,7 @@ type TrafficObservationStats struct {
 	MeanMS *float64 `json:"mean_ms"`
 	P50MS  *int     `json:"p50_ms"`
 	P95MS  *int     `json:"p95_ms"`
+	P50TPS *float64 `json:"p50_tps"`
 }
 
 type TrafficObservationRow struct {
@@ -215,6 +222,7 @@ type TrafficObservationView struct {
 	Excluded        map[string]int          `json:"excluded"`
 	Groups          []TrafficObservationRow `json:"groups"`
 	OmittedGroups   int                     `json:"omitted_groups"`
+	Protection      *TrafficGuardView       `json:"protection,omitempty"`
 }
 
 func GetOpenAITrafficObservation(accountID int64, window time.Duration) TrafficObservationView {
@@ -246,7 +254,10 @@ func (s *trafficObservationStore) view(account int64, now time.Time, window time
 		}
 	}
 	s.mu.Unlock()
-	type values struct{ all, earlier, later []int }
+	type values struct {
+		all, earlier, later []int
+		tps                 []float64
+	}
 	groups := map[TrafficObservationGroup]*values{}
 	middle := start.Add(window / 2)
 	for _, sample := range samples {
@@ -261,6 +272,9 @@ func (s *trafficObservationStore) view(account int64, now time.Time, window time
 			groups[sample.group] = v
 		}
 		v.all = append(v.all, sample.ms)
+		if sample.duration > 0 {
+			v.tps = append(v.tps, float64(sample.output)/sample.duration.Seconds())
+		}
 		if sample.at.Before(middle) {
 			v.earlier = append(v.earlier, sample.ms)
 		} else {
@@ -268,7 +282,12 @@ func (s *trafficObservationStore) view(account int64, now time.Time, window time
 		}
 	}
 	for group, v := range groups {
-		view.Groups = append(view.Groups, TrafficObservationRow{TrafficObservationGroup: group, Stats: trafficObservationStats(v.all), Earlier: trafficObservationStats(v.earlier), Later: trafficObservationStats(v.later)})
+		stats := trafficObservationStats(v.all)
+		if len(v.tps) > 0 {
+			value := trafficGuardMedian(v.tps)
+			stats.P50TPS = &value
+		}
+		view.Groups = append(view.Groups, TrafficObservationRow{TrafficObservationGroup: group, Stats: stats, Earlier: trafficObservationStats(v.earlier), Later: trafficObservationStats(v.later)})
 	}
 	sort.Slice(view.Groups, func(i, j int) bool {
 		a, b := view.Groups[i], view.Groups[j]

@@ -1381,14 +1381,19 @@ func (s *OpenAIGatewayService) openAITTFTMode(ctx context.Context) string {
 	return normalizeOpenAITTFTMode(mode)
 }
 
-// openAIHTTPAccountTTFTMode is used only by ordinary HTTP response handlers.
-// WS ingress/egress, including HTTP bridges, keeps its fixed WS semantic rule.
-func (s *OpenAIGatewayService) openAIHTTPAccountTTFTMode(ctx context.Context, account *Account) string {
+// Explicit account exceptions follow the actual HTTP upstream, including a WS
+// client bridged to HTTP. Native WS upstream timing remains WS semantic.
+func openAIAccountFirstEventTTFT(account *Account) bool {
 	if account != nil && account.IsOpenAIApiKey() {
 		mode, _ := account.Extra["openai_http_ttft_mode"].(string)
-		if strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeFirstEvent) {
-			return OpenAITTFTModeFirstEvent
-		}
+		return strings.EqualFold(strings.TrimSpace(mode), OpenAITTFTModeFirstEvent)
+	}
+	return false
+}
+
+func (s *OpenAIGatewayService) openAIHTTPAccountTTFTMode(ctx context.Context, account *Account) string {
+	if openAIAccountFirstEventTTFT(account) {
+		return OpenAITTFTModeFirstEvent
 	}
 	return s.openAITTFTMode(ctx)
 }

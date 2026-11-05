@@ -25,6 +25,7 @@ type openAIWSPassthroughHandlerHarness struct {
 	moderationRepo *contentModerationHandlerTestRepo
 	gatewayCache   service.GatewayCache
 	apiKey         *service.APIKey
+	accountRepo    *openAIWSUsageHandlerAccountRepoStub
 }
 
 func newOpenAIWSPassthroughHandlerHarness(t *testing.T, upstreamURL string, settings ...map[string]string) *openAIWSPassthroughHandlerHarness {
@@ -129,6 +130,50 @@ func newOpenAIWSPassthroughHandlerHarness(t *testing.T, upstreamURL string, sett
 		moderationRepo: moderationRepo,
 		gatewayCache:   gatewayCache,
 		apiKey:         apiKey,
+		accountRepo:    accountRepo,
+	}
+}
+
+func TestOpenAIResponsesWebSocketManualStopRejectsExistingConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	secondFrame := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, nil)
+		require.NoError(t, err)
+		defer conn.CloseNow()
+		_, _, err = conn.Read(ctx)
+		require.NoError(t, err)
+		err = conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_before_manual_stop","model":"gpt-5.1","usage":{"input_tokens":3,"output_tokens":2}}}`))
+		require.NoError(t, err)
+		_, frame, err := conn.Read(ctx)
+		if err == nil {
+			secondFrame <- frame
+		}
+	}))
+	defer upstream.Close()
+	h := newOpenAIWSPassthroughHandlerHarness(t, upstream.URL)
+	frame := []byte(`{"type":"response.create","model":"gpt-5.1","input":"synthetic"}`)
+	require.NoError(t, h.clientConn.Write(ctx, coderws.MessageText, frame))
+	_, event, err := h.clientConn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "response.completed", gjson.GetBytes(event, "type").String())
+	h.accountRepo.manualStopped.Store(true)
+	require.NoError(t, h.clientConn.Write(ctx, coderws.MessageText, frame))
+	_, _, err = h.clientConn.Read(ctx)
+	var closed coderws.CloseError
+	require.ErrorAs(t, err, &closed)
+	require.Equal(t, coderws.StatusTryAgainLater, closed.Code)
+	require.Contains(t, closed.Reason, "no longer schedulable")
+	select {
+	case <-h.handlerDone:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case frame := <-secondFrame:
+		t.Fatalf("disabled account received next request: %s", frame)
+	default:
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTrafficObservationRouteRequiresAdminAndHasNoMutation(t *testing.T) {
+func TestTrafficObservationAndGuardRoutesRequireAdmin(t *testing.T) {
 	r := gin.New()
 	RegisterAdminRoutes(r.Group("/api/v1"), &handler.Handlers{Admin: &handler.AdminHandlers{}},
 		middleware.AdminAuthMiddleware(func(c *gin.Context) { c.AbortWithStatus(401) }),
@@ -29,5 +29,8 @@ func TestTrafficObservationRouteRequiresAdminAndHasNoMutation(t *testing.T) {
 	require.True(t, found)
 	out := httptest.NewRecorder()
 	r.ServeHTTP(out, httptest.NewRequest("GET", "/api/v1/admin/accounts/7/traffic-observation", nil))
+	require.Equal(t, 401, out.Code)
+	out = httptest.NewRecorder()
+	r.ServeHTTP(out, httptest.NewRequest("PUT", "/api/v1/admin/accounts/7/traffic-guard", nil))
 	require.Equal(t, 401, out.Code)
 }

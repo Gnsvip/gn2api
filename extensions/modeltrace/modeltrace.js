@@ -577,7 +577,7 @@
     const refreshStatus = () => {
       const current = states.get(id);
       const enabled = !!(current?.enabled || current?.prompt_test?.enabled);
-      badge.textContent = dialog.dataset.activeTab === 'traffic' ? '只观察' : current?.running || current?.prompt_test?.running ? '检测中' : enabled ? '已开启' : '已关闭';
+      badge.textContent = dialog.dataset.activeTab === 'traffic' ? (dialog.dataset.trafficStatus || '首字观察') : current?.running || current?.prompt_test?.running ? '检测中' : enabled ? '已开启' : '已关闭';
       badge.dataset.enabled = String(enabled);
       for (const status of dialog.querySelectorAll('[data-mode-status]')) {
         const mode = status.dataset.modeStatus === 'custom' ? current?.prompt_test : current;
@@ -604,7 +604,7 @@
     const pages = [];
     const selectTab = (key, focus = false) => {
       dialog.dataset.activeTab = key; refreshStatus(); refreshDirty();
-      if (!forms.some(form => form.dirty())) footerNotice.textContent = key === 'traffic' ? '此页只读，无需保存' : '';
+      if (!forms.some(form => form.dirty())) footerNotice.textContent = key === 'traffic' ? '开关修改后需保存' : '';
       for (const page of pages) {
         const selected = page.key === key;
         page.panel.hidden = !selected;
@@ -660,7 +660,7 @@
     document.body.append(dialog); dialog.showModal();
   }
 
-  function buildTrafficPanel(id, dialog, panel) {
+  function buildTrafficPanel(id, dialog, panel, loadModels, registerForm) {
     const body = el('div', 'mt-body');
     const top = el('div', 'mt-panel-top');
     const status = el('p', 'mt-note', '正在读取观察数据…');
@@ -671,16 +671,90 @@
     }
     const refresh = el('button', 'mt-traffic-refresh', '刷新统计'); refresh.type = 'button';
     controls.append(windowSelect, refresh); top.append(status, controls);
-    const note = el('p', 'mt-note', '只观察承接用户请求的上游账号，不额外发题、不取消请求、不自动停调度。无需填写阈值，首字慢也不直接判定模型降智。');
+    const enabledLabel = el('label', 'mt-inline-toggle');
+    const enabled = el('input'); enabled.type = 'checkbox'; enabled.disabled = true;
+    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '连续性能异常自动冷却');
+    enabledLabel.append(enabled, document.createTextNode('连续性能异常自动冷却'));
+    const cooldownLabel = el('label', 'mt-interval', '冷却');
+    const cooldown = el('input'); cooldown.type = 'number'; cooldown.min = '1'; cooldown.max = '1440'; cooldown.step = '1'; cooldown.value = '10'; cooldown.disabled = true;
+    cooldown.setAttribute('aria-label', '性能异常冷却分钟'); cooldownLabel.append(cooldown, document.createTextNode('分钟'));
+    const protectionControls = el('div', 'mt-traffic-fields'); protectionControls.append(enabledLabel, cooldownLabel);
+    const protectionStatus = el('p', 'mt-note');
+    const protectionGroups = el('div', 'mt-traffic-results');
+    const evidence = el('details', 'mt-help'); evidence.hidden = true;
+    evidence.append(el('summary', '', '上次冷却依据'));
+    const evidenceBody = el('p', 'mt-note'); evidence.append(evidenceBody);
+    const note = el('p', 'mt-note', '只观察用户请求对应的上游账号，不额外发题、不取消已在执行的请求。开启后连续异常才进入冷却池，到期重新参与调度；不会修改手动停用状态，也不据此认定模型身份。');
+    const rules = el('details', 'mt-help');
+    rules.append(el('summary', '', '自动冷却规则与限制'), el('p', '', '同账号、模型、推理档位、服务档位、传输、计时口径、上下文、缓存比例及输出量分组。开启后，最近 6 小时内每组前 20 个有效样本建立参考；参考波动过大时不自动停用。'),
+      el('p', '', '最近 10 分钟至少连续 3 次首字达到参考 P50 的 3 倍、参考 P95 和 5 秒三者中的最大值，同时全程 TPS 不超过参考中位数的一半，才触发冷却。异常需持续至少 30 秒，输出量与参考差异不超过 2 倍。少于 32 个输出 token、失败、重试、取消和未知口径不触发。'),
+      el('p', '', 'TPS = 输出 token ÷ 整个请求耗时，包含等待时间；它是辅助指标，不等于正文生成速度。没有健康基准时无法识别一直很慢的账号。冷却后、设置变化或服务重启需重新积累参考，恢复调度不代表能力已恢复。关闭开关停止后续自动冷却，已生效的冷却仍按原时间到期。'));
     const timing = el('p', 'mt-note', '按实际出站和计时口径分组：普通 HTTP 使用 semantic 或 visible；WS 链路（含 HTTP 回退）收到明确推理信号或非空内容即记时，开始处理通知、空 delta 不算。只比较同模型、档位、上下文区间和口径。缺少完整链路证据的兼容请求不纳入分布。');
     const coverage = el('p', 'mt-note');
     const totals = el('p', 'mt-note');
     const exclusions = el('p', 'mt-note');
     const rows = el('div', 'mt-traffic-results');
     const error = el('p', 'mt-error');
-    body.append(top, note, timing, coverage, totals, exclusions, rows, error); panel.append(body);
+    body.append(top, protectionControls, protectionStatus, protectionGroups, evidence, note, rules, timing, coverage, totals, exclusions, rows, error); panel.append(body);
     const seconds = value => value == null ? '—' : (Number(value) / 1000).toFixed(2) + ' 秒';
     const time = value => new Date(value).toLocaleString('zh-CN', { hour12: false });
+    const rate = value => value == null ? '—' : Number(value).toFixed(2) + ' token/s';
+    const payload = () => ({ enabled: enabled.checked, cooldown_minutes: Number(cooldown.value) });
+    let baseline = null;
+    const form = {
+      dirty: () => baseline !== null && baseline !== JSON.stringify(payload()),
+      validate: () => {
+        const minutes = Number(cooldown.value);
+        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '冷却时间须为 1–1440 分钟'; return false; }
+        return true;
+      },
+      save: async () => {
+        const currentToken = token();
+        const submitted = JSON.stringify(payload());
+        enabled.disabled = cooldown.disabled = true;
+        try {
+          const response = await fetch('/api/v1/admin/accounts/' + id + '/traffic-guard', {
+            method: 'PUT', headers: { Authorization: 'Bearer ' + currentToken, 'Content-Type': 'application/json' },
+            body: submitted, signal: AbortSignal.timeout(15000)
+          });
+          const data = await response.json();
+          if (currentToken !== token()) throw new Error('登录状态已变化');
+          if (!response.ok || data.code !== 0) throw new Error(data.message || '无法保存自动冷却设置');
+          baseline = submitted;
+          await load();
+          return true;
+        } catch (failure) { error.textContent = failure.message; return false; }
+        finally { enabled.disabled = false; cooldown.disabled = !enabled.checked; }
+      },
+      commit: () => { baseline = JSON.stringify(payload()); }
+    };
+    registerForm(form);
+    enabled.addEventListener('change', () => { cooldown.disabled = !enabled.checked; });
+    const renderProtection = protection => {
+      if (!protection) { enabled.disabled = cooldown.disabled = true; protectionStatus.textContent = '后端尚未支持自动冷却'; return; }
+      if (!form.dirty()) { enabled.checked = !!protection.config.enabled; cooldown.value = String(protection.config.cooldown_minutes); form.commit(); }
+      enabled.disabled = false; cooldown.disabled = !enabled.checked;
+      const label = { disabled: '观察中 · 不自动停调度', learning: '自动冷却已开启 · 积累参考中', watching: '自动冷却已开启 · 观察连续异常', cooldown: '账号冷却中' }[protection.state] || '状态未知';
+      status.textContent = label;
+      dialog.dataset.trafficStatus = protection.state === 'cooldown' ? '冷却中' : protection.config.enabled ? '保护已开启' : '只观察';
+      dialog.dispatchEvent(new Event('mt-save-end'));
+      protectionStatus.textContent = protection.until ? '冷却至 ' + time(protection.until) : protection.config.enabled ? '每组需要 20 个参考样本；样本不足不停止调度。' : '默认只观察，开启并保存后开始建立参考。';
+      protectionGroups.replaceChildren();
+      for (const group of (protection.groups || []).slice(0, 20)) {
+        const row = el('div', 'mt-traffic-result');
+        row.append(el('strong', '', group.model + ' · ' + group.effort + ' · ' + group.transport),
+          el('p', 'mt-note', '上下文 ' + group.context + ' · 缓存 ' + group.cache_bucket + ' · 输出 ' + group.output_bucket + ' token'),
+          el('p', '', '参考 ' + group.baseline_samples + '/20 · ' + (group.ready ? '连续异常 ' + group.streak + '/3' : '学习中或参考波动过大')),
+          el('p', 'mt-note', '参考首字 ' + seconds(group.baseline_p50_ms) + ' · 全程 TPS ' + rate(group.baseline_tps) + ' · 触发首字 ≥ ' + seconds(group.threshold_ms)));
+        protectionGroups.append(row);
+      }
+      if ((protection.groups || []).length > 20) protectionGroups.append(el('p', 'mt-note', '显示前 20 组，另有 ' + (protection.groups.length - 20) + ' 组正在观察。'));
+      const last = protection.last_evidence;
+      evidence.hidden = !last;
+      if (last) evidenceBody.textContent = last.model + ' · ' + last.effort + ' · ' + last.transport + ' · 参考首字 ' + seconds(last.baseline_p50_ms) + ' / TPS ' + rate(last.baseline_tps)
+        + '；异常样本：' + (last.recent || []).map(point => time(point.at) + ' 首字 ' + seconds(point.ttft_ms) + ' / TPS ' + rate(point.tps)).join('；');
+      panel.dispatchEvent(new Event('change'));
+    };
     const reasons = { cancelled: '取消/断开', policy_blocked: '策略拦截', forward_error: '转发失败', missing_result: '无结果',
       nonstream: '非流式', media_output: '媒体生成', missing_trace: '缺少完整链路证据', retried: '含重试', incomplete: '未完整完成',
       missing_ttft: '无首字', invalid_ttft: '计时无效', insufficient_output: '输出不足', missing_metric: '口径不明' };
@@ -699,8 +773,9 @@
         if (currentToken !== token()) throw new Error('登录状态已变化');
         if (!response.ok || data.code !== 0) throw new Error(data.message || '无法读取观察数据');
         const view = data.data;
-        if (view?.mode !== 'observe_only' || !Array.isArray(view.groups)) throw new Error('网关尚未支持首字观察，请先更新后端');
+        if (!['observe_only', 'observe_and_protect'].includes(view?.mode) || !Array.isArray(view.groups)) throw new Error('网关尚未支持首字观察，请先更新后端');
         status.textContent = '观察中 · 不自动停调度';
+        renderProtection(view.protection);
         coverage.textContent = '本次采集始于 ' + time(view.started_at) + '。仅保留最近 24 小时、全进程最多 ' + Number(view.capacity).toLocaleString() + ' 条数值元数据；不落盘，服务重启会清空。'
           + (view.capacity_limited ? ' 容量已达上限，本窗口较早样本已淘汰。' : !view.window_complete ? ' 尚未收满所选窗口。' : ' 已覆盖所选时间窗口。');
         const omitted = Object.values(view.excluded || {}).reduce((total, value) => total + Number(value), 0);
@@ -715,10 +790,11 @@
           row.append(el('strong', '', group.model + ' · ' + effort));
           row.append(el('p', 'mt-note', (group.transport === 'websocket' ? 'WS' : 'HTTP') + ' · ' + mode + ' · 上下文 ' + group.context + ' tokens · ' + tier));
           row.append(el('p', '', '样本 ' + group.stats.count + ' · 平均 ' + seconds(group.stats.mean_ms) + ' · P50 ' + seconds(group.stats.p50_ms) + ' · P95 ' + seconds(group.stats.p95_ms)));
+          row.append(el('p', 'mt-note', '全程 TPS P50 ' + rate(group.stats.p50_tps) + '（含等待时间）'));
           row.append(el('p', 'mt-note', '窗口前半段 P50 ' + seconds(group.earlier.p50_ms) + '（' + group.earlier.count + ' 次） → 后半段 ' + seconds(group.later.p50_ms) + '（' + group.later.count + ' 次）'));
           rows.append(row);
         }
-        rows.append(el('p', 'mt-note', 'P50 为中位数；P95 表示约 95% 的样本不超过此耗时。样本少时仅供观察，不生成自动停用阈值。'
+        rows.append(el('p', 'mt-note', 'P50 为中位数；P95 表示约 95% 的样本不超过此耗时。观察分布与自动冷却参考分别计算，少量样本不会触发冷却。'
           + (view.omitted_groups ? ' 当前仅展示样本最多的 50 组，另有 ' + view.omitted_groups + ' 组。' : '')));
       } catch (e) {
         if (request === sequence && dialog.open) { status.textContent = '暂不可用'; error.textContent = e.message; }

@@ -40,10 +40,14 @@ live_models = ['gpt-6-sol', 'gpt-6-astra', 'gpt-6.1-sol']
 writes = []
 traffic_requests = []
 traffic_error = False
+guard_writes = []
+guard_error = False
+guard_config = dict(enabled=False, cooldown_minutes=10, revision='', since='0001-01-01T00:00:00Z')
 traffic_data = dict(mode='observe_only', started_at='2026-11-04T00:00:00Z', generated_at='2026-11-04T01:00:00Z',
     capacity=100000, capacity_limited=False, window_complete=True, valid_samples=24, excluded={'forward_error': 2, 'missing_ttft': 1},
+    protection=dict(config=guard_config, state='disabled', groups=[]),
     groups=[dict(model='gpt-6-astra', effort='xhigh', tier='unspecified', transport='websocket', mode='ws_semantic', context='128–230k',
-        stats=dict(count=24, mean_ms=2500, p50_ms=1800, p95_ms=6500), earlier=dict(count=12, p50_ms=1600), later=dict(count=12, p50_ms=2000))], omitted_groups=0)
+        stats=dict(count=24, mean_ms=2500, p50_ms=1800, p95_ms=6500, p50_tps=12.34), earlier=dict(count=12, p50_ms=1600), later=dict(count=12, p50_ms=2000))], omitted_groups=0)
 errors = []
 fail_prompt_save = False
 accept_discard = True
@@ -67,7 +71,17 @@ with sync_playwright() as p:
         dialog.accept() if accept_discard else dialog.dismiss()
     page.on('dialog', handle_dialog)
     def route(r):
-        if '/traffic-observation' in r.request.url:
+        if '/traffic-guard' in r.request.url:
+            if guard_error:
+                r.fulfill(status=503, json={'code':503, 'message':'保存失败'})
+                return
+            assert r.request.method == 'PUT'
+            guard_writes.append(r.request.post_data_json)
+            guard_config.update(r.request.post_data_json)
+            traffic_data['mode'] = 'observe_and_protect' if guard_config['enabled'] else 'observe_only'
+            traffic_data['protection']['state'] = 'cooldown' if traffic_data['protection'].get('until') else 'learning' if guard_config['enabled'] else 'disabled'
+            r.fulfill(json={'code':0, 'data':guard_config})
+        elif '/traffic-observation' in r.request.url:
             traffic_requests.append((r.request.method, parse_qs(urlsplit(r.request.url).query)))
             r.fulfill(status=503 if traffic_error else 200, json={'code': 503, 'message': '暂时无法读取'} if traffic_error else {'code': 0, 'data': traffic_data})
         elif '/api/v1/admin/accounts/' in r.request.url:
@@ -587,8 +601,11 @@ with sync_playwright() as p:
     assert 'P50 1.80 秒' in panel.inner_text()
     assert 'WS semantic（含推理信号）' in panel.inner_text()
     assert '转发失败 2' in panel.inner_text()
-    assert panel.locator('input').count() == 0
-    assert panel.get_by_role('switch').count() == 0
+    assert panel.get_by_role('switch', name='连续性能异常自动冷却').count() == 1
+    assert not panel.get_by_role('switch', name='连续性能异常自动冷却').is_checked()
+    assert panel.get_by_label('性能异常冷却分钟').is_disabled()
+    assert '全程 TPS P50 12.34 token/s' in panel.inner_text()
+    assert guard_writes == []
     assert page.locator('.mt-actions .mt-primary').is_hidden()
     assert len(writes) == paid_writes
     for width in (1160, 390):
@@ -610,6 +627,36 @@ with sync_playwright() as p:
     assert all(method == 'GET' for method, _ in traffic_requests), traffic_requests
     assert traffic_requests[-1][1] == dict(window_minutes=['1440'])
     assert len(writes) == paid_writes
+    # Only explicit save enables the guard. Observation refresh must not overwrite edits.
+    guard_toggle = panel.get_by_role('switch', name='连续性能异常自动冷却')
+    guard_toggle.check()
+    panel.get_by_label('性能异常冷却分钟').fill('15')
+    page.get_by_role('button', name='刷新统计', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('暂无有效样本')")
+    assert guard_toggle.is_checked()
+    assert panel.get_by_label('性能异常冷却分钟').input_value() == '15'
+    assert guard_writes == []
+    guard_error = True
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic .mt-error').textContent === '保存失败'")
+    assert guard_toggle.is_checked() and guard_writes == []
+    guard_error = False
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('自动冷却已开启')")
+    assert guard_writes == [dict(enabled=True, cooldown_minutes=15)]
+    assert '保护已开启' in page.locator('.mt-header .mt-badge').inner_text()
+    assert len(writes) == paid_writes  # No model tests are scheduled by protection.
+    traffic_data['protection'].update(state='cooldown', until='2026-11-05T12:00:00Z', last_evidence=dict(
+        model='gpt-6-astra', effort='high', transport='websocket', baseline_p50_ms=1000, baseline_tps=64,
+        recent=[dict(at='2026-11-05T11:50:00Z', ttft_ms=6000, tps=20)]))
+    page.get_by_role('button', name='刷新统计', exact=True).click()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('账号冷却中')")
+    assert panel.get_by_text('上次冷却依据', exact=True).is_visible()
+    guard_toggle.uncheck()
+    page.get_by_role('button', name='保存设置', exact=True).click()
+    page.wait_for_function("document.querySelector('.mt-actions .mt-primary').dataset.dirty === 'false'")
+    assert guard_writes[-1] == dict(enabled=False, cooldown_minutes=15)
+    assert '账号冷却中' in panel.inner_text()  # Disabling does not cancel an active cooldown.
     page.get_by_role('button', name='关闭', exact=True).click()
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")

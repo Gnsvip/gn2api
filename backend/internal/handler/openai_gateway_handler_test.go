@@ -1977,7 +1977,8 @@ type openAIResponsesWSUsageLogResult struct {
 
 type openAIWSUsageHandlerAccountRepoStub struct {
 	service.AccountRepository
-	account service.Account
+	account       service.Account
+	manualStopped atomic.Bool
 }
 
 func (s *openAIWSUsageHandlerAccountRepoStub) ListSchedulableByPlatform(ctx context.Context, platform string) ([]service.Account, error) {
@@ -1996,6 +1997,9 @@ func (s *openAIWSUsageHandlerAccountRepoStub) GetByID(ctx context.Context, id in
 		return nil, nil
 	}
 	account := s.account
+	if s.manualStopped.Load() {
+		account.Schedulable = false
+	}
 	return &account, nil
 }
 
