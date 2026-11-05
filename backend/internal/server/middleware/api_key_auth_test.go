@@ -1454,6 +1454,7 @@ func TestAPIKeyAuthOpenAIQuotaErrorFormat(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusTooManyRequests, w.Code)
+	require.Equal(t, "false", w.Header().Get("X-Should-Retry"))
 	var response struct {
 		Error struct {
 			Message string  `json:"message"`

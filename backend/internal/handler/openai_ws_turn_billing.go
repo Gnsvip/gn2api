@@ -74,6 +74,9 @@ func writeOpenAIWSBillingError(ctx context.Context, conn *coderws.Conn, err erro
 		"type": "error", "status": status,
 		"error": map[string]any{"type": code, "code": code, "message": message},
 	}
+	if code == "insufficient_quota" {
+		event["headers"] = map[string]string{"x-should-retry": "false"}
+	}
 	if retryAfter > 0 {
 		event["headers"] = map[string]string{"retry-after": strconv.Itoa(retryAfter)}
 	}

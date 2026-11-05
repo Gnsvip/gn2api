@@ -82,6 +82,8 @@ func AbortWithError(c *gin.Context, statusCode int, code, message string) {
 
 // abortWithOpenAIQuotaError writes the OpenAI-compatible insufficient quota response.
 func abortWithOpenAIQuotaError(c *gin.Context, statusCode int, message string) {
+	// SDKs may retry every 429 unless the server explicitly opts out.
+	c.Header("X-Should-Retry", "false")
 	c.JSON(statusCode, gin.H{
 		"error": gin.H{
 			"message": message,

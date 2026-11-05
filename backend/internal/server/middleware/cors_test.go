@@ -109,6 +109,7 @@ func TestCORS_AllowedOrigin_HasAllowHeaders(t *testing.T) {
 				"允许的 origin 应收到 Allow-Methods")
 			assert.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "Server-Timing")
 			assert.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "WWW-Authenticate")
+			assert.Contains(t, w.Header().Get("Access-Control-Expose-Headers"), "X-Should-Retry")
 			assert.Equal(t, "86400", w.Header().Get("Access-Control-Max-Age"),
 				"允许的 origin 应收到 Max-Age=86400")
 			assert.Equal(t, "https://allowed.example.com", w.Header().Get("Access-Control-Allow-Origin"),

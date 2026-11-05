@@ -24,6 +24,11 @@ func writeResponsesBillingError(c *gin.Context, err error, streamStarted bool) {
 	if service.StopOpenAICompactSSEKeepaliveCommitted(c) {
 		streamStarted = true
 	}
+	if code == "insufficient_quota" && !streamStarted {
+		// The official SDKs retry HTTP 429 without this header, even when
+		// the body identifies terminal quota exhaustion.
+		c.Header("X-Should-Retry", "false")
+	}
 	if retryAfter > 0 {
 		c.Header("Retry-After", strconv.Itoa(retryAfter))
 	}

@@ -58,6 +58,11 @@ func TestOpenAIWSBillingErrorPreservesFailureCategory(t *testing.T) {
 			require.Equal(t, "error", gjson.GetBytes(payload, "type").String())
 			require.Equal(t, tc.status, gjson.GetBytes(payload, "status").Int())
 			require.Equal(t, tc.code, gjson.GetBytes(payload, "error.code").String())
+			if tc.code == "insufficient_quota" {
+				require.Equal(t, "false", gjson.GetBytes(payload, "headers.x-should-retry").String())
+			} else {
+				require.False(t, gjson.GetBytes(payload, "headers.x-should-retry").Exists())
+			}
 			if tc.retry {
 				seconds, err := strconv.Atoi(gjson.GetBytes(payload, "headers.retry-after").String())
 				require.NoError(t, err)
