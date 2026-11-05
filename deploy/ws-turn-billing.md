@@ -11,7 +11,7 @@
 - 同轮上游重试、刷新和换号沿用一次准入与预留；不重复计入 standard 模式 RPM。失败结束/客户端断开由 handler 兜底归还引用。
 - 每次计费提交取得该轮不可变的 context；下一轮不能替换上轮计费的预留。风控失败的异步用量记录也取得自己的引用。
 - 保留现有单次已准入请求允许超额结算为负的规则。下一轮余额不够则拒绝，不允许持续透支。真正同时在途或仍待计费的请求继续计入预留。
-- 余额不足先发送 WS `error` 事件，使用 `status: 429`、`error.type/code: insufficient_quota`，随后 1008 关闭。限流和计费服务故障保留各自错误类别。
+- 余额不足时，普通 WS 发送 `error` 事件，使用 `status: 403`、`error.type/code: insufficient_quota`；Codex WS 发送终止事件 `response.failed`，使用 `response.status: failed`、`response.error.type/code: insufficient_quota`。随后均以 1008 关闭。限流和计费服务故障保留各自错误类别，站内余额不足不再映射为上游限流 429。
 
 未修改普通 HTTP 的预留生命周期、数据库结构、前端或压缩/增量协议；不增加请求正文日志。
 
@@ -21,11 +21,11 @@
 
 标准计费模式的本地 socket 用例覆盖 passthrough、ctx_pool、http_bridge：闲置释放；实际扣款后释放；异步计费等待时阻止并发透支、落地后可再次预留；本轮超额结算后下一轮发送明确错误且不触达上游。换号用例覆盖 429 和连接轮换后 401，三轮逻辑请求仅三次预留，并校验工具续传上下文。
 
-原生兼容测试使用本机 Codex CLI `0.166.0-alpha.6`，临时独立 CODEX_HOME 与 loopback 服务，调用生产错误帧构造器，不使用真实账号凭据、不请求真实模型：
+原生兼容测试使用官方正式 Linux Codex CLI `0.166.0`，临时独立 CODEX_HOME 与 loopback 服务，调用生产错误帧构造器，不使用真实账号凭据、不请求真实模型：
 
 - 普通 403 实测会多次重连并回退 HTTP，不能作为本修复的最终格式。
-- 429 + insufficient_quota 实测显示额度不足并结束：一次启动预热、一次正式 WS 请求、零 HTTP 回退、无重连提示。
+- `response.failed + insufficient_quota` 显示额度不足并结束：一次启动预热、一次正式 WS 请求、零 HTTP 回退、无重连提示。HTTP 和握手前余额拒绝的兼容范围见 [balance-denial-repair.md](balance-denial-repair.md)。
 
 可复测：设置 `GN2API_TEST_CODEX_EXE` 指向已安装官方 Codex 可执行文件，然后运行 `go test -tags unit ./internal/handler -run TestOpenAIWSBillingErrorNativeCodex -count=1 -v`。未设置时仅跳过该原生兼容测试，其余本地用例照常执行。
 
-已执行 handler 全套测试，以及 service/repository 的余额、计费、WS、压缩、用量任务相关回归。Windows 环境未执行 race 检查。没有发布或部署，也未进行线上真实压缩请求验收。
+本次服务端兼容修复执行 middleware/handler 的余额、计费、预留、监控和换号相关回归，以及 Linux 官方客户端原生验证。未执行 race 检查。当前结果属于本地隔离验收，没有发布或部署，也不替代线上客户端观察。

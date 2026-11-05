@@ -10,8 +10,7 @@ import (
 )
 
 // Keep the site's balance denial distinct from upstream or window rate limits.
-// Use this for HTTP and connected WS turns; client retry behavior is verified
-// separately and must not change the public HTTP 403 balance contract.
+// Ordinary HTTP requests retain 403; Codex streams carry a terminal failure.
 func responsesBillingErrorDetails(err error) (status int, code, message string, retryAfter int) {
 	status, code, message, retryAfter = billingErrorDetails(err)
 	if errors.Is(err, service.ErrInsufficientBalance) {
@@ -24,6 +23,12 @@ func writeResponsesBillingError(c *gin.Context, err error, streamStarted bool) {
 	status, code, message, retryAfter := responsesBillingErrorDetails(err)
 	if service.StopOpenAICompactSSEKeepaliveCommitted(c) {
 		streamStarted = true
+	}
+	if !streamStarted && errors.Is(err, service.ErrInsufficientBalance) &&
+		service.IsCodexBalanceResponsesPath(c.Request) && service.IsCodexBalanceFailureClient(c.Request) &&
+		(c.GetBool(opsStreamKey) || service.CodexBalanceRequestsSSE(c.Request)) {
+		service.WriteCodexBalanceFailedSSE(c, message)
+		return
 	}
 	if code == "insufficient_quota" && !streamStarted {
 		// The official SDKs retry HTTP 429 without this header, even when

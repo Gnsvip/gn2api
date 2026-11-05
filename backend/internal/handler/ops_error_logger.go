@@ -1476,9 +1476,15 @@ func logOpsStreamErrorValue(c *gin.Context, ops *service.OpsService, wireStatus 
 	}
 	errorBody := ""
 	if streamErr.Code != "" {
-		if payload, err := json.Marshal(gin.H{"error": gin.H{
+		body := gin.H{"error": gin.H{
 			"type": normalizedType, "code": streamErr.Code, "message": streamErr.Message,
-		}}); err == nil {
+		}}
+		if streamErr.RequestScoped && streamErr.Code == "insufficient_quota" {
+			// Codex balance compatibility establishes a 200/101 transport, then
+			// rejects the logical request with 403. Keep both values reviewable.
+			body["transport_status"] = wireStatus
+		}
+		if payload, err := json.Marshal(body); err == nil {
 			errorBody = string(payload)
 		}
 	}
@@ -1495,6 +1501,9 @@ func logOpsStreamErrorValue(c *gin.Context, ops *service.OpsService, wireStatus 
 	var accountID *int64
 	if v, ok := accountIDV.(int64); ok && v > 0 {
 		accountID = &v
+	}
+	if streamErr.RequestScoped && streamErr.Code == "insufficient_quota" {
+		accountID = nil // A previous WS turn's account does not own this denial.
 	}
 
 	fallbackPlatform := guessPlatformFromPath(c.Request.URL.Path)

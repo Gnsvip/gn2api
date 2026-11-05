@@ -118,8 +118,65 @@ func TestResponsesBillingOtherErrorsKeepRetrySemantics(t *testing.T) {
 		w := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(w)
 		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Request.Header.Set("User-Agent", "codex_exec/0.166.0")
+		ctx.Request.Header.Set("Accept", "text/event-stream")
+		setOpsRequestContext(ctx, "gpt-5.1", true)
 		writeResponsesBillingError(ctx, err, false)
+		require.Equal(t, s, w.Code)
 		require.Empty(t, w.Header().Get("X-Should-Retry"), "transient errors must retain SDK retries")
+	}
+}
+
+func TestCodexBalanceAfterWaitUsesTerminalStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, codex := range []bool{false, true} {
+		t.Run(fmt.Sprint(codex), func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			if codex {
+				c.Request.Header.Set("User-Agent", "codex_exec/0.166.0")
+			}
+			setOpsRequestContext(c, "gpt-6-astra", true)
+			writeResponsesBillingError(c, fmt.Errorf("wait: %w", service.ErrInsufficientBalance), false)
+			if !codex {
+				require.Equal(t, 403, w.Code)
+				return
+			}
+			require.Equal(t, 200, w.Code)
+			require.Contains(t, w.Body.String(), "event: response.failed")
+			require.Contains(t, w.Body.String(), `"model":"gpt-6-astra"`)
+			require.Contains(t, w.Body.String(), `"code":"insufficient_quota"`)
+			failure, ok := service.GetOpsStreamError(c)
+			require.True(t, ok)
+			require.True(t, failure.RequestScoped)
+			require.Equal(t, 403, failure.IntendedStatus)
+		})
+	}
+}
+
+func TestCodexBalanceFailureLoggingKeepsTransportAndLocalAttribution(t *testing.T) {
+	for _, wireStatus := range []int{200, 101} {
+		t.Run(fmt.Sprint(wireStatus), func(t *testing.T) {
+			setupOpsErrorLogTestQueue(t, 4)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			setOpsRequestContext(c, "gpt-5.1", true)
+			c.Set(opsAccountIDKey, int64(12140))
+			service.SetOpsUpstreamError(c, 429, "earlier turn rate limit", "")
+			service.MarkCodexBalanceStreamDenied(c, "Insufficient account balance")
+			logOpsStreamError(c, service.NewOpsService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil), wireStatus)
+			require.Equal(t, int64(1), OpsErrorLogQueueLength())
+			entry := (<-opsErrorLogQueue).entry
+			require.Equal(t, 403, entry.StatusCode)
+			require.Equal(t, int64(wireStatus), gjson.Get(entry.ErrorBody, "transport_status").Int())
+			require.Equal(t, "client", entry.ErrorOwner)
+			require.Equal(t, "client_request", entry.ErrorSource)
+			require.Equal(t, "billing_error", entry.ErrorType)
+			require.True(t, entry.IsBusinessLimited)
+			require.Nil(t, entry.AccountID)
+			require.Nil(t, entry.UpstreamStatusCode)
+		})
 	}
 }
 

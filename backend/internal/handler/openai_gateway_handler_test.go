@@ -1963,6 +1963,7 @@ type openAIResponsesWSUsageLogCase struct {
 	// secondTurnCloseExpected：第二个 turn 被拒（连接被 1008 关闭）。
 	secondTurnCloseExpected bool
 	billingErrorCode        string
+	billingResponseFailed   bool
 	usageWorkerPool         *service.UsageRecordWorkerPool
 	onBillingReady          func(*service.BillingCacheService, *service.APIKey)
 }
@@ -3142,6 +3143,13 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		defer cancelRead()
 		_, payload, readErr := clientConn.Read(readCtx)
 		require.NoError(t, readErr, "billing denial must send an error event before closing")
+		if tc.billingResponseFailed {
+			require.Equal(t, "response.failed", gjson.GetBytes(payload, "type").String(), string(payload))
+			require.Equal(t, "failed", gjson.GetBytes(payload, "response.status").String())
+			require.Equal(t, tc.billingErrorCode, gjson.GetBytes(payload, "response.error.code").String())
+			require.NotEmpty(t, gjson.GetBytes(payload, "response.error.message").String())
+			return
+		}
 		require.Equal(t, "error", gjson.GetBytes(payload, "type").String(), string(payload))
 		require.Equal(t, tc.billingErrorCode, gjson.GetBytes(payload, "error.code").String(), string(payload))
 		require.GreaterOrEqual(t, gjson.GetBytes(payload, "status").Int(), int64(400))

@@ -2668,7 +2668,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 	if err := h.billingCacheService.CheckBillingEligibility(ctx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
 		reqLog.Info("openai.websocket_billing_eligibility_check_failed", zap.Error(err))
-		writeOpenAIWSBillingError(ctx, wsConn, err)
+		writeOpenAIWSBillingError(ctx, wsConn, err, c)
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 		return
 	}
@@ -2679,7 +2679,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	turnReservation.setRequest(reqModel, firstMessage)
 	if err := turnReservation.begin(ctx, h.billingCacheService, h.gatewayService, apiKey, subscription, false); err != nil {
 		reqLog.Info("openai.websocket_inflight_reservation_rejected", zap.Error(err))
-		writeOpenAIWSBillingError(ctx, wsConn, err)
+		writeOpenAIWSBillingError(ctx, wsConn, err, c)
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 		return
 	}
@@ -2694,7 +2694,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return nil
 		}
 		if err := h.billingCacheService.CheckBillingEligibility(ctx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(ctx, apiKey)); err != nil {
-			writeOpenAIWSBillingError(ctx, wsConn, err)
+			writeOpenAIWSBillingError(ctx, wsConn, err, c)
 			return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", err)
 		}
 		return nil
@@ -3102,7 +3102,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				turnKey := turnBillingAPIKeys.forTurn(turn, apiKey)
 				if err := turnReservation.begin(turnCtx, h.billingCacheService, h.gatewayService, turnKey, subscription, true); err != nil {
 					reqLog.Info("openai.websocket_turn_billing_rejected", zap.Int("turn", turn), zap.Error(err))
-					writeOpenAIWSBillingError(ctx, wsConn, err)
+					writeOpenAIWSBillingError(ctx, wsConn, err, c)
 					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "billing check failed", err)
 				}
 				return nil

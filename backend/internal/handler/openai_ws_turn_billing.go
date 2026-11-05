@@ -3,12 +3,14 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 )
 
 // A connection owns at most one admitted logical request. Account retries keep
@@ -68,7 +70,7 @@ func (r *openAIWSTurnReservation) finish() {
 
 // Send before returning a close error: passthrough may close the socket before
 // control returns to the handler. Never reduce a billing denial to a bare EOF.
-func writeOpenAIWSBillingError(ctx context.Context, conn *coderws.Conn, err error) {
+func writeOpenAIWSBillingError(ctx context.Context, conn *coderws.Conn, err error, c *gin.Context) {
 	status, code, message, retryAfter := responsesBillingErrorDetails(err)
 	event := map[string]any{
 		"type": "error", "status": status,
@@ -81,6 +83,10 @@ func writeOpenAIWSBillingError(ctx context.Context, conn *coderws.Conn, err erro
 		event["headers"] = map[string]string{"retry-after": strconv.Itoa(retryAfter)}
 	}
 	payload, _ := json.Marshal(event)
+	if c != nil && errors.Is(err, service.ErrInsufficientBalance) && service.IsCodexBalanceFailureClient(c.Request) {
+		service.MarkCodexBalanceStreamDenied(c, message)
+		payload = service.CodexBalanceFailedEvent(ctx, message)
+	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	_ = conn.Write(writeCtx, coderws.MessageText, payload)

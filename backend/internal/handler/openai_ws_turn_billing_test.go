@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -14,11 +15,24 @@ import (
 )
 
 func TestOpenAIWSTurnBillingOverdraftStopsNextTurn(t *testing.T) {
+	for _, codex := range []bool{false, true} {
+		t.Run(fmt.Sprintf("codex=%t", codex), func(t *testing.T) {
+			testOpenAIWSTurnBillingOverdraftStopsNextTurn(t, codex)
+		})
+	}
+}
+
+func testOpenAIWSTurnBillingOverdraftStopsNextTurn(t *testing.T, codex bool) {
+	var userAgent *string
+	if codex {
+		userAgent = testStringPtr("codex_exec/0.166.0")
+	}
 	for _, mode := range []string{service.OpenAIWSIngressModePassthrough, service.OpenAIWSIngressModeCtxPool, service.OpenAIWSIngressModeHTTPBridge} {
 		t.Run(mode, func(t *testing.T) {
 			cache := newHandlerInflightCache(0.000002)
 			repo := &compatStreamUsageBillingRepo{}
 			runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
+				userAgent: userAgent, billingResponseFailed: codex,
 				ingressMode: mode, standardBillingCache: cache, usageBillingRepo: repo,
 				firstPayload:            `{"type":"response.create","model":"gpt-5.1","input":[]}`,
 				secondPayload:           `{"type":"response.create","model":"gpt-5.1","input":[]}`,

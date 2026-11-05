@@ -18,6 +18,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	coderws "github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -44,7 +45,7 @@ func TestOpenAIWSBillingErrorPreservesFailureCategory(t *testing.T) {
 				defer conn.CloseNow()
 				ctx, cancel := context.WithCancel(r.Context())
 				cancel() // Closing the request context must not erase the error frame.
-				writeOpenAIWSBillingError(ctx, conn, tc.err)
+				writeOpenAIWSBillingError(ctx, conn, tc.err, nil)
 				closeOpenAIClientWS(conn, coderws.StatusPolicyViolation, "billing check failed")
 			}))
 			defer server.Close()
@@ -109,7 +110,9 @@ func TestOpenAIWSBillingErrorNativeCodex(t *testing.T) {
 		} else {
 			wsRequests.Add(1)
 		}
-		writeOpenAIWSBillingError(ctx, conn, service.ErrInsufficientBalance)
+		c, _ := gin.CreateTestContext(w)
+		c.Request = r
+		writeOpenAIWSBillingError(ctx, conn, service.ErrInsufficientBalance, c)
 		closeOpenAIClientWS(conn, coderws.StatusPolicyViolation, "billing check failed")
 	}))
 	defer server.Close()
@@ -142,7 +145,7 @@ requires_openai_auth = false
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, ctx.Err(), "native client must terminate without blind retries: %s", output)
 	require.Error(t, err, "denied turn must fail")
-	require.Contains(t, strings.ToLower(string(output)), "balance", "%s", output)
+	require.Contains(t, strings.ToLower(string(output)), "quota", "%s", output)
 	require.Contains(t, string(output), `"type":"turn.failed"`, "%s", output)
 	require.NotContains(t, string(output), "stream closed before response.completed")
 	require.NotContains(t, string(output), "Reconnecting")
