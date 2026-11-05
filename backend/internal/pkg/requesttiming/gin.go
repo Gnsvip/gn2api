@@ -117,11 +117,14 @@ func FinishRecorder(c *gin.Context, recorder *Recorder, status int) {
 	// Preserve these bounded milestones in the existing access record even
 	// when a fast request does not qualify for a separate evidence file.
 	for key, value := range map[string]*int64{
-		"openai_timing_first_event_ms":                last.FirstEventMS,
-		"openai_timing_first_visible_ms":              last.FirstVisibleMS,
-		"openai_timing_first_text_ms":                 last.FirstTextMS,
-		"openai_timing_first_content_write_ms":        last.FirstWriteMS,
-		"openai_timing_first_content_flush_return_ms": last.FirstFlushMS,
+		"openai_timing_tool_adapter_raw_event_ms":      last.ToolAdapterRawEventMS,
+		"openai_timing_tool_adapter_raw_content_ms":    last.ToolAdapterRawContentMS,
+		"openai_timing_tool_adapter_output_content_ms": last.ToolAdapterOutputContentMS,
+		"openai_timing_first_event_ms":                 last.FirstEventMS,
+		"openai_timing_first_visible_ms":               last.FirstVisibleMS,
+		"openai_timing_first_text_ms":                  last.FirstTextMS,
+		"openai_timing_first_content_write_ms":         last.FirstWriteMS,
+		"openai_timing_first_content_flush_return_ms":  last.FirstFlushMS,
 	} {
 		if value != nil {
 			c.Set(key, *value)

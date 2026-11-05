@@ -1,6 +1,33 @@
 package requesttiming
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
+
+// ToolAdapterEvent observes both sides of the tool converter without changing
+// TTFT or retaining event payloads. Output means ready for the next stream
+// reader, not flushed to the client. All times use the same request/turn origin.
+func (a *Attempt) ToolAdapterEvent(raw bool, eventType string, content bool) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ended {
+		return
+	}
+	ms := time.Since(a.start).Milliseconds()
+	if raw {
+		setFirst(&a.d.ToolAdapterRawEventMS, ms)
+		if content && a.d.ToolAdapterRawContentMS == nil {
+			setFirst(&a.d.ToolAdapterRawContentMS, ms)
+			a.d.ToolAdapterRawContentType = safeStreamEventType(eventType)
+		}
+	} else if content {
+		setFirst(&a.d.ToolAdapterOutputContentMS, ms)
+	}
+}
 
 // Fixed vocabulary and a four-event limit keep diagnosis useful without storing
 // arbitrary vendor strings, headers, request content or response content.

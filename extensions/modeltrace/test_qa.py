@@ -81,13 +81,12 @@ def test_qa_partial_round_error_never_pauses(store):
     assert control.calls == [] and store.public(7)["prompt_test"]["failure_streak"] == 0
 
 
-def test_qa_confirmed_reds_pause_only_opted_in_prompt_monitor(store):
+def test_qa_first_red_pauses_only_opted_in_prompt_monitor(store):
     store.configure(7, True, "gpt-6-sol")
     configure(store, auto_pause_enabled=True, auto_pause_threshold=2)
     control = Answers("29", "29", "29", "29")
-    for _ in range(2):
-        job = prompt_claim(store)
-        store.finish_prompt(job, s.run_prompt_round(job, store, FakeAccounts(), control))
+    job = prompt_claim(store)
+    store.finish_prompt(job, s.run_prompt_round(job, store, FakeAccounts(), control))
     store.apply_pending_prompt_pause(FakeAccounts(), control)
     assert control.calls == [7]
     state = store.public(7)

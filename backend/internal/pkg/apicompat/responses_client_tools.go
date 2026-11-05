@@ -536,14 +536,15 @@ func restoreClientToolValue(value any, adapter *ResponsesClientToolMapping) bool
 }
 
 // ResponsesClientToolStreamRestorer restores client tool stream lifecycles.
-// It is intentionally stateful because custom tools need their function
-// arguments buffered until the upstream signals the call is complete.
+// It decodes custom input strings incrementally and validates their completed
+// value before emitting a successful tool completion.
 type ResponsesClientToolStreamRestorer struct {
 	adapter  ResponsesClientToolMapping
 	nextSeq  int
 	seenSeq  bool
 	calls    map[string]*responsesClientToolStreamCall
 	byOutput map[int]*responsesClientToolStreamCall
+	err      error
 }
 
 type responsesClientToolStreamCall struct {
@@ -551,15 +552,29 @@ type responsesClientToolStreamCall struct {
 	name string
 	// callID and itemID stay as the upstream sent them so later upstream
 	// events keep matching this call; clientItemID is what we emit.
-	callID       string
-	itemID       string
-	clientItemID string
-	outputIdx    int
-	arguments    strings.Builder
+	callID         string
+	itemID         string
+	clientItemID   string
+	outputIdx      int
+	arguments      strings.Builder
+	inputStream    customInputStream
+	inputDone      bool
+	finalArguments string
 }
 
 func NewResponsesClientToolStreamRestorer(mapping ResponsesClientToolMapping) *ResponsesClientToolStreamRestorer {
 	return &ResponsesClientToolStreamRestorer{adapter: mapping, calls: make(map[string]*responsesClientToolStreamCall), byOutput: make(map[int]*responsesClientToolStreamCall)}
+}
+
+// CanBatchCustomInputDelta allows callers to combine adjacent deltas only after
+// this custom call has delivered its first input bytes. Fallback wrappers and
+// other tool kinds keep their existing behavior.
+func (r *ResponsesClientToolStreamRestorer) CanBatchCustomInputDelta(event ResponsesStreamEvent) bool {
+	if r == nil || r.err != nil || event.Type != "response.function_call_arguments.delta" {
+		return false
+	}
+	call := r.callFor(event)
+	return call != nil && call.kind == "custom" && !call.inputDone && call.inputStream.emitted.Len() > 0
 }
 
 // Restore transforms one upstream SSE event into zero or more client events.
@@ -568,6 +583,9 @@ func NewResponsesClientToolStreamRestorer(mapping ResponsesClientToolMapping) *R
 func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) []ResponsesStreamEvent {
 	if r == nil {
 		return []ResponsesStreamEvent{event}
+	}
+	if r.err != nil {
+		return nil
 	}
 	if !r.seenSeq {
 		r.nextSeq = event.SequenceNumber
@@ -601,8 +619,22 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 		emit(r.restoreNamespaceEvent(event))
 	case "response.function_call_arguments.delta":
 		if call := r.callFor(event); call != nil {
+			if call.inputDone && event.Delta != "" {
+				r.err = fmt.Errorf("custom tool arguments continued after completion")
+				return nil
+			}
 			_, _ = call.arguments.WriteString(event.Delta)
-			return nil
+			if call.kind == "custom" {
+				delta, err := call.inputStream.append(call.arguments.String())
+				if err != nil {
+					r.err = err
+					return nil
+				}
+				if delta != "" {
+					emit(ResponsesStreamEvent{Type: "response.custom_tool_call_input.delta", OutputIndex: call.outputIdx, ItemID: call.clientItemID, Delta: delta})
+				}
+			}
+			return out
 		}
 		emit(r.restoreNamespaceEvent(event))
 	case "response.function_call_arguments.done":
@@ -612,11 +644,7 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 				_, _ = call.arguments.WriteString(event.Arguments)
 			}
 			if call.kind == "custom" {
-				input := extractCustomToolCallInput(call.arguments.String())
-				if input != "" {
-					emit(ResponsesStreamEvent{Type: "response.custom_tool_call_input.delta", OutputIndex: call.outputIdx, ItemID: call.clientItemID, Delta: input})
-				}
-				emit(ResponsesStreamEvent{Type: "response.custom_tool_call_input.done", OutputIndex: call.outputIdx, ItemID: call.clientItemID, CallID: call.callID, Name: call.name, Input: input})
+				r.completeCustomInput(call, emit)
 			}
 			return out
 		}
@@ -624,8 +652,12 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 	case "response.output_item.done":
 		if call := r.recordItem(event); call != nil {
 			if call.kind == "custom" {
+				r.completeCustomInput(call, emit)
+				if r.err != nil {
+					return nil
+				}
 				event.Item.Type = "custom_tool_call"
-				event.Item.Input = extractCustomToolCallInput(call.arguments.String())
+				event.Item.Input = call.inputStream.emitted.String()
 				event.Item.Arguments = ""
 				event.Item.Namespace = ""
 			} else {
@@ -640,9 +672,13 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 			if call.clientItemID != "" {
 				event.Item.ID = call.clientItemID
 			}
-			delete(r.calls, call.itemID)
-			delete(r.calls, call.callID)
-			delete(r.byOutput, call.outputIdx)
+			// Keep custom completion state through response.completed so a
+			// contradictory terminal value cannot silently replace streamed input.
+			if call.kind != "custom" {
+				delete(r.calls, call.itemID)
+				delete(r.calls, call.callID)
+				delete(r.byOutput, call.outputIdx)
+			}
 		}
 		emit(r.restoreNamespaceEvent(event))
 	default:
@@ -659,6 +695,9 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 // completions can expand to multiple payloads and proxy argument deltas can be
 // intentionally dropped, hence the slice return value.
 func (r *ResponsesClientToolStreamRestorer) RestoreEvent(payload []byte) ([][]byte, bool, error) {
+	if r.err != nil {
+		return nil, false, r.err
+	}
 	if len(payload) == 0 {
 		return nil, false, nil
 	}
@@ -670,11 +709,17 @@ func (r *ResponsesClientToolStreamRestorer) RestoreEvent(payload []byte) ([][]by
 		return nil, false, err
 	}
 	if isResponsesClientToolTerminalEvent(wire.Type) {
+		prefix, err := r.finishTerminalCustomInputs(payload, wire.Type)
+		if err != nil {
+			r.err = err
+			return nil, false, err
+		}
 		restored, changed, err := RestoreResponsesClientToolPayload(payload, r.adapter)
 		if err != nil {
 			return nil, false, err
 		}
-		return r.resequenceRaw(restored, wire.Sequence, changed)
+		terminal, changed, err := r.resequenceRaw(restored, wire.Sequence, changed)
+		return append(prefix, terminal...), changed || len(prefix) > 0, err
 	}
 	if !clientToolLifecycleEvent(wire.Type) {
 		return r.resequenceRaw(payload, wire.Sequence, false)
@@ -687,11 +732,8 @@ func (r *ResponsesClientToolStreamRestorer) RestoreEvent(payload []byte) ([][]by
 		return nil, false, err
 	}
 	events := r.Restore(event)
-	if len(events) == 1 {
-		unchanged, err := json.Marshal(events[0])
-		if err == nil && bytes.Equal(bytes.TrimSpace(unchanged), bytes.TrimSpace(payload)) {
-			return [][]byte{payload}, false, nil
-		}
+	if r.err != nil {
+		return nil, false, r.err
 	}
 	result := make([][]byte, 0, len(events))
 	for _, restored := range events {
@@ -700,6 +742,9 @@ func (r *ResponsesClientToolStreamRestorer) RestoreEvent(payload []byte) ([][]by
 			return nil, false, err
 		}
 		result = append(result, encoded)
+	}
+	if len(result) == 1 && bytes.Equal(bytes.TrimSpace(result[0]), bytes.TrimSpace(payload)) {
+		return [][]byte{payload}, false, nil
 	}
 	return result, true, nil
 }
@@ -830,11 +875,19 @@ func (r *ResponsesClientToolStreamRestorer) callFor(event ResponsesStreamEvent) 
 	if call := r.calls[event.ItemID]; call != nil {
 		return call
 	}
-	if call := r.byOutput[event.OutputIndex]; call != nil {
+	if call := r.calls[event.CallID]; call != nil {
 		return call
 	}
+	if call := r.byOutput[event.OutputIndex]; call != nil {
+		// An absent output_index decodes as zero. Do not attach another
+		// function's explicit ID to a retained custom call at index zero.
+		if (event.ItemID == "" || call.itemID == "" || event.ItemID == call.itemID) &&
+			(event.CallID == "" || call.callID == "" || event.CallID == call.callID) {
+			return call
+		}
+	}
 	for _, call := range r.calls {
-		if (event.CallID != "" && call.callID == event.CallID) || (event.ItemID == "" && event.Name != "" && call.name == event.Name) {
+		if event.ItemID == "" && event.CallID == "" && event.Name != "" && call.name == event.Name {
 			return call
 		}
 	}

@@ -17,6 +17,7 @@ import uuid
 
 import attempts
 import evidence
+from qa_policy import CANDY_PROMPT, CANDY_QUESTION, LEGACY_CANDY_PROMPT, migrated_prompt_policy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,9 +53,7 @@ QA_MAX_CASES = 5
 MAX_ARTIFACT_BYTES = 512 * 1024
 DEFAULT_QA_CASES = [
     {"id": "candy", "name": "糖果形状题", "enabled": False,
-     "prompt": "黑色袋子中有苹果味、桃子味、西瓜味三种糖果。圆形分别有 7、9、8 颗，五角星形分别有 7、6、4 颗。"
-               "可以靠手感辨别并选择形状，但不能靠手感辨别口味。活动前决定取出的总数，最少取多少颗，"
-               "才能保证同时有圆形苹果味和五角星桃子味，或者圆形桃子味和五角星苹果味？只回答最少颗数的阿拉伯数字，不要解释。",
+     "prompt": CANDY_PROMPT,
      "expected_answer": "21"},
     {"id": "pelican_bicycle", "name": "鹈鹕骑自行车动画", "enabled": False, "kind": "manual",
      "prompt": "创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试，不需要调用任何skills",
@@ -168,6 +167,14 @@ class Store:
             }.items():
                 if name not in prompt_columns:
                     db.execute(f"ALTER TABLE prompt_monitors ADD COLUMN {name} {definition}")
+            # Only migrate the unchanged bundled question. Keep user edits and
+            # historical answers; invalidate running/pending work under old rules.
+            for row in db.execute("SELECT * FROM prompt_monitors").fetchall():
+                changes = migrated_prompt_policy(dict(row))
+                if changes:
+                    assignments = ','.join(key + '=?' for key in changes)
+                    db.execute('UPDATE prompt_monitors SET ' + assignments + ' WHERE account_id=?',
+                               (*changes.values(), row['account_id']))
 
     @contextmanager
     def db(self):
@@ -202,6 +209,8 @@ class Store:
             interval_minutes = (old["interval_minutes"] if old else 10) if interval_minutes is None else interval_minutes
             challenge_count = (old["challenge_count"] if old else 3) if challenge_count is None else challenge_count
             test_mode = (old["test_mode"] if old else "attribution") if test_mode is None else test_mode
+            if test_mode == "qa":
+                auto_pause_threshold = 1
             cases_json = (old["cases"] if old else "[]") if cases is None else json.dumps(cases, ensure_ascii=False, sort_keys=True)
             same = (old and bool(old["enabled"]) == enabled and old["model"] == model
                     and old["reasoning_effort"] == reasoning_effort
@@ -344,10 +353,9 @@ class Store:
             context = result.pop("_context", "")
             evidence.commit(db, job, result)
             artifacts = result.pop("_artifacts", {})
-            manual_round = job.get("test_mode") == "qa" and any(
-                case.get("enabled") and case.get("kind") == "manual" for case in json.loads(job["cases"]))
             streak = 0
-            if current["auto_pause_enabled"] and result.get("status") == "red" and context and not manual_round:
+            eligible = job.get("test_mode") != "qa" or result.get("round_complete") is True
+            if current["auto_pause_enabled"] and result.get("status") == "red" and context and eligible:
                 streak = (current["failure_streak"] if current["failure_context"] == context else 0) + 1
             pending = streak >= current["auto_pause_threshold"]
             mode = job.get("test_mode", "attribution")
@@ -356,6 +364,9 @@ class Store:
                           template_hash=hashlib.sha256((job["cases"] if mode == "qa" else job["prompt"]).encode()).hexdigest())
             if mode == "attribution":
                 result["bank_commit"] = BANK_COMMIT
+            else:
+                result["_pause_guard"] = {"generation": job["generation"], "run_sequence": job["run_sequence"],
+                                          "context": context}
             result["failure_streak"] = streak
             inserted = db.execute("INSERT INTO prompt_results(account_id,checked_at,model,result) VALUES(?,?,?,?)",
                                   (job["account_id"], now, job["model"], json.dumps(result, ensure_ascii=False)))
@@ -377,7 +388,7 @@ class Store:
             return dict(row) if row else None
 
     def review_artifact(self, account_id, result_id, case_id, status):
-        # Human review only edits this result. It never changes scheduling or red streaks.
+        # Only the latest completed turn of the current configuration may pause.
         with self.action_lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("""SELECT r.result FROM prompt_results r
@@ -399,6 +410,21 @@ class Store:
                 result["message"] = {"green": "所选题目均通过（含人工评分）", "yellow": "含待确认结果（人工评分已保存）",
                                      "red": "有题目未通过（含人工评分）"}[result["status"]]
             result["manual_reviewed"] = True
+            current = db.execute("SELECT * FROM prompt_monitors WHERE account_id=?", (account_id,)).fetchone()
+            latest_id = db.execute("SELECT MAX(id) FROM prompt_results WHERE account_id=?", (account_id,)).fetchone()[0]
+            guard = result.get("_pause_guard") or {}
+            if (current and current["enabled"] and current["auto_pause_enabled"] and not current["running"]
+                    and current["test_mode"] == "qa" and latest_id == result_id
+                    and guard.get("generation") == current["generation"]
+                    and guard.get("run_sequence") == current["run_sequence"] and guard.get("context")
+                    and result.get("round_complete")):
+                red = result["status"] == "red"
+                result["failure_streak"] = int(red)
+                if not red or not current["failure_streak"]:
+                    db.execute("""UPDATE prompt_monitors SET failure_streak=?,failure_context=?,pause_status=?,
+                        pause_retry_at=0,message=? WHERE account_id=?""",
+                        (int(red), guard["context"] if red else "", "pending" if red else "",
+                         "当前轮人工评分不符，等待停止调度" if red else result["message"], account_id))
             db.execute("UPDATE prompt_results SET result=? WHERE id=? AND account_id=?",
                        (json.dumps(result, ensure_ascii=False), result_id, account_id))
             return True
@@ -442,13 +468,13 @@ class Store:
                 enabled=0,running=0,generation=generation+1 WHERE account_id=?""",
                 (time.time(), message, message, row["account_id"]))
 
-    def apply_pending_prompt_pause(self, accounts, controller):
+    def apply_pending_prompt_pause(self, accounts, controller, account_id=None):
         with self.action_lock, self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("""SELECT * FROM prompt_monitors WHERE enabled=1 AND auto_pause_enabled=1
                 AND pause_status IN ('pending','failed') AND pause_retry_at<=?
-                AND failure_streak>=auto_pause_threshold ORDER BY pause_retry_at LIMIT 1""",
-                (time.time(),)).fetchone()
+                AND failure_streak>=auto_pause_threshold AND (? IS NULL OR account_id=?)
+                ORDER BY pause_retry_at LIMIT 1""", (time.time(), account_id, account_id)).fetchone()
             if not row:
                 return
             latest = db.execute("SELECT result FROM prompt_results WHERE account_id=? ORDER BY id DESC LIMIT 1",
@@ -474,7 +500,8 @@ class Store:
                     (time.time() + 60, row["account_id"]))
                 return
             kind = "问答测试答案不符" if row["test_mode"] == "qa" else "提示词归因不符"
-            message = f"连续 {row['failure_streak']} 轮{kind}，已停止此账号调度；恢复需手动操作"
+            message = (f"本轮{kind}，已停止此账号调度；恢复需手动操作" if row["test_mode"] == "qa"
+                       else f"连续 {row['failure_streak']} 轮{kind}，已停止此账号调度；恢复需手动操作")
             db.execute("""UPDATE prompt_monitors SET pause_status='paused',paused_at=?,pause_message=?,message=?,
                 enabled=0,running=0,generation=generation+1 WHERE account_id=?""",
                 (time.time(), message, message, row["account_id"]))
@@ -538,12 +565,13 @@ class Store:
             "interval_minutes": prompt["interval_minutes"] if prompt else 10,
             "message": prompt["message"] if prompt else "",
             "auto_pause_enabled": bool(prompt and prompt["auto_pause_enabled"]),
-            "auto_pause_threshold": prompt["auto_pause_threshold"] if prompt else 3,
+            "auto_pause_threshold": prompt["auto_pause_threshold"] if prompt else 1,
             "failure_streak": prompt["failure_streak"] if prompt else 0,
             "pause_status": prompt["pause_status"] if prompt else "",
             "paused_at": prompt["paused_at"] if prompt else None,
             "pause_message": prompt["pause_message"] if prompt else "",
-            "history": [{**json.loads(r[1]), "result_id": r[0]} for r in reversed(prompt_rows)],
+            "history": [{**{k: v for k, v in json.loads(r[1]).items() if k != "_pause_guard"},
+                         "result_id": r[0]} for r in reversed(prompt_rows)],
         }
         return {
             "account_id": account_id, "enabled": bool(config and config["enabled"]),
@@ -686,7 +714,7 @@ def normalized_answer(text):
 
 def qa_status(cases):
     colors = {item["status"] for item in cases}
-    return "yellow" if not cases or "yellow" in colors else "red" if "red" in colors else "green"
+    return "red" if "red" in colors else "yellow" if not cases or "yellow" in colors else "green"
 
 
 def html_artifact(output):
@@ -1264,7 +1292,7 @@ def run_qa_round(job, store, accounts, controller):
                                                 "yellow": "本轮含待确认结果"}[status], "_context": context.hex(), "round_complete": True}
         failures = [item for item in results if item.get('outcome')]
         if failures:
-            result.update(outcome=failures[0]['outcome'], round_complete=False,
+            result.update(status='yellow', outcome=failures[0]['outcome'], round_complete=False,
                           message='本轮有题目未完成')
     except ProbeError as exc:
         result = {"status": "yellow", "message": str(exc), "outcome": exc.code, "round_complete": False}
@@ -1546,7 +1574,7 @@ class AdminAuth:
         return valid
 
 
-def create_app(store, accounts, authenticate):
+def create_app(store, accounts, authenticate, controller=None):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
     allowed_origins = set(os.environ.get("MODELTRACE_ORIGINS", "https://aifxo.com,https://www.aifxo.com").split(","))
@@ -1767,6 +1795,8 @@ def create_app(store, accounts, authenticate):
             return jsonify(error="账号不存在"), 404
         if not store.review_artifact(account_id, result_id, case_id, body["status"]):
             return jsonify(error="可评分作品不存在或已随历史记录清理"), 404
+        if controller is not None:
+            store.apply_pending_prompt_pause(accounts, controller, account_id)
         return jsonify(account=render(account_id, meta))
 
     return app
@@ -1777,12 +1807,12 @@ if __name__ == "__main__":
     store = Store(os.environ.get("MODELTRACE_DB", "/var/lib/modeltrace-ovh/state.sqlite3"))
     accounts = Accounts(os.environ.get("MODELTRACE_PG", "dbname=sub2api user=modeltrace_ovh host=/var/run/postgresql"))
     auth = AdminAuth(os.environ.get("SUB2API_URL", "http://127.0.0.1:8080"))
-    app = create_app(store, accounts, auth)
     stop = threading.Event()
     controller = SchedulingControl(
         Path(os.environ.get("CREDENTIALS_DIRECTORY", "/etc/modeltrace-ovh")) / "sub2api-admin-key",
         os.environ.get("SUB2API_URL", "http://127.0.0.1:8080"),
     )
+    app = create_app(store, accounts, auth, controller)
     worker = threading.Thread(target=scheduler, args=(store, accounts, stop,
         os.environ.get("CODEX_CLIENT_VERSION", "0.147.0"), controller), daemon=True)
     worker.start()

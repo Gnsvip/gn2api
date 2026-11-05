@@ -1344,7 +1344,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
 				maxLineSize = s.cfg.Gateway.MaxLineSize
 			}
-			resp.Body = newResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize)
+			resp.Body = newResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize, requesttiming.FromGin(c).Current())
 		}
 
 		serviceTier := extractOpenAIServiceTierFromBody(body)

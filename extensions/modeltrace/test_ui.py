@@ -5,9 +5,8 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
 from playwright.sync_api import sync_playwright
-DEFAULT_QA_CASES = [dict(id='candy', name='糖果形状题', enabled=False,
-                        prompt='圆形苹果/桃子/西瓜 7/9/8，五角星 7/6/4。可按形状挑选，最少取几颗保证异形苹果桃子配对？只回答数字。',
-                        expected_answer='21')]
+from service import DEFAULT_QA_CASES as SERVER_QA_CASES
+DEFAULT_QA_CASES = [dict(SERVER_QA_CASES[0])]
 
 ROOT = Path(__file__).resolve().parent
 NOW = time.time()
@@ -322,7 +321,13 @@ with sync_playwright() as p:
     candy_case = page.locator('.mt-case').first
     candy_case.locator('summary span').click()
     assert candy_case.get_by_label('预期答案', exact=True).input_value() == '21'
+    assert candy_case.get_by_label('题目提示词', exact=True).input_value() == SERVER_QA_CASES[0]['prompt']
+    assert '参赛者需要在活动前决定摸出的糖果数目' in candy_case.get_by_label('题目提示词', exact=True).input_value()
     candy_case.locator('summary span').click()
+    single_red = page.get_by_role('switch', name='一个红点自动停止调度', exact=True)
+    single_red.check()
+    assert page.get_by_label('连续红点轮数', exact=True).is_hidden()
+    assert '包含人工标红' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='＋ 添加自定义题', exact=True).click()
     custom = page.locator('.mt-case').last
     custom.get_by_label('题目名称', exact=True).fill('知识题')
@@ -341,6 +346,7 @@ with sync_playwright() as p:
     saved = writes[-1][1]
     assert saved['test_mode'] == 'qa' and saved['enabled'] and saved['model'] == 'gpt-6.1-sol'
     assert saved['reasoning_effort'] == 'high'
+    assert saved['auto_pause_enabled'] and saved['auto_pause_threshold'] == 1
     assert [item['enabled'] for item in saved['cases']] == [False, True]
     assert saved['cases'][1]['prompt'].endswith('Only return True or False.')
     assert json.dumps(states['8']['history']) == attribution_before

@@ -110,6 +110,7 @@ func Logger() gin.HandlerFunc {
 			"ops_openai_ws_write_ms", "ops_openai_ws_request_sent_ms",
 			"ops_openai_ws_first_event_ms", "ops_openai_ws_first_visible_ms",
 			"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms",
+			"openai_timing_tool_adapter_raw_event_ms", "openai_timing_tool_adapter_raw_content_ms", "openai_timing_tool_adapter_output_content_ms",
 			"openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms",
 		} {
 			if value, exists := c.Get(key); exists {

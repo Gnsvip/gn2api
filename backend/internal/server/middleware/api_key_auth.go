@@ -261,7 +261,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			} else {
 				// 非订阅模式 或 订阅模式但 subscriptionService 未注入：回退到余额检查
 				if apiKeyBalanceBelowAuthThreshold(apiKey.User.Balance, cfg) {
-					AbortWithError(c, 403, "INSUFFICIENT_BALANCE", "Insufficient account balance")
+					abortWithAPIKeyBalanceError(c)
 					return
 				}
 			}
@@ -303,6 +303,15 @@ func hasAPIKeyCredentialInput(c *gin.Context) bool {
 	return c.GetHeader("Authorization") != "" ||
 		c.GetHeader("x-api-key") != "" ||
 		c.GetHeader("x-goog-api-key") != ""
+}
+
+func abortWithAPIKeyBalanceError(c *gin.Context) {
+	const message = "Insufficient account balance"
+	if isOpenAICompatibleAPIKeyRequest(c) {
+		abortWithOpenAIQuotaError(c, http.StatusTooManyRequests, message)
+		return
+	}
+	AbortWithError(c, http.StatusForbidden, "INSUFFICIENT_BALANCE", message)
 }
 
 func abortWithAPIKeyQuotaError(c *gin.Context) {

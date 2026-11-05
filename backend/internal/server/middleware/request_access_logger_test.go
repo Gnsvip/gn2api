@@ -404,6 +404,8 @@ func TestLoggerCorrelatesResponsesID(t *testing.T) {
 	router.POST("/v1/responses", func(c *gin.Context) {
 		requesttiming.Context(c, c.Request.Context())
 		a := requesttiming.FromGin(c).Begin(123, "websocket")
+		a.ToolAdapterEvent(true, "response.function_call_arguments.delta", true)
+		a.ToolAdapterEvent(false, "response.custom_tool_call_input.delta", true)
 		a.Event("resp_correlated", "text", "completed", 100, true, true)
 		a.Written(true)
 		a.Flushed()
@@ -424,7 +426,7 @@ func TestLoggerCorrelatesResponsesID(t *testing.T) {
 		if event.Fields["openai_response_id"] != "resp_correlated" || event.Fields["request_id"] != "gateway-correlated" {
 			t.Fatalf("missing direct correlation: %+v", event.Fields)
 		}
-		for _, key := range []string{"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms", "openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms", "ops_openai_ws_conn_id", "openai_ws_scope_hash", "openai_ws_execution_lane", "openai_ws_acquire_reason", "openai_ws_checkpoint_before"} {
+		for _, key := range []string{"openai_timing_first_event_ms", "openai_timing_first_visible_ms", "openai_timing_first_text_ms", "openai_timing_first_content_write_ms", "openai_timing_first_content_flush_return_ms", "openai_timing_tool_adapter_raw_event_ms", "openai_timing_tool_adapter_raw_content_ms", "openai_timing_tool_adapter_output_content_ms", "ops_openai_ws_conn_id", "openai_ws_scope_hash", "openai_ws_execution_lane", "openai_ws_acquire_reason", "openai_ws_checkpoint_before"} {
 			if _, ok := event.Fields[key]; !ok {
 				t.Fatalf("missing metadata %s", key)
 			}

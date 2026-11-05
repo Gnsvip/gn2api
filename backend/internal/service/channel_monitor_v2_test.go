@@ -189,6 +189,13 @@ func TestChannelMonitorV2ErrorTaxonomyPriority(t *testing.T) {
 	}{
 		{"cyber", ChannelMonitorV2ErrorInput{ErrorType: "cyber_policy", StatusCode: 200}, "content_policy"},
 		{"auth before forbidden", ChannelMonitorV2ErrorInput{StatusCode: 403, Message: "invalid API key"}, "authentication"},
+		{"local balance", ChannelMonitorV2ErrorInput{StatusCode: 403, Message: "Insufficient account balance"}, "quota_or_balance"},
+		{"balance code", ChannelMonitorV2ErrorInput{StatusCode: 403, Message: "INSUFFICIENT_BALANCE"}, "quota_or_balance"},
+		{"responses quota", ChannelMonitorV2ErrorInput{StatusCode: 429, ErrorType: "insufficient_quota"}, "quota_or_balance"},
+		{"key quota", ChannelMonitorV2ErrorInput{StatusCode: 429, Message: "API_KEY_QUOTA_EXHAUSTED"}, "quota_or_balance"},
+		{"real forbidden", ChannelMonitorV2ErrorInput{StatusCode: 403, Message: "Permission denied"}, "upstream_forbidden"},
+		{"real rate limit", ChannelMonitorV2ErrorInput{StatusCode: 429, Message: "Too many requests"}, "rate_or_capacity"},
+		{"auth before quota", ChannelMonitorV2ErrorInput{StatusCode: 401, Message: "insufficient_quota"}, "authentication"},
 		{"context", ChannelMonitorV2ErrorInput{Message: "maximum prompt length exceeded"}, "context_limit"},
 		{"unsupported", ChannelMonitorV2ErrorInput{Message: "not supported by any configured account"}, "model_unsupported"},
 		{"pool", ChannelMonitorV2ErrorInput{Message: "No available accounts"}, "account_pool_unavailable"},

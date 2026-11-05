@@ -714,7 +714,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		maxLineSize = s.cfg.Gateway.MaxLineSize
 	}
 	if hasResponsesClientToolMapping(clientToolMapping) {
-		resp.Body = newResponsesClientToolStreamBody(resp.Body, clientToolMapping, maxLineSize)
+		resp.Body = newResponsesClientToolStreamBody(resp.Body, clientToolMapping, maxLineSize, requesttiming.FromGin(c).Current())
 	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanBuf := getSSEScannerBuf64K()

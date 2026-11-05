@@ -26,6 +26,9 @@
 | `attempts[].response_id` / `upstream_request_id` | 各次尝试的 Responses ID / HTTP 上游请求 ID |
 | `account_id` / `transport` / `number` | 该次尝试使用的账号、传输方式、尝试序号 |
 | `start_ms` / `connected_ms` / `sent_ms` / `headers_ms` | 开始尝试、连接就绪、写请求返回、收到 HTTP 响应头 |
+| `tool_adapter_raw_event_ms` | 工具兼容转换器读到首个原始 JSON 事件，仅转换路径有值 |
+| `tool_adapter_raw_content_ms` / `tool_adapter_raw_content_type` | 转换前首次含内容的事件及固定类别；函数参数中的 JSON 包装片段也算内容 |
+| `tool_adapter_output_content_ms` | 转换器首次产出可交给后续读取器的内容，尚不表示下游写出 |
 | `first_event_ms` | 网关读到并解析首个上游事件；并非内容首字 |
 | `first_visible_ms` / `first_visible_type` | 首次可用内容及类别，如正文、推理内容、工具输入或图片 |
 | `first_text_ms` | 首次正文文本事件；工具参数不计入 |
@@ -42,6 +45,10 @@
 | `outcome` / `failure` / `last_stage` / `retry_reason` | 终止结果、独立的传输或下游失败标记、最后阶段、已知重试原因 |
 
 缺失字段表示没有观察到，不能当成 0。部分插件或兼容传输不提供写完成/连接/最终序列化回调，这些字段留空。只有终止帧含完整答案时不捏造独立的首次内容时间。HTTP/2 请求上传与响应可并行，时间点不保证严格串行。
+
+有自定义工具兼容转换的 HTTP/SSE 链路（包括 WS 客户端桥接 HTTP 上游），原有 `first_event_ms`、`first_visible_ms` 等由**转换后的**读取器观察，不能据此推断原始上游何时开始输出。新增 `tool_adapter_*` 时间区分转换前与转换后：后者减去前者，可显示等待足够包装片段、转换处理及该段期间本地阻塞的合计，不能把差值全部算成转换器 CPU 耗时。`first_content_write_ms` 再记录后续实际写出。所有字段沿用请求/轮次零点，不改变 UI 首字口径或扩大摘要采样范围。旧请求没有这几个字段时，无法倒推上游等待与本地转换等待各占多少。
+
+自定义工具的标准 `{"input":"..."}` 包装现在逐段解码、转发输入，跨片段转义和 Unicode 会等字节齐全后发送；最终结果校验已发前缀，完成事件不重复发送已有内容。其他包装仍按原有完成时兼容转换。首次可解码片段不等于完整工具调用可执行，也不能保证客户端立即渲染。
 
 覆盖 HTTP/SSE（普通与透传）、HTTP→WS、原生 WS 连接池、WS 透传和 WS→HTTP 桥接。WS 透传后续轮次从收到 `response.create` 开始记录，包含准入处理，不含此前的客户端空闲。
 
@@ -85,6 +92,8 @@ rg -F 'resp_要查询的ID' /实际日志目录/request-timing -g 'timing-*.json
 ## v0.2.56 完成日志中的精简元数据
 
 即使快速请求不生成单独摘要，完成日志也保留最终尝试的 `openai_timing_first_event_ms`、`openai_timing_first_visible_ms`、`openai_timing_first_text_ms`、`openai_timing_first_content_write_ms`、`openai_timing_first_content_flush_return_ms`。这些时间沿用入口/WS 轮次的零点，缺失即未观察到；后续轮次不会继承旧值。服务端 Flush 返回仍不代表客户端已渲染。
+
+发生工具兼容转换时，完成日志还保留 `openai_timing_tool_adapter_raw_event_ms`、`openai_timing_tool_adapter_raw_content_ms`、`openai_timing_tool_adapter_output_content_ms` 三个时间点。只记录毫秒值，不记录工具参数或其他正文。
 
 HTTP→WS 完成日志额外记录：
 

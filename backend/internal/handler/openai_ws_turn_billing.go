@@ -3,8 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -71,13 +69,7 @@ func (r *openAIWSTurnReservation) finish() {
 // Send before returning a close error: passthrough may close the socket before
 // control returns to the handler. Never reduce a billing denial to a bare EOF.
 func writeOpenAIWSBillingError(ctx context.Context, conn *coderws.Conn, err error) {
-	status, code, message, retryAfter := billingErrorDetails(err)
-	if errors.Is(err, service.ErrInsufficientBalance) {
-		// Codex maps 429 + insufficient_quota to a terminal quota error.
-		// A generic 403 is retried and eventually falls back to HTTP.
-		status = http.StatusTooManyRequests
-		code = "insufficient_quota"
-	}
+	status, code, message, retryAfter := responsesBillingErrorDetails(err)
 	event := map[string]any{
 		"type": "error", "status": status,
 		"error": map[string]any{"type": code, "code": code, "message": message},

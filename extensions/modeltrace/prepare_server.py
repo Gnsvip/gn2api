@@ -43,7 +43,7 @@ if __name__ == '__main__':
     baseline = snapshot()
     TARGET.mkdir(mode=0o755)
     (TARGET / 'deployment-baseline.json').write_text(json.dumps(baseline, indent=2))
-    for name in ['service.py', 'attempts.py', 'evidence.py', 'requirements.txt', 'modeltrace.js', 'modeltrace-ovh.service', 'test_service.py']:
+    for name in ['service.py', 'qa_policy.py', 'attempts.py', 'evidence.py', 'requirements.txt', 'modeltrace.js', 'modeltrace-ovh.service', 'test_service.py']:
         shutil.copy2(SOURCE / name, TARGET / name)
     shutil.copytree(SOURCE / 'vendor', TARGET / 'vendor')
     run(['useradd', '--system', '--user-group', '--home-dir', '/var/lib/modeltrace-ovh', '--shell', '/usr/sbin/nologin', 'modeltrace_ovh'])

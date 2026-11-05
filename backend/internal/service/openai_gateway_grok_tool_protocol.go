@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -109,6 +111,22 @@ type responsesClientToolStreamBody struct {
 	source io.Closer
 }
 
+// Drain already received tool deltas before the scanner may block on upstream
+// input. This batches bursts without a timer or delaying paced output.
+type responsesToolFlushReader struct {
+	io.Reader
+	flush func() error
+}
+
+func (r *responsesToolFlushReader) Read(p []byte) (int, error) {
+	if r.flush != nil {
+		if err := r.flush(); err != nil {
+			return 0, err
+		}
+	}
+	return r.Reader.Read(p)
+}
+
 func (b *responsesClientToolStreamBody) Close() error {
 	readerErr := b.PipeReader.Close()
 	sourceErr := b.source.Close()
@@ -122,10 +140,11 @@ func newResponsesClientToolStreamBody(
 	source io.ReadCloser,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	timing ...*requesttiming.Attempt,
 ) io.ReadCloser {
 	reader, writer := io.Pipe()
 	body := &responsesClientToolStreamBody{PipeReader: reader, source: source}
-	go transformResponsesClientToolStream(source, writer, mapping, maxLineSize)
+	go transformResponsesClientToolStream(source, writer, mapping, maxLineSize, timing...)
 	return body
 }
 
@@ -133,8 +152,9 @@ func newGrokResponsesClientToolStreamBody(
 	source io.ReadCloser,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	timing ...*requesttiming.Attempt,
 ) io.ReadCloser {
-	return newResponsesClientToolStreamBody(source, mapping, maxLineSize)
+	return newResponsesClientToolStreamBody(source, mapping, maxLineSize, timing...)
 }
 
 func transformResponsesClientToolStream(
@@ -142,13 +162,15 @@ func transformResponsesClientToolStream(
 	destination *io.PipeWriter,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	timing ...*requesttiming.Attempt,
 ) {
 	defer func() { _ = source.Close() }()
 	if maxLineSize <= 0 {
 		maxLineSize = defaultMaxLineSize
 	}
 
-	scanner := bufio.NewScanner(source)
+	input := &responsesToolFlushReader{Reader: source}
+	scanner := bufio.NewScanner(input)
 	scanBuf := getSSEScannerBuf64K()
 	defer putSSEScannerBuf64K(scanBuf)
 	scanner.Buffer(scanBuf[:0], maxLineSize)
@@ -158,6 +180,31 @@ func transformResponsesClientToolStream(
 	pendingFields := make([]string, 0, 2)
 	frameHadEventField := false
 	frameEmitted := false
+	var attempt *requesttiming.Attempt
+	if len(timing) > 0 {
+		attempt = timing[0]
+	}
+	rawContentObserved, outputContentObserved := false, false
+	observe := func(payload []byte, raw bool) {
+		if attempt == nil || (raw && rawContentObserved) || (!raw && outputContentObserved) || !json.Valid(payload) {
+			return
+		}
+		eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+		if eventType == "" {
+			for _, field := range pendingFields {
+				if value, ok := extractOpenAISSEEventLine(field); ok {
+					eventType = value
+				}
+			}
+		}
+		content := openAIStreamDataStartsTTFT(string(payload), eventType, false, OpenAITTFTModeVisible)
+		attempt.ToolAdapterEvent(raw, eventType, content)
+		if raw {
+			rawContentObserved = content
+		} else {
+			outputContentObserved = content
+		}
+	}
 
 	writeLine := func(line string) error {
 		if _, err := buffered.WriteString(line); err != nil {
@@ -165,9 +212,9 @@ func transformResponsesClientToolStream(
 		}
 		return buffered.WriteByte('\n')
 	}
-	writePendingFields := func(payload []byte, includeNonEvent bool) error {
+	writePendingFields := func(payload []byte, fields []string, includeNonEvent bool) error {
 		eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-		for _, field := range pendingFields {
+		for _, field := range fields {
 			if _, isEvent := extractOpenAISSEEventLine(field); isEvent {
 				if eventType != "" {
 					if err := writeLine("event: " + eventType); err != nil {
@@ -186,13 +233,14 @@ func transformResponsesClientToolStream(
 		}
 		return nil
 	}
-	writePayloads := func(payloads [][]byte) error {
+	writePayloads := func(payloads [][]byte, fields []string, hadEvent bool) error {
 		for index, payload := range payloads {
+			observe(payload, false)
 			if index == 0 {
-				if err := writePendingFields(payload, true); err != nil {
+				if err := writePendingFields(payload, fields, true); err != nil {
 					return err
 				}
-			} else if frameHadEventField {
+			} else if hadEvent {
 				eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 				if eventType != "" {
 					if err := writeLine("event: " + eventType); err != nil {
@@ -209,12 +257,66 @@ func transformResponsesClientToolStream(
 		}
 		return buffered.Flush()
 	}
+	const batchLimit = 16 * 1024
+	var batch apicompat.ResponsesStreamEvent
+	var batchDelta strings.Builder
+	var batchFields []string
+	var batchHadEvent bool
+	flushBatch := func() error {
+		if batchDelta.Len() == 0 {
+			return nil
+		}
+		batch.Delta = batchDelta.String()
+		payload, err := json.Marshal(batch)
+		if err != nil {
+			return err
+		}
+		payloads, _, err := restorer.RestoreEvent(payload)
+		if err != nil {
+			return err
+		}
+		batchDelta.Reset()
+		return writePayloads(payloads, batchFields, batchHadEvent)
+	}
+	input.flush = flushBatch
 
 	for documents.Scan() {
 		line := documents.Text()
 		data, isData := extractOpenAISSEDataLine(line)
 		if isData {
 			payload := []byte(data)
+			observe(payload, true)
+			if gjson.GetBytes(payload, "type").String() == "response.function_call_arguments.delta" {
+				var event apicompat.ResponsesStreamEvent
+				if json.Unmarshal(payload, &event) == nil && event.Delta != "" && restorer.CanBatchCustomInputDelta(event) {
+					if batchDelta.Len() > 0 && (batch.ItemID != event.ItemID || batch.CallID != event.CallID ||
+						batch.OutputIndex != event.OutputIndex || !slices.Equal(batchFields, pendingFields) ||
+						batchDelta.Len()+len(event.Delta) > batchLimit) {
+						if err := flushBatch(); err != nil {
+							_ = destination.CloseWithError(err)
+							return
+						}
+					}
+					if batchDelta.Len() == 0 {
+						batch, batchHadEvent = event, frameHadEventField
+						batchFields = append(batchFields[:0], pendingFields...)
+					}
+					batchDelta.WriteString(event.Delta)
+					if batchDelta.Len() >= batchLimit {
+						if err := flushBatch(); err != nil {
+							_ = destination.CloseWithError(err)
+							return
+						}
+					}
+					pendingFields = pendingFields[:0]
+					frameHadEventField, frameEmitted = false, true
+					continue
+				}
+			}
+			if err := flushBatch(); err != nil {
+				_ = destination.CloseWithError(err)
+				return
+			}
 			payloads := [][]byte{payload}
 			if json.Valid(payload) {
 				var err error
@@ -225,7 +327,7 @@ func transformResponsesClientToolStream(
 					return
 				}
 			}
-			if err := writePayloads(payloads); err != nil {
+			if err := writePayloads(payloads, pendingFields, frameHadEventField); err != nil {
 				_ = destination.CloseWithError(err)
 				return
 			}
@@ -237,6 +339,10 @@ func transformResponsesClientToolStream(
 
 		if line == "" {
 			if !frameEmitted {
+				if err := flushBatch(); err != nil {
+					_ = destination.CloseWithError(err)
+					return
+				}
 				for _, field := range pendingFields {
 					if err := writeLine(field); err != nil {
 						_ = destination.CloseWithError(err)
@@ -266,6 +372,10 @@ func transformResponsesClientToolStream(
 		pendingFields = append(pendingFields, line)
 	}
 
+	if err := flushBatch(); err != nil {
+		_ = destination.CloseWithError(err)
+		return
+	}
 	for _, field := range pendingFields {
 		if err := writeLine(field); err != nil {
 			_ = destination.CloseWithError(err)

@@ -10,16 +10,18 @@ import sqlite3
 import time
 
 from upgrade_auto_pause import snapshot, run, get_json
+from qa_policy import migrated_prompt_policy
 
 SOURCE = Path(__file__).resolve().parent
 TARGET = Path('/opt/modeltrace-ovh')
 DB = Path('/var/lib/modeltrace-ovh/state.sqlite3')
 JS = Path('/opt/sub2api-custom/modeltrace.js')
 NGINX = Path('/etc/nginx/sites-enabled/aifxo.com').resolve()
-VERSION = '20261102-settings-1'
+VERSION = '20261105-single-red-1'
 FILES = ['service.py', 'attempts.py', 'evidence.py', 'test_evidence.py', 'test_attempts.py', 'modeltrace.js', 'test_service.py', 'test_ui.py', 'README.md',
          'activate_server.py', 'upgrade_prompt_test.py', 'RELEASE_NOTES.md', 'test_qa.py', 'test_budget_effort.py',
-         'test_single_pass.py', 'test_lifecycle.py', 'test_gateway_failures.py', 'CALIBRATION.md']
+         'test_single_pass.py', 'test_lifecycle.py', 'test_gateway_failures.py', 'CALIBRATION.md',
+         'qa_policy.py', 'test_qa_single_red.py']
 
 
 def digest(path):
@@ -70,8 +72,17 @@ def existing_state(db):
 
 def state_preserved(db, previous):
     for table, (columns, rows, order) in previous.items():
+        rows = [tuple(row) for row in rows]
+        if table == 'prompt_monitors':
+            expected = []
+            for values in rows:
+                row = dict(zip(columns, values))
+                row.update(migrated_prompt_policy(row))
+                expected.append(tuple(row[column] for column in columns))
+            rows = expected
         selection = ','.join('"' + column.replace('"', '""') + '"' for column in columns)
-        if db.execute(f'SELECT {selection} FROM {table} ORDER BY {order}').fetchall() != rows:
+        actual = [tuple(row) for row in db.execute(f'SELECT {selection} FROM {table} ORDER BY {order}')]
+        if actual != rows:
             return False
     return True
 
@@ -119,7 +130,7 @@ def main():
                   script_version=VERSION, gateway_compatible=True,
                   changes=['independent extension files', 'retain first normal/anomaly evidence only; no SSE or Base64 recording',
                            'single batch attribution and one request per question; 720-second round budget',
-                           'honor opt-in candidate-mismatch pause thresholds; clean deleted-account records between rounds',
+                           'single-red QA pause including current-turn human reviews; correct unchanged candy presets',
                            'separate answer and stream limits; inline short answers; extract legacy HTML/SVG previews',
                            'classified gateway timeout/disconnect events; continue independent questions within the round budget',
                            'nginx script version and 128k body limit'])

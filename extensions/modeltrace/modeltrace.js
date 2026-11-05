@@ -123,7 +123,7 @@
     ...(result.cases || []).map(item => item.kind === 'manual'
       ? `${item.name}：${item.message || '待人工确认'}${item.reviewed_at ? '\n人工评分时间：' + date(item.reviewed_at) : ''}`
       : `${item.name}：${item.message || item.answer_preview || '未完成'}\n预期答案：${item.expected_answer} · 本题请求：${item.requests ?? item.attempts?.length ?? 0} 次`),
-    result.manual_reviewed && '人工评分只更新历史记录，不追溯触发自动停调度',
+    result.manual_reviewed && '人工评分已保存；仅当前轮且已开启自动停止时可触发停调度，历史评分不追溯',
     '按答案判断，不代表模型身份归因'
   ].filter(Boolean).join('\n') : [
     date(result.checked_at), `预期：${result.expected}`, result.sent_model && `发送模型：${result.sent_model}`,
@@ -1154,13 +1154,24 @@
     const autoLabel = el('label');
     const auto = el('input'); auto.type = 'checkbox'; auto.checked = !!promptState.auto_pause_enabled;
     auto.setAttribute('role', 'switch'); auto.setAttribute('aria-label', '连续红点自动停止调度');
-    autoLabel.append(auto, document.createTextNode('连续红点停调度'));
+    const autoText = document.createTextNode('');
+    autoLabel.append(auto, autoText);
     const thresholdLabel = el('label');
     const threshold = el('input'); threshold.type = 'number'; threshold.min = '1'; threshold.max = '100'; threshold.step = '1';
     threshold.value = String(promptState.auto_pause_threshold || 3); threshold.disabled = !auto.checked;
     threshold.setAttribute('aria-label', '连续红点轮数');
     const policyFields = el('div', 'mt-policy-fields'); policyFields.hidden = !auto.checked;
-    const refreshPolicy = () => { threshold.disabled = !auto.checked; policyFields.hidden = !auto.checked; progress.hidden = !auto.checked; };
+    const refreshPolicy = () => {
+      const qa = mode.value === 'qa';
+      auto.setAttribute('aria-label', qa ? '一个红点自动停止调度' : '连续红点自动停止调度');
+      autoText.textContent = qa ? '一个红点停调度' : '连续红点停调度';
+      threshold.disabled = qa || !auto.checked; policyFields.hidden = qa || !auto.checked;
+      progress.hidden = !auto.checked;
+      progress.textContent = qa ? '当前轮出现一个红点即停止调度，包含人工标红；恢复需手动操作。'
+        : `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`;
+      policyHelp.textContent = qa ? '自动答案不符或当前轮人工标红均可触发。历史评分、未完成轮次及请求错误不触发；关闭此开关后只保留检测结果。'
+        : '只计完整红点；绿、黄清零。达到设置轮数后停止调度。';
+    };
     auto.addEventListener('change', refreshPolicy);
     thresholdLabel.append(document.createTextNode('连续'), threshold, document.createTextNode('轮'));
     const progress = el('p', 'mt-note', `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`);
@@ -1168,7 +1179,8 @@
     policy.append(autoLabel, policyFields);
     const policyNotes = el('div', 'mt-policy-notes'); policyNotes.append(progress);
     const policyInfo = el('details', 'mt-info');
-    policyInfo.append(el('summary', '', 'ⓘ'), el('span', '', '只计完整红点；绿、黄清零。包含人工预览题的轮次不累计自动停调度红点；人工评分只更新记录。'));
+    const policyHelp = el('span', '');
+    policyInfo.append(el('summary', '', 'ⓘ'), policyHelp);
     policyInfo.querySelector('summary').setAttribute('aria-label', '自动停止说明');
     policy.append(policyInfo);
     if (promptState.pause_status === 'pending' || promptState.pause_status === 'failed') policyNotes.append(el('p', 'mt-error', promptState.message));
@@ -1180,9 +1192,9 @@
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
       el('p', '', '归因模式：按设置的挑战次数只跑一轮，候选分数拉开且不符标红，相符标绿；样本不足或分数未拉开标黄。候选比较不认证实际型号；开启自动停止后，连续不符达到设置轮数仍会停止调度。'),
       el('p', '', '问答模式：每道开启的题只请求一次，不符也不复测。绿表示全部符合预期；红表示至少一题不符，且本轮没有未完成题；黄表示请求失败、未完成或待人工评分。问答颜色不证明模型身份。'),
-      el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“查看作品”，手动选择绿、黄或红。人工评分会标记来源和时间，不计入自动停调度。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
-      el('p', '', '问答失败按题显示一次；代理连接、TLS 握手与上游繁忙分别标注。连续不符停止只统计完整红点，连接错误和黄色结果不计入。'),
-      el('p', '', '间隔、挑战次数与自动停止参数在一行设置。自动停止只统计用户选定阈值，绿、黄都会清零。'),
+      el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“查看作品”，手动选择绿、黄或红。开启自动停止后，当前轮人工标红即可停止调度；旧轮次评分只更新记录。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
+      el('p', '', '问答失败按题显示一次；代理连接、TLS 握手与上游繁忙分别标注。一个完整红点即可停止调度；未完成轮次、连接错误和黄色结果不计入。'),
+      el('p', '', '自定义题目固定一个红点触发；数字归因模板仍按设置的连续轮数触发。自动停止开关需自行开启。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'),
       el('p', '', '删除账号后自动清理其测试记录、留证和作品；清理在检测轮次之间执行，停用或限流不会触发删除。'));
     const history = el('ul', 'mt-history mt-prompt-history');
@@ -1231,7 +1243,7 @@
     const error = el('p', 'mt-error mt-save-error');
     const saved = account => {
       promptState = account.prompt_test; enabled.checked = !!promptState.enabled;
-      progress.textContent = `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`;
+      refreshPolicy();
     };
     const availability = el('p', 'mt-error');
     const catalogNote = el('p', 'mt-note', '正在读取账号可用模型…');
@@ -1247,6 +1259,7 @@
       const available = (qa ? promptState.qa_available : promptState.attribution_available) ?? promptState.available;
       availability.textContent = available ? '' : ((qa ? promptState.qa_reason : promptState.attribution_reason) || promptState.reason);
       schedule.classList.toggle('mt-schedule-qa', qa);
+      refreshPolicy();
       refreshEstimate();
     }
     mode.addEventListener('change', () => {
@@ -1278,7 +1291,7 @@
       const payload = { enabled: enabled.checked, model: model.value || promptState.model || 'gpt-6-astra',
         reasoning_effort: effort.select.value,
         prompt: prompt.value, challenge_count: Number(challenges.value),
-        auto_pause_enabled: auto.checked, auto_pause_threshold: Number(threshold.value), interval_minutes: Number(interval.value) };
+        auto_pause_enabled: auto.checked, auto_pause_threshold: mode.value === 'qa' ? 1 : Number(threshold.value), interval_minutes: Number(interval.value) };
       payload.test_mode = mode.value;
       if (mode.value === 'qa') payload.cases = editor.values();
       return payload;

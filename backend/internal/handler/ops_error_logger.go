@@ -2155,11 +2155,14 @@ func isKnownOpsErrorType(t string) bool {
 }
 
 func normalizeOpsErrorType(errType string, code string) string {
-	if errType != "" && isKnownOpsErrorType(errType) {
+	if errType != "" && errType != "api_error" && isKnownOpsErrorType(errType) {
 		return errType
 	}
+	if errType == opsErrInsufficientQuota {
+		return "billing_error"
+	}
 	switch strings.TrimSpace(code) {
-	case opsCodeInsufficientBalance:
+	case opsCodeInsufficientBalance, opsCodeAPIKeyQuotaExhausted, opsErrInsufficientQuota:
 		return "billing_error"
 	case opsCodeUsageLimitExceeded, opsCodeSubscriptionNotFound, opsCodeSubscriptionInvalid:
 		return "subscription_error"
@@ -2307,6 +2310,7 @@ func isOpsClientAuthError(code string, msg string) bool {
 func isOpsLocalBusinessLimitError(code string, msg string) bool {
 	switch strings.TrimSpace(code) {
 	case opsCodeInsufficientBalance,
+		opsErrInsufficientQuota,
 		opsCodeUsageLimitExceeded,
 		opsCodeSubscriptionNotFound,
 		opsCodeSubscriptionInvalid,
