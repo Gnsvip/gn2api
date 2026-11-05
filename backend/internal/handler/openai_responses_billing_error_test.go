@@ -180,6 +180,33 @@ func TestCodexBalanceFailureLoggingKeepsTransportAndLocalAttribution(t *testing.
 	}
 }
 
+func TestOpsErrorLoggerMiddlewareCodexBalanceSSEKeepsLocal403(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupOpsErrorLogTestQueue(t, 4)
+	ops := service.NewOpsService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := gin.New()
+	router.Use(OpsErrorLoggerMiddleware(ops))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		service.WriteCodexBalanceFailedSSE(c, "Insufficient account balance")
+	})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	r.Header.Set("User-Agent", "codex_exec/0.166.0")
+	router.ServeHTTP(w, r)
+	require.Equal(t, 200, w.Code)
+	require.Contains(t, w.Body.String(), "event: response.failed")
+	require.Equal(t, int64(1), OpsErrorLogQueueLength())
+	entry := (<-opsErrorLogQueue).entry
+	require.Equal(t, 403, entry.StatusCode, "captured local SSE failure must not be inferred as upstream 502")
+	require.Equal(t, int64(200), gjson.Get(entry.ErrorBody, "transport_status").Int())
+	require.Equal(t, "billing_error", entry.ErrorType)
+	require.Equal(t, "client_request", entry.ErrorSource)
+	require.Equal(t, "client", entry.ErrorOwner)
+	require.True(t, entry.IsBusinessLimited)
+	require.Nil(t, entry.AccountID)
+	require.Nil(t, entry.UpstreamStatusCode)
+}
+
 func TestOpsBalanceDenialClassification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, body := range []string{

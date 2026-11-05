@@ -1118,6 +1118,17 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 			}
 		}
 		if status < 400 {
+			// A local balance denial uses the same terminal SSE shape as an
+			// upstream failure. Its explicit admission marker takes precedence
+			// over inferring a provider 502 from the captured response body.
+			if local, ok := service.GetOpsStreamError(c); ok && local.RequestScoped &&
+				local.Code == "insufficient_quota" && local.IntendedStatus == http.StatusForbidden {
+				logOpsStreamError(c, ops, status)
+				if opsStreamErrorsAllRequestScoped(service.GetOpsStreamErrors(c)) {
+					logOpsRecoveredUpstream(c, ops, status)
+				}
+				return
+			}
 			if parsed.StreamFailure {
 				status = inferStreamFailureStatus(c, parsed)
 			} else {

@@ -16,6 +16,8 @@ Responses 的 OpenAI 与兼容网关两个 handler 均使用同一错误构造�
 
 Ops 将明确余额/额度错误记作 `billing_error`，本地拒绝归用户侧业务限制。Codex 兼容拒绝记录逻辑状态 **403**，错误详情另存 `transport_status: 200/101`；不计为成功推理，也不沿用上一轮 WS 的上游账号或错误归因。真正上游错误保留原有归因。监控的 Go 与 SQL 分类都补认 `Insufficient account balance`、`INSUFFICIENT_BALANCE`、`insufficient_quota` 和 `API_KEY_QUOTA_EXHAUSTED`。
 
+v0.2.67 线上验收发现，HTTP 的终止 SSE 被通用捕获分支先识别，绕过本地余额标记而误记 502；v0.2.68 令明确的本地余额拒绝标记优先，并补上完整 `OpsErrorLoggerMiddleware` 链路回归。只测独立日志构造器不能覆盖该分支顺序问题。
+
 这是 v1 既有 `quota_or_balance` 类别的漏识别修正，未改变类别定义或判定优先级，因此保留 taxonomy version 1。历史重算必须单独执行，不能靠提升版本号使旧数据退出查询。
 
 ## 验证
