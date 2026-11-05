@@ -72,7 +72,7 @@ requires_openai_auth = false
 			output, err := cmd.CombinedOutput()
 			require.NoError(t, ctx.Err(), "%s", output)
 			require.Error(t, err)
-			require.Contains(t, strings.ToLower(string(output)), "quota", "%s", output)
+			require.Contains(t, strings.ToLower(string(output)), "balance", "%s", output)
 			require.Contains(t, string(output), `"type":"turn.failed"`, "%s", output)
 			require.NotContains(t, string(output), "Reconnecting")
 			require.NotContains(t, string(output), "stream closed before response.completed")

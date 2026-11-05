@@ -52,7 +52,7 @@ func TestAPIKeyAuthResponsesBalanceExhausted(t *testing.T) {
 					req.Header.Set("Connection", "Upgrade")
 				}
 				router.ServeHTTP(w, req)
-				require.Equal(t, http.StatusTooManyRequests, w.Code)
+				require.Equal(t, http.StatusForbidden, w.Code)
 				require.Equal(t, "false", w.Header().Get("X-Should-Retry"))
 				require.JSONEq(t, `{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"Insufficient account balance","param":null}}`, w.Body.String())
 				require.Empty(t, w.Header().Get("Retry-After"))

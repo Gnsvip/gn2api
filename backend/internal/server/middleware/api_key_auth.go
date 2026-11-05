@@ -308,7 +308,9 @@ func hasAPIKeyCredentialInput(c *gin.Context) bool {
 func abortWithAPIKeyBalanceError(c *gin.Context) {
 	const message = "Insufficient account balance"
 	if isOpenAICompatibleAPIKeyRequest(c) {
-		abortWithOpenAIQuotaError(c, http.StatusTooManyRequests, message)
+		// Website balance exhaustion is a local admission denial, not an
+		// upstream rate limit. Preserve HTTP 403 at the public boundary.
+		abortWithOpenAIQuotaError(c, http.StatusForbidden, message)
 		return
 	}
 	AbortWithError(c, http.StatusForbidden, "INSUFFICIENT_BALANCE", message)

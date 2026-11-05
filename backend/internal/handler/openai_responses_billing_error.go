@@ -9,12 +9,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Responses clients distinguish terminal quota exhaustion from retryable rate
-// limits by both status and code. Use this for HTTP and connected WS turns.
+// Keep the site's balance denial distinct from upstream or window rate limits.
+// Use this for HTTP and connected WS turns; client retry behavior is verified
+// separately and must not change the public HTTP 403 balance contract.
 func responsesBillingErrorDetails(err error) (status int, code, message string, retryAfter int) {
 	status, code, message, retryAfter = billingErrorDetails(err)
 	if errors.Is(err, service.ErrInsufficientBalance) {
-		status, code = http.StatusTooManyRequests, "insufficient_quota"
+		status, code = http.StatusForbidden, "insufficient_quota"
 	}
 	return
 }

@@ -95,9 +95,9 @@ func TestResponsesBillingDenialBeforeAndAfterStreamStarted(t *testing.T) {
 				streamErr, ok := service.GetOpsStreamError(c)
 				require.True(t, ok)
 				require.Equal(t, "insufficient_quota", streamErr.Code)
-				require.Equal(t, http.StatusTooManyRequests, streamErr.IntendedStatus)
+				require.Equal(t, http.StatusForbidden, streamErr.IntendedStatus)
 			} else {
-				require.Equal(t, http.StatusTooManyRequests, w.Code)
+				require.Equal(t, http.StatusForbidden, w.Code)
 				require.Equal(t, "false", w.Header().Get("X-Should-Retry"))
 				require.Equal(t, "insufficient_quota", gjson.Get(w.Body.String(), "error.type").String())
 				require.Equal(t, "insufficient_quota", gjson.Get(w.Body.String(), "error.code").String())

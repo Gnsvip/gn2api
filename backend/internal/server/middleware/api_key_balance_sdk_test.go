@@ -55,8 +55,8 @@ func TestAPIKeyBalanceOfficialSDKNoRetry(t *testing.T) {
 								return
 							}
 							if tc.legacy {
-								// Reproduce v0.2.64's response by removing only the new
-								// hint from the real middleware's response.
+								// Keep the old 429-without-hint response as a retry
+								// control; the site's balance response is now 403.
 								recorded := httptest.NewRecorder()
 								router.ServeHTTP(recorded, r)
 								for key, values := range recorded.Header() {
@@ -65,7 +65,7 @@ func TestAPIKeyBalanceOfficialSDKNoRetry(t *testing.T) {
 									}
 									w.Header()[key] = values
 								}
-								w.WriteHeader(recorded.Code)
+								w.WriteHeader(http.StatusTooManyRequests)
 								_, _ = w.Write(recorded.Body.Bytes())
 								return
 							}
@@ -80,10 +80,14 @@ func TestAPIKeyBalanceOfficialSDKNoRetry(t *testing.T) {
 						}
 						cmd := exec.CommandContext(ctx, sdk.executable, flag, sdk.script)
 						code := "insufficient_quota"
+						status := http.StatusForbidden
+						if tc.legacy || tc.rateLimited {
+							status = http.StatusTooManyRequests
+						}
 						if tc.rateLimited {
 							code = "rate_limit_exceeded"
 						}
-						cmd.Env = append(os.Environ(), "GN2API_SDK_BASE_URL="+server.URL+"/v1", "GN2API_SDK_CODE="+code, fmt.Sprintf("GN2API_SDK_STREAM=%t", streaming))
+						cmd.Env = append(os.Environ(), "GN2API_SDK_BASE_URL="+server.URL+"/v1", "GN2API_SDK_CODE="+code, fmt.Sprintf("GN2API_SDK_STATUS=%d", status), fmt.Sprintf("GN2API_SDK_STREAM=%t", streaming))
 						output, err := cmd.CombinedOutput()
 						require.NoError(t, ctx.Err(), "%s", output)
 						require.NoError(t, err, "%s", output)
@@ -107,7 +111,7 @@ const OpenAI = require(process.env.GN2API_TEST_OPENAI_NODE);
       await client.responses.create({model:'gpt-5.1', input:'Reply OK only.', stream:process.env.GN2API_SDK_STREAM==='true'});
       throw new Error('unexpected success');
     } catch (error) {
-      assert.equal(error.status, 429);
+      assert.equal(error.status, Number(process.env.GN2API_SDK_STATUS));
       assert.equal(error.code, process.env.GN2API_SDK_CODE);
       denials++;
     }
@@ -126,7 +130,7 @@ try:
             client.responses.create(model='gpt-5.1', input='Reply OK only.', stream=os.environ['GN2API_SDK_STREAM']=='true')
             raise AssertionError('unexpected success')
         except openai.APIStatusError as error:
-            assert error.status_code == 429
+            assert error.status_code == int(os.environ['GN2API_SDK_STATUS'])
             assert error.code == os.environ['GN2API_SDK_CODE']
             denials += 1
     print(json.dumps({'denials':denials, 'default_retries':client.max_retries, 'version':openai.__version__}))

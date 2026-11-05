@@ -30,7 +30,7 @@ func TestOpenAIWSBillingErrorPreservesFailureCategory(t *testing.T) {
 		code   string
 		retry  bool
 	}{
-		{"balance", service.ErrInsufficientBalance, 429, "insufficient_quota", false},
+		{"balance", service.ErrInsufficientBalance, 403, "insufficient_quota", false},
 		{"key window", service.ErrAPIKeyRateLimit5hExceeded, 429, "rate_limit_exceeded", false},
 		{"rpm", service.ErrUserRPMExceeded, 429, "rate_limit_exceeded", true},
 		{"backend unavailable", service.ErrBillingServiceUnavailable, 503, "billing_service_error", false},
@@ -142,7 +142,7 @@ requires_openai_auth = false
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, ctx.Err(), "native client must terminate without blind retries: %s", output)
 	require.Error(t, err, "denied turn must fail")
-	require.Contains(t, strings.ToLower(string(output)), "quota", "%s", output)
+	require.Contains(t, strings.ToLower(string(output)), "balance", "%s", output)
 	require.Contains(t, string(output), `"type":"turn.failed"`, "%s", output)
 	require.NotContains(t, string(output), "stream closed before response.completed")
 	require.NotContains(t, string(output), "Reconnecting")
