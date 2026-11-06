@@ -160,6 +160,7 @@ func ProvideHTTPServer(cfg *config.Config, router *gin.Engine) *http.Server {
 	}
 
 	server.Handler = httpHandler
+	manageHTTPShutdown(server)
 	return server
 }
 

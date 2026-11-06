@@ -357,6 +357,10 @@ func (s *BillingCacheService) reserveInflight(ctx context.Context, user *User, g
 			break
 		}
 	}
+	if errors.Is(err, ErrBalanceTemporarilyReserved) {
+		logger.LegacyPrintf("service.billing_cache", "inflight reservation busy: user=%d inflight=%.6f estimate=%.6f", user.ID, inflight, estimate)
+		return nil, err
+	}
 	if err != nil {
 		logger.LegacyPrintf("service.billing_cache", "Warning: inflight reservation unavailable for user %d: %v", user.ID, err)
 		return nil, ErrBillingServiceUnavailable.WithCause(err)

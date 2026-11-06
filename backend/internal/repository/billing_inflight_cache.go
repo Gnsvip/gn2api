@@ -72,7 +72,7 @@ var (
 			return {0, tostring(sum), count}
 		end
 		if count > 0 and (balance - sum) < amount then
-			return {0, tostring(sum), count}
+			return {2, tostring(sum), count}
 		end
 		redis.call('ZADD', KEYS[1], tonumber(ARGV[2]), ARGV[3])
 		redis.call('HSET', KEYS[2], ARGV[3], ARGV[4])
@@ -174,6 +174,9 @@ func (c *billingCache) ReserveInflightBalance(ctx context.Context, userID int64,
 	var sum float64
 	if s, ok := res[1].(string); ok {
 		sum, _ = strconv.ParseFloat(s, 64)
+	}
+	if allowed == 2 {
+		return false, sum, service.ErrBalanceTemporarilyReserved
 	}
 	return allowed == 1, sum, nil
 }

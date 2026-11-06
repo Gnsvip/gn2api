@@ -32,6 +32,7 @@ func TestOpenAIWSBillingErrorPreservesFailureCategory(t *testing.T) {
 		retry  bool
 	}{
 		{"balance", service.ErrInsufficientBalance, 403, "insufficient_quota", false},
+		{"temporary reservation", service.ErrBalanceTemporarilyReserved, 409, "balance_temporarily_reserved", true},
 		{"key window", service.ErrAPIKeyRateLimit5hExceeded, 429, "rate_limit_exceeded", false},
 		{"rpm", service.ErrUserRPMExceeded, 429, "rate_limit_exceeded", true},
 		{"backend unavailable", service.ErrBillingServiceUnavailable, 503, "billing_service_error", false},

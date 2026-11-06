@@ -58,7 +58,7 @@ func TestInflightReservation_ConcurrentAdmitsOnlyWhatBalanceCovers(t *testing.T)
 			<-start
 			release, err := svc.ReserveInflightBalance(ctx, user, nil, nil, 0.3)
 			if err != nil {
-				if !errors.Is(err, service.ErrInsufficientBalance) {
+				if !errors.Is(err, service.ErrBalanceTemporarilyReserved) {
 					t.Errorf("unexpected error: %v", err)
 				}
 				rejected.Add(1)
@@ -98,7 +98,7 @@ func TestInflightReservation_FirstRequestAlwaysAdmitted(t *testing.T) {
 	release, err := svc.ReserveInflightBalance(ctx, user, nil, nil, 5)
 	require.NoError(t, err, "a lone request keeps legacy behavior even if estimate exceeds balance")
 	_, err = svc.ReserveInflightBalance(ctx, user, nil, nil, 0.001)
-	require.ErrorIs(t, err, service.ErrInsufficientBalance)
+	require.ErrorIs(t, err, service.ErrBalanceTemporarilyReserved)
 	release()
 	release2, err := svc.ReserveInflightBalance(ctx, user, nil, nil, 0.001)
 	require.NoError(t, err)
@@ -114,7 +114,7 @@ func TestInflightReservation_TTLExpiryFreesLeakedReservation(t *testing.T) {
 	_, err := svc.ReserveInflightBalance(ctx, user, nil, nil, 0.8) // leaked: never released
 	require.NoError(t, err)
 	_, err = svc.ReserveInflightBalance(ctx, user, nil, nil, 0.8)
-	require.ErrorIs(t, err, service.ErrInsufficientBalance)
+	require.ErrorIs(t, err, service.ErrBalanceTemporarilyReserved)
 
 	time.Sleep(1100 * time.Millisecond)
 	release, err := svc.ReserveInflightBalance(ctx, user, nil, nil, 0.8)
@@ -225,7 +225,7 @@ func TestInflightReservation_SequentialInBillingWindowAdmitsOnlyWhatBalanceCover
 	for i := 0; i < 5; i++ {
 		res, err := svc.ReserveInflight(ctx, user, nil, nil, cost)
 		if err != nil {
-			require.ErrorIs(t, err, service.ErrInsufficientBalance)
+			require.ErrorIs(t, err, service.ErrBalanceTemporarilyReserved)
 			continue
 		}
 		admitted++
@@ -257,7 +257,7 @@ func TestInflightReservation_RenewalKeepsStreamingReservationAlive(t *testing.T)
 	require.NoError(t, err)
 	time.Sleep(2500 * time.Millisecond) // streaming well past the 1s TTL
 	_, err = svc.ReserveInflight(ctx, user, nil, nil, 0.8)
-	require.ErrorIs(t, err, service.ErrInsufficientBalance, "renewed reservation must still count")
+	require.ErrorIs(t, err, service.ErrBalanceTemporarilyReserved, "renewed reservation must still count")
 	require.Equal(t, int64(1), inflightCount(t, cache, user.ID))
 
 	res.HandlerDone()

@@ -626,13 +626,11 @@ func provideCleanup(
 				return nil
 			}},
 			{"BillingCacheService", func() error {
-				billingCache.Stop()
-				return nil
-			}},
-			{"UsageRecordWorkerPool", func() error {
+				// Handlers have drained; finish their billing before stopping cache writes.
 				if usageRecordWorkerPool != nil {
 					usageRecordWorkerPool.Stop()
 				}
+				billingCache.Stop()
 				return nil
 			}},
 			{"OAuthService", func() error {

@@ -2492,6 +2492,9 @@ func extractQuotaResetSeconds(err error) int {
 }
 
 func billingErrorDetails(err error) (status int, code, message string, retryAfter int) {
+	if errors.Is(err, service.ErrBalanceTemporarilyReserved) {
+		return http.StatusConflict, "balance_temporarily_reserved", pkgerrors.Message(err), 2
+	}
 	if errors.Is(err, service.ErrBillingServiceUnavailable) {
 		msg := pkgerrors.Message(err)
 		if msg == "" {

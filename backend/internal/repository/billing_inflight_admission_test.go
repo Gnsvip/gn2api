@@ -83,7 +83,7 @@ func TestInflightReservation_MultipleInstancesShareAtomicBalance(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			r, err := instance.ReserveInflight(context.Background(), &service.User{ID: 99103}, nil, nil, 5)
-			if errors.Is(err, service.ErrInsufficientBalance) {
+			if errors.Is(err, service.ErrBalanceTemporarilyReserved) {
 				denied.Add(1)
 				return
 			}

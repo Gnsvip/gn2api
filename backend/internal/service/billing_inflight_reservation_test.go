@@ -335,8 +335,11 @@ func (m *memInflightCache) ReserveInflightBalance(_ context.Context, _ int64, id
 	for _, v := range m.res {
 		sum += v
 	}
-	if m.balance <= 0 || m.balance < minimumBalance || (len(m.res) > 0 && m.balance-sum < amount) {
+	if m.balance <= 0 || m.balance < minimumBalance {
 		return false, sum, nil
+	}
+	if len(m.res) > 0 && m.balance-sum < amount {
+		return false, sum, ErrBalanceTemporarilyReserved
 	}
 	m.res[id] = amount
 	m.exp[id] = time.Now().Add(ttl)
@@ -392,7 +395,7 @@ func TestInflightReservation_HeldUntilBillingTaskDone(t *testing.T) {
 	require.Equal(t, 1, cache.count(), "reservation must survive handler return while billing is pending")
 
 	_, err = svc.ReserveInflight(context.Background(), user, nil, nil, 0.9)
-	require.ErrorIs(t, err, ErrInsufficientBalance)
+	require.ErrorIs(t, err, ErrBalanceTemporarilyReserved)
 
 	taskDone()
 	taskDone() // idempotent
@@ -426,7 +429,7 @@ func TestInflightReservation_RenewedWhileHandlerActive(t *testing.T) {
 	require.Equal(t, 1, cache.count(), "renewal keeps the reservation alive past its TTL")
 	require.Greater(t, cache.renews.Load(), int32(3))
 	_, err = svc.ReserveInflight(context.Background(), user, nil, nil, 0.9)
-	require.ErrorIs(t, err, ErrInsufficientBalance)
+	require.ErrorIs(t, err, ErrBalanceTemporarilyReserved)
 
 	done := res.Acquire()
 	res.HandlerDone()
