@@ -47,10 +47,10 @@ func (h *AccountHandler) SetTrafficGuard(c *gin.Context) {
 	}
 	var input struct {
 		Enabled         *bool `json:"enabled"`
-		CooldownMinutes int   `json:"cooldown_minutes"`
+		CooldownMinutes *int  `json:"cooldown_minutes"` // Legacy clients only; no automatic recovery.
 	}
-	if c.ShouldBindJSON(&input) != nil || input.Enabled == nil || input.CooldownMinutes < 1 || input.CooldownMinutes > 1440 {
-		response.BadRequest(c, "须提供开关，冷却时间须为 1–1440 分钟")
+	if c.ShouldBindJSON(&input) != nil || input.Enabled == nil || (input.CooldownMinutes != nil && (*input.CooldownMinutes < 1 || *input.CooldownMinutes > 1440)) {
+		response.BadRequest(c, "须提供有效的自动停止调度开关")
 		return
 	}
 	account, err := h.adminService.GetAccount(c.Request.Context(), id)
@@ -59,12 +59,12 @@ func (h *AccountHandler) SetTrafficGuard(c *gin.Context) {
 		return
 	}
 	if account == nil || !account.IsOpenAI() {
-		response.BadRequest(c, "性能冷却目前支持 OpenAI 账号")
+		response.BadRequest(c, "性能异常自动停止调度目前支持 OpenAI 账号")
 		return
 	}
 	cfg := service.OpenAITrafficGuardConfig(account)
-	if cfg.Revision == "" || cfg.Enabled != *input.Enabled || cfg.CooldownMinutes != input.CooldownMinutes {
-		cfg = service.TrafficGuardConfig{Enabled: *input.Enabled, CooldownMinutes: input.CooldownMinutes, Revision: uuid.NewString(), Since: time.Now().UTC()}
+	if cfg.Revision == "" || cfg.Enabled != *input.Enabled {
+		cfg = service.TrafficGuardConfig{Enabled: *input.Enabled, CooldownMinutes: cfg.CooldownMinutes, Revision: uuid.NewString(), Since: time.Now().UTC()}
 		if err := h.adminService.UpdateAccountExtra(c.Request.Context(), id, map[string]any{service.TrafficGuardExtraKey: cfg}); err != nil {
 			response.ErrorFrom(c, err)
 			return

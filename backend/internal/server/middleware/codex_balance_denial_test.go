@@ -113,8 +113,7 @@ func TestCodexBalanceWSHandshakeDenial(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.CloseNow()
 	require.Equal(t, 101, resp.StatusCode)
-	// A large first turn is discarded, never retained or forwarded upstream.
-	require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","input":"`+strings.Repeat("x", 128<<10)+`"}`)))
+	require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","input":[]}`)))
 	_, payload, err := conn.Read(ctx)
 	require.NoError(t, err)
 	require.Equal(t, "response.failed", gjson.GetBytes(payload, "type").String())

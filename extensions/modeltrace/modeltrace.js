@@ -55,6 +55,9 @@
     .mt-policy input[type=number]{box-sizing:border-box;width:54px;margin:0;padding:4px 6px;border:1px solid #cbd5e1;border-radius:6px;background:transparent;color:inherit;font:inherit}.mt-policy-fields{display:flex;align-items:center;gap:8px;min-width:0}.mt-policy-fields[hidden]{display:none}.mt-policy-fields .mt-note{display:none}.mt-policy-explanation{margin:4px 0 0!important}.mt-estimate{margin:4px 0 0!important}.mt-prompt-label{display:block;margin-top:10px}.mt-dialog textarea{box-sizing:border-box;width:100%;min-height:90px;resize:vertical;padding:9px 10px;border:1px solid #cbd5e1;border-radius:7px;margin-top:5px;color:inherit;background:transparent;font:inherit;line-height:1.5}.mt-prompt-history .mt-result-title{color:#7c3aed}
     .mt-case{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:9px}.mt-case>summary{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px}.mt-case>summary span{flex:1;overflow-wrap:anywhere}.mt-case input[type=checkbox],.mt-qa-enabled input{accent-color:#059669}
     .mt-case input[type=text]{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;background:transparent;color:inherit;font:inherit;margin-top:5px}.mt-case-tools{display:flex;gap:14px;flex-wrap:wrap}.mt-qa-enabled{display:block;margin-top:14px}
+    .mt-question-picker{position:relative;min-width:0;margin-top:4px}.mt-question-picker>summary{display:flex;align-items:center;gap:8px;list-style:none;cursor:pointer;padding:7px 8px;border:1px solid #cbd5e1;border-radius:7px;min-height:22px}.mt-question-picker>summary::-webkit-details-marker{display:none}.mt-question-picker>summary:after{content:'⌄';margin-left:auto}.mt-question-picker>summary span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mt-question-picker>summary:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
+    .mt-question-options{position:absolute;top:calc(100% + 4px);left:0;z-index:8;box-sizing:border-box;width:360px;max-width:calc(100vw - 56px);max-height:340px;overflow:auto;padding:8px 12px;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 24px #0002}.dark .mt-question-options{background:#111827;border-color:#475569}.mt-question-options .mt-case{margin:0;padding:8px 0;border:0;border-bottom:1px solid #e2e8f066;border-radius:0}.mt-question-options .mt-case-tools{padding-top:8px;gap:8px 12px}.mt-question-options .mt-case>summary span{min-width:0}.mt-question-options .mt-note{margin:6px 0}
+    .mt-question-options .mt-case>summary .mt-case-edit{flex:0 0 auto;white-space:nowrap}
     .mt-preview-dialog{width:min(960px,calc(100vw - 24px))}.mt-preview-dialog iframe{display:block;width:100%;height:55vh;min-height:240px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.mt-preview-dialog .mt-actions{flex-wrap:wrap}.mt-preview-dialog .mt-header h3{overflow-wrap:anywhere}.mt-preview-dialog textarea{min-height:180px;font:12px/1.5 monospace}.mt-preview-link{display:block;margin:0 0 12px 17px;color:#7c3aed}.mt-actions .mt-review-green{border-color:#059669;color:#047857}.mt-actions .mt-review-yellow{border-color:#ca8a04;color:#a16207}.mt-actions .mt-review-red{border-color:#dc2626;color:#dc2626}
     @media(max-width:600px){.mt-header{padding:12px 12px 8px}.mt-tabs{padding:0 12px 8px}.mt-body{padding:0 12px}.mt-actions{padding:9px 12px}.mt-setting-grid{grid-template-columns:1fr 1fr}.mt-schedule-row{grid-template-columns:1fr 1fr}.mt-schedule-row .mt-policy{grid-column:1/-1;flex-wrap:wrap}.mt-result>summary{gap:5px;flex-wrap:wrap}.mt-result-inline{order:2;flex-basis:100%;flex-wrap:wrap;white-space:normal;padding-left:13px}.mt-result-case,.mt-result-case button{max-width:100%;font-size:12px}.mt-dialog{width:calc(100vw - 16px);max-height:94vh}}
   `;
@@ -673,22 +676,19 @@
     controls.append(windowSelect, refresh); top.append(status, controls);
     const enabledLabel = el('label', 'mt-inline-toggle');
     const enabled = el('input'); enabled.type = 'checkbox'; enabled.disabled = true;
-    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '连续性能异常自动冷却');
-    enabledLabel.append(enabled, document.createTextNode('连续性能异常自动冷却'));
-    const cooldownLabel = el('label', 'mt-interval', '冷却');
-    const cooldown = el('input'); cooldown.type = 'number'; cooldown.min = '1'; cooldown.max = '1440'; cooldown.step = '1'; cooldown.value = '10'; cooldown.disabled = true;
-    cooldown.setAttribute('aria-label', '性能异常冷却分钟'); cooldownLabel.append(cooldown, document.createTextNode('分钟'));
-    const protectionControls = el('div', 'mt-traffic-fields'); protectionControls.append(enabledLabel, cooldownLabel);
+    enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '连续性能异常自动停止调度');
+    enabledLabel.append(enabled, document.createTextNode('连续性能异常自动停止调度'));
+    const protectionControls = el('div', 'mt-traffic-fields'); protectionControls.append(enabledLabel);
     const protectionStatus = el('p', 'mt-note');
     const protectionGroups = el('div', 'mt-traffic-results');
     const evidence = el('details', 'mt-help'); evidence.hidden = true;
-    evidence.append(el('summary', '', '上次冷却依据'));
+    evidence.append(el('summary', '', '上次触发依据'));
     const evidenceBody = el('p', 'mt-note'); evidence.append(evidenceBody);
-    const note = el('p', 'mt-note', '只观察用户请求对应的上游账号，不额外发题、不取消已在执行的请求。开启后连续异常才进入冷却池，到期重新参与调度；不会修改手动停用状态，也不据此认定模型身份。');
+    const note = el('p', 'mt-note', '只观察用户请求对应的上游账号，不额外发题。连续性能异常命中后自动停止调度，需手动恢复；关闭此开关不会恢复账号，已在执行的请求继续完成。');
     const rules = el('details', 'mt-help');
-    rules.append(el('summary', '', '自动冷却规则与限制'), el('p', '', '同账号、模型、推理档位、服务档位、传输、计时口径、上下文、缓存比例及输出量分组。开启后，最近 6 小时内每组前 20 个有效样本建立参考；参考波动过大时不自动停用。'),
-      el('p', '', '最近 10 分钟至少连续 3 次首字达到参考 P50 的 3 倍、参考 P95 和 5 秒三者中的最大值，同时全程 TPS 不超过参考中位数的一半，才触发冷却。异常需持续至少 30 秒，输出量与参考差异不超过 2 倍。少于 32 个输出 token、失败、重试、取消和未知口径不触发。'),
-      el('p', '', 'TPS = 输出 token ÷ 整个请求耗时，包含等待时间；它是辅助指标，不等于正文生成速度。没有健康基准时无法识别一直很慢的账号。冷却后、设置变化或服务重启需重新积累参考，恢复调度不代表能力已恢复。关闭开关停止后续自动冷却，已生效的冷却仍按原时间到期。'));
+    rules.append(el('summary', '', '自动停止规则与限制'), el('p', '', '同账号、模型、推理档位、服务档位、传输、计时口径、上下文、缓存比例及输出量分组。开启后，最近 6 小时内每组前 20 个有效样本建立参考；参考波动过大时不自动停用。'),
+      el('p', '', '最近 10 分钟至少连续 3 次首字达到参考 P50 的 3 倍、参考 P95 和 5 秒三者中的最大值，同时全程 TPS 不超过参考中位数的一半，才停止调度。异常需持续至少 30 秒，输出量与参考差异不超过 2 倍。少于 32 个输出 token、失败、重试、取消和未知口径不触发。'),
+      el('p', '', 'TPS = 输出 token ÷ 整个请求耗时，包含等待时间；它是辅助指标，不等于正文生成速度，也不能单独确认上游限流或模型身份。没有健康基准时无法识别一直很慢的账号。手动恢复、设置变化或服务重启后重新积累参考。'));
     const timing = el('p', 'mt-note', '按实际出站和计时口径分组：普通 HTTP 使用 semantic 或 visible；WS 链路（含 HTTP 回退）收到明确推理信号或非空内容即记时，开始处理通知、空 delta 不算。只比较同模型、档位、上下文区间和口径。缺少完整链路证据的兼容请求不纳入分布。');
     const coverage = el('p', 'mt-note');
     const totals = el('p', 'mt-note');
@@ -699,19 +699,15 @@
     const seconds = value => value == null ? '—' : (Number(value) / 1000).toFixed(2) + ' 秒';
     const time = value => new Date(value).toLocaleString('zh-CN', { hour12: false });
     const rate = value => value == null ? '—' : Number(value).toFixed(2) + ' token/s';
-    const payload = () => ({ enabled: enabled.checked, cooldown_minutes: Number(cooldown.value) });
+    const payload = () => ({ enabled: enabled.checked });
     let baseline = null;
     const form = {
       dirty: () => baseline !== null && baseline !== JSON.stringify(payload()),
-      validate: () => {
-        const minutes = Number(cooldown.value);
-        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '冷却时间须为 1–1440 分钟'; return false; }
-        return true;
-      },
+      validate: () => !enabled.disabled,
       save: async () => {
         const currentToken = token();
         const submitted = JSON.stringify(payload());
-        enabled.disabled = cooldown.disabled = true;
+        enabled.disabled = true;
         try {
           const response = await fetch('/api/v1/admin/accounts/' + id + '/traffic-guard', {
             method: 'PUT', headers: { Authorization: 'Bearer ' + currentToken, 'Content-Type': 'application/json' },
@@ -719,26 +715,25 @@
           });
           const data = await response.json();
           if (currentToken !== token()) throw new Error('登录状态已变化');
-          if (!response.ok || data.code !== 0) throw new Error(data.message || '无法保存自动冷却设置');
+          if (!response.ok || data.code !== 0) throw new Error(data.message || '无法保存自动停止设置');
           baseline = submitted;
           await load();
           return true;
         } catch (failure) { error.textContent = failure.message; return false; }
-        finally { enabled.disabled = false; cooldown.disabled = !enabled.checked; }
+        finally { enabled.disabled = false; }
       },
       commit: () => { baseline = JSON.stringify(payload()); }
     };
     registerForm(form);
-    enabled.addEventListener('change', () => { cooldown.disabled = !enabled.checked; });
     const renderProtection = protection => {
-      if (!protection) { enabled.disabled = cooldown.disabled = true; protectionStatus.textContent = '后端尚未支持自动冷却'; return; }
-      if (!form.dirty()) { enabled.checked = !!protection.config.enabled; cooldown.value = String(protection.config.cooldown_minutes); form.commit(); }
-      enabled.disabled = false; cooldown.disabled = !enabled.checked;
-      const label = { disabled: '观察中 · 不自动停调度', learning: '自动冷却已开启 · 积累参考中', watching: '自动冷却已开启 · 观察连续异常', cooldown: '账号冷却中' }[protection.state] || '状态未知';
+      if (!protection || protection.action !== 'stop_scheduling') { enabled.disabled = true; protectionStatus.textContent = '请更新后端以支持自动停止调度'; return; }
+      if (!form.dirty()) { enabled.checked = !!protection.config.enabled; form.commit(); }
+      enabled.disabled = false;
+      const label = { disabled: '观察中 · 不自动停调度', learning: '自动停止已开启 · 积累参考中', watching: '自动停止已开启 · 观察连续异常', paused: '账号已停止调度 · 需手动恢复', cooldown: '账号处于已有冷却中' }[protection.state] || '状态未知';
       status.textContent = label;
-      dialog.dataset.trafficStatus = protection.state === 'cooldown' ? '冷却中' : protection.config.enabled ? '保护已开启' : '只观察';
+      dialog.dataset.trafficStatus = protection.state === 'paused' ? '已停止调度' : protection.state === 'cooldown' ? '冷却中' : protection.config.enabled ? '保护已开启' : '只观察';
       dialog.dispatchEvent(new Event('mt-save-end'));
-      protectionStatus.textContent = protection.until ? '冷却至 ' + time(protection.until) : protection.config.enabled ? '每组需要 20 个参考样本；样本不足不停止调度。' : '默认只观察，开启并保存后开始建立参考。';
+      protectionStatus.textContent = protection.state === 'paused' ? '请在账号管理中手动恢复调度；此处关闭保护不会恢复账号。' : protection.until ? '已有冷却至 ' + time(protection.until) : protection.config.enabled ? '每组需要 20 个参考样本；样本不足不停止调度。' : '默认只观察，开启并保存后开始建立参考。';
       protectionGroups.replaceChildren();
       for (const group of (protection.groups || []).slice(0, 20)) {
         const row = el('div', 'mt-traffic-result');
@@ -794,7 +789,7 @@
           row.append(el('p', 'mt-note', '窗口前半段 P50 ' + seconds(group.earlier.p50_ms) + '（' + group.earlier.count + ' 次） → 后半段 ' + seconds(group.later.p50_ms) + '（' + group.later.count + ' 次）'));
           rows.append(row);
         }
-        rows.append(el('p', 'mt-note', 'P50 为中位数；P95 表示约 95% 的样本不超过此耗时。观察分布与自动冷却参考分别计算，少量样本不会触发冷却。'
+        rows.append(el('p', 'mt-note', 'P50 为中位数；P95 表示约 95% 的样本不超过此耗时。观察分布与自动停止参考分别计算，少量样本不会停止调度。'
           + (view.omitted_groups ? ' 当前仅展示样本最多的 50 组，另有 ' + view.omitted_groups + ' 组。' : '')));
       } catch (e) {
         if (request === sequence && dialog.open) { status.textContent = '暂不可用'; error.textContent = e.message; }
@@ -1034,15 +1029,28 @@
     } catch (failure) { if (dialog.open) error.textContent = failure.message; }
   }
 
-  function qaEditor(initial, presets, changed) {
-    const root = el('div', 'mt-qa-editor');
+  function qaEditor(initial, presets, changed, dialog) {
+    const root = el('details', 'mt-qa-editor mt-question-picker');
+    const selection = el('summary'); selection.setAttribute('aria-label', '测试题目');
+    const selectedText = el('span', '', '请选择题目'); selection.append(selectedText);
+    const menu = el('div', 'mt-question-options');
     const list = el('div');
     const rows = [];
     const tools = el('div', 'mt-case-tools');
     const add = el('button', 'mt-link', '＋ 添加自定义题'); add.type = 'button';
     const presetButtons = [];
     const tiboPreset = (presets || []).find(preset => preset.id === 'tibo');
-    const update = () => { add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; }); changed(); root.dispatchEvent(new Event('change', { bubbles: true })); };
+    const update = () => {
+      const selected = rows.map(row => row.get()).filter(item => item.enabled);
+      selectedText.textContent = selected.length === 1 ? selected[0].name || '未命名题目' : selected.length ? `已选 ${selected.length} 道题` : '请选择题目';
+      selection.title = selected.map(item => item.name || '未命名题目').join('、');
+      add.disabled = rows.length >= 5; presetButtons.forEach(button => { button.disabled = add.disabled; });
+      changed(); root.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    root.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && root.open) { event.preventDefault(); event.stopPropagation(); root.open = false; selection.focus(); }
+    });
+    dialog.addEventListener('click', event => { if (!root.contains(event.target)) root.open = false; });
     function append(data) {
       if (rows.length >= 5) return;
       if ((data.kind || 'exact') === 'exact' && tiboPreset?.expected_answer
@@ -1054,7 +1062,8 @@
       const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!data.enabled;
       const title = el('span', '', data.name || '未命名题目');
       const remove = el('button', 'mt-link', '删除'); remove.type = 'button';
-      summary.append(enabled, title, remove); card.append(summary);
+      const editHint = el('span', 'mt-link mt-case-edit', '编辑');
+      summary.append(enabled, title, editHint, remove); card.append(summary);
       const fields = {};
       const wrappers = {};
       const kindLabel = el('label', 'mt-prompt-label', '判断方式');
@@ -1079,7 +1088,7 @@
         name: fields.name.value, prompt: fields.prompt.value, expected_answer: fields.expected_answer.value }) };
       rows.push(row); list.append(card);
       const rename = () => { title.textContent = fields.name.value || '未命名题目'; enabled.setAttribute('aria-label', '测试 ' + title.textContent); };
-      rename(); fields.name.addEventListener('input', rename);
+      rename(); fields.name.addEventListener('input', () => { rename(); update(); });
       enabled.addEventListener('click', event => event.stopPropagation());
       enabled.addEventListener('change', update);
       remove.addEventListener('click', event => { event.preventDefault(); rows.splice(rows.indexOf(row), 1); card.remove(); update(); });
@@ -1093,8 +1102,9 @@
       button.addEventListener('click', () => append({ ...preset, id: undefined, enabled: false }));
       presetButtons.push(button); tools.append(button);
     }
-    root.append(el('p', 'mt-note', '最多 5 道题。只测试勾选的题；关闭的题不发送请求。可修改每道题的提示词和预期答案。'), list, tools,
+    menu.append(el('p', 'mt-note', '可多选，最多 5 道题。点击题目行可编辑；每道勾选题每轮只请求一次。'), list, tools,
       el('p', 'mt-note', '答案匹配题按完整答案比较，忽略首尾空白、大小写和全角差异。作品题选择人工预览，无需填写预期答案。'));
+    root.append(selection, menu);
     initial.forEach(append);
     return { root, values: () => rows.map(row => row.get()) };
   }
@@ -1104,12 +1114,7 @@
     let promptState = state.prompt_test;
     const body = el('div', 'mt-body');
     const status = el('p', 'mt-note mt-panel-status'); status.dataset.modeStatus = 'custom';
-    const modeLabel = el('label', 'mt-prompt-label', '测试方式');
-    const mode = el('select'); mode.setAttribute('aria-label', '测试方式');
-    for (const [value, text] of [['qa', '自定义题目（答案匹配 / 人工预览）'], ['attribution', '数字归因模板（原算法）']]) {
-      const option = el('option', '', text); option.value = value; mode.append(option);
-    }
-    mode.value = promptState.test_mode || 'attribution'; modeLabel.append(mode);
+    const questionField = el('div', 'mt-prompt-label', '测试题目');
     const enabledLabel = el('label', 'mt-inline-toggle');
     const enabled = el('input'); enabled.type = 'checkbox'; enabled.checked = !!promptState.enabled;
     enabled.setAttribute('role', 'switch'); enabled.setAttribute('aria-label', '启用此页定时测试');
@@ -1124,16 +1129,8 @@
     model.value = preferredModel(choices, promptState.model || state.model);
     model.setAttribute('aria-label', '测试模型'); modelLabel.append(model);
     const effort = effortField(promptState.reasoning_effort, '题目推理等级');
-    const settingsGrid = el('div', 'mt-setting-grid'); settingsGrid.append(modeLabel, modelLabel, effort.label);
-    const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟；每题一次，数字归因按所选次数运行，不自动补采或复测。修改推理等级会取消旧轮次后续请求。数字归因仍需匹配对应档位的指纹库校准条件；问答按所设答案判断。');
-    const promptLabel = el('label', 'mt-prompt-label', '测试提示词模板');
-    const prompt = el('textarea'); prompt.maxLength = 4000; prompt.value = promptState.prompt || '{{challenge}}';
-    prompt.setAttribute('aria-label', '测试提示词'); promptLabel.append(prompt);
-    const templateNote = el('p', 'mt-note', '保留一个 {{challenge}}，每次自动插入新的数字挑战。普通问答不能直接用于此归因算法；修改模板可能影响统计可靠性。');
-    const challengeLabel = el('label', 'mt-prompt-label', '每轮挑战次数');
-    const challenges = el('select'); challenges.setAttribute('aria-label', '提示词挑战次数');
-    for (const count of [1, 2, 3]) { const option = el('option', '', String(count)); option.value = String(count); challenges.append(option); }
-    challenges.value = String(promptState.challenge_count || 3); challengeLabel.append(challenges);
+    const settingsGrid = el('div', 'mt-setting-grid'); settingsGrid.append(questionField, modelLabel, effort.label);
+    const budgetNote = el('p', 'mt-note', '每轮最多 12 分钟；只测试勾选题目，每题一次，不自动补采或复测。修改推理等级会取消旧轮次后续请求。');
     const intervalLabel = el('label', 'mt-interval', '测试间隔');
     const interval = el('input'); interval.type = 'number'; interval.min = '1'; interval.max = '1440'; interval.step = '1';
     interval.value = String(promptState.interval_minutes || 10); interval.setAttribute('aria-label', '测试间隔（分钟）');
@@ -1142,17 +1139,17 @@
     let editor;
     const refreshEstimate = () => {
       const selected = (editor?.values() || []).filter(item => item.enabled);
-      const minutes = Number(interval.value), samples = mode.value === 'qa' ? selected.length : Number(challenges.value);
-      const maximum = samples;
+      const minutes = Number(interval.value), maximum = selected.length;
       estimate.textContent = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440
         ? `每轮最多 ${maximum} 次，不自动复测；每天最多约 ${Math.ceil(1440 / minutes) * maximum} 次，会消耗账号额度。` : '';
     };
-    const initialCases = promptState.cases?.length || mode.value === 'qa' ? (promptState.cases || []) : (promptState.qa_presets || []);
-    editor = qaEditor(initialCases, promptState.qa_presets, refreshEstimate);
-    interval.addEventListener('input', refreshEstimate); challenges.addEventListener('change', refreshEstimate); refreshEstimate();
+    const initialCases = promptState.cases?.length || promptState.test_mode === 'qa' ? (promptState.cases || []) : (promptState.qa_presets || []);
+    editor = qaEditor(initialCases, promptState.qa_presets, refreshEstimate, dialog);
+    questionField.append(editor.root);
+    interval.addEventListener('input', refreshEstimate); refreshEstimate();
     const policy = el('div', 'mt-policy');
     const autoLabel = el('label');
-    const auto = el('input'); auto.type = 'checkbox'; auto.checked = !!promptState.auto_pause_enabled;
+    const auto = el('input'); auto.type = 'checkbox'; auto.checked = promptState.test_mode === 'qa' && !!promptState.auto_pause_enabled;
     auto.setAttribute('role', 'switch'); auto.setAttribute('aria-label', '连续红点自动停止调度');
     const autoText = document.createTextNode('');
     autoLabel.append(auto, autoText);
@@ -1162,15 +1159,12 @@
     threshold.setAttribute('aria-label', '连续红点轮数');
     const policyFields = el('div', 'mt-policy-fields'); policyFields.hidden = !auto.checked;
     const refreshPolicy = () => {
-      const qa = mode.value === 'qa';
-      auto.setAttribute('aria-label', qa ? '一个红点自动停止调度' : '连续红点自动停止调度');
-      autoText.textContent = qa ? '一个红点停调度' : '连续红点停调度';
-      threshold.disabled = qa || !auto.checked; policyFields.hidden = qa || !auto.checked;
+      auto.setAttribute('aria-label', '一个红点自动停止调度');
+      autoText.textContent = '一个红点停调度';
+      threshold.disabled = true; policyFields.hidden = true;
       progress.hidden = !auto.checked;
-      progress.textContent = qa ? '当前轮出现一个红点即停止调度，包含人工标红；恢复需手动操作。'
-        : `当前连续红点 ${promptState.failure_streak || 0} / ${promptState.auto_pause_threshold || 3}；绿、黄均清零。`;
-      policyHelp.textContent = qa ? '自动答案不符或当前轮人工标红均可触发。历史评分、未完成轮次及请求错误不触发；关闭此开关后只保留检测结果。'
-        : '只计完整红点；绿、黄清零。达到设置轮数后停止调度。';
+      progress.textContent = '当前轮出现一个红点即停止调度，包含人工标红；恢复需手动操作。';
+      policyHelp.textContent = '自动答案不符或当前轮人工标红均可触发。历史评分、未完成轮次及请求错误不触发；关闭此开关后只保留检测结果。';
     };
     auto.addEventListener('change', refreshPolicy);
     thresholdLabel.append(document.createTextNode('连续'), threshold, document.createTextNode('轮'));
@@ -1186,15 +1180,14 @@
     if (promptState.pause_status === 'pending' || promptState.pause_status === 'failed') policyNotes.append(el('p', 'mt-error', promptState.message));
     if (promptState.paused_at) policyNotes.append(el('p', 'mt-note', `上次停调度：${date(promptState.paused_at)} · ${promptState.pause_message}`));
     refreshPolicy();
-    const schedule = el('div', 'mt-schedule-row'); schedule.append(intervalLabel, challengeLabel, policy);
+    const schedule = el('div', 'mt-schedule-row mt-schedule-qa'); schedule.append(intervalLabel, policy);
     const help = el('details', 'mt-help');
     help.append(el('summary', '', '测试说明'),
       el('p', '', '测试通过 GN2API 的账号测试接口发送，使用该账号现有出站链路；传输是否为 WS 取决于实际选路，不能由归因颜色判断。'),
-      el('p', '', '归因模式：按设置的挑战次数只跑一轮，候选分数拉开且不符标红，相符标绿；样本不足或分数未拉开标黄。候选比较不认证实际型号；开启自动停止后，连续不符达到设置轮数仍会停止调度。'),
       el('p', '', '问答模式：每道开启的题只请求一次，不符也不复测。绿表示全部符合预期；红表示至少一题不符，且本轮没有未完成题；黄表示请求失败、未完成或待人工评分。问答颜色不证明模型身份。'),
       el('p', '', '人工预览题：每轮生成一次作品，先记黄点待确认。在最近结果中点击“查看作品”，手动选择绿、黄或红。开启自动停止后，当前轮人工标红即可停止调度；旧轮次评分只更新记录。作品与最近 10 轮历史一起保留，每件最多 512 KiB。'),
       el('p', '', '问答失败按题显示一次；代理连接、TLS 握手与上游繁忙分别标注。一个完整红点即可停止调度；未完成轮次、连接错误和黄色结果不计入。'),
-      el('p', '', '自定义题目固定一个红点触发；数字归因模板仍按设置的连续轮数触发。自动停止开关需自行开启。'),
+      el('p', '', '自定义题目固定一个红点触发，自动停止开关需自行开启。模型归因在单独的页签设置。'),
       el('p', '', '停止调度只停止后续新请求，不终止已经进行中的业务请求；恢复调度需要在 sub2api 中手动操作。'),
       el('p', '', '删除账号后自动清理其测试记录、留证和作品；清理在检测轮次之间执行，停用或限流不会触发删除。'));
     const history = el('ul', 'mt-history mt-prompt-history');
@@ -1248,40 +1241,27 @@
     const availability = el('p', 'mt-error');
     const catalogNote = el('p', 'mt-note', '正在读取账号可用模型…');
     function refreshMode() {
-      const qa = mode.value === 'qa';
-      promptLabel.hidden = templateNote.hidden = challengeLabel.hidden = qa;
-      editor.root.hidden = !qa;
-      choices = liveChoices ? liveChoices.filter(name => qa || (state.models || []).includes(name)) : (state.models || []);
+      choices = liveChoices || state.models || [];
       model.replaceChildren();
       for (const name of choices) { const option = el('option', '', name); option.value = name; model.append(option); }
       model.value = preferredModel(choices, desiredModel);
       model.disabled = !catalogReady || !choices.length;
-      const available = (qa ? promptState.qa_available : promptState.attribution_available) ?? promptState.available;
-      availability.textContent = available ? '' : ((qa ? promptState.qa_reason : promptState.attribution_reason) || promptState.reason);
-      schedule.classList.toggle('mt-schedule-qa', qa);
+      const available = promptState.qa_available ?? promptState.available;
+      availability.textContent = available ? '' : (promptState.qa_reason || promptState.reason);
       refreshPolicy();
       refreshEstimate();
     }
-    mode.addEventListener('change', () => {
-      auto.checked = mode.value === (promptState.test_mode || 'attribution') && !!promptState.auto_pause_enabled;
-      refreshPolicy();
-      error.textContent = ''; refreshMode();
-    });
     enabled.addEventListener('change', refreshMode);
     dialog.addEventListener('mt-save-end', refreshMode);
     body.addEventListener('input', () => { error.textContent = ''; error.classList.add('mt-error'); });
     const validate = () => {
       error.classList.add('mt-error');
-      const minutes = Number(interval.value), count = Number(threshold.value);
-      const qa = mode.value === 'qa';
+      const minutes = Number(interval.value);
       if (enabled.checked && !model.value.trim()) { error.textContent = '请填写测试模型'; return; }
-      if (!qa && (!prompt.value.trim() || prompt.value.length > 4000)) { error.textContent = '提示词不能为空且不能超过 4000 个字符'; return; }
-      if (!qa && prompt.value.split('{{challenge}}').length !== 2) { error.textContent = '请保留且仅保留一个 {{challenge}} 数字挑战占位符'; return; }
       if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) { error.textContent = '测试间隔请填写 1–1440 分钟的整数'; return; }
-      if (!Number.isInteger(count) || count < 1 || count > 100) { error.textContent = '连续红点轮数请填写 1–100 的整数'; return; }
       const cases = editor.values();
-      if (qa && enabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
-      if (qa && cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || (item.kind !== 'manual' && !item.expected_answer.trim())))) {
+      if (enabled.checked && !cases.some(item => item.enabled)) { error.textContent = '请至少勾选一道题，或关闭定时测试后保存'; return; }
+      if (cases.some(item => item.enabled && (!item.name.trim() || !item.prompt.trim() || (item.kind !== 'manual' && !item.expected_answer.trim())))) {
         error.textContent = '请填写已勾选题目的名称和提示词；答案匹配题还需填写预期答案'; return;
       }
       error.textContent = '';
@@ -1290,14 +1270,12 @@
     const formPayload = () => {
       const payload = { enabled: enabled.checked, model: model.value || promptState.model || 'gpt-6-astra',
         reasoning_effort: effort.select.value,
-        prompt: prompt.value, challenge_count: Number(challenges.value),
-        auto_pause_enabled: auto.checked, auto_pause_threshold: mode.value === 'qa' ? 1 : Number(threshold.value), interval_minutes: Number(interval.value) };
-      payload.test_mode = mode.value;
-      if (mode.value === 'qa') payload.cases = editor.values();
+        auto_pause_enabled: auto.checked, auto_pause_threshold: 1, interval_minutes: Number(interval.value),
+        test_mode: 'qa', cases: editor.values() };
       return payload;
     };
     body.append(top, settingsGrid, catalogNote, schedule, estimate, policyNotes,
-      availability, editor.root, promptLabel, templateNote, historyHead, history, empty, help, error);
+      availability, historyHead, history, empty, help, error);
     help.append(budgetNote);
     panel.append(body);
     refreshMode();

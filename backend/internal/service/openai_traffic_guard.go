@@ -21,7 +21,8 @@ const trafficGuardBaselineCount = 20
 const trafficGuardStreak = 3
 
 type TrafficGuardConfig struct {
-	Enabled         bool      `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// Retained for old saved configurations and compare-and-set; no expiry is scheduled.
 	CooldownMinutes int       `json:"cooldown_minutes"`
 	Revision        string    `json:"revision"`
 	Since           time.Time `json:"since"`
@@ -67,6 +68,7 @@ type TrafficGuardProgress struct {
 }
 
 type TrafficGuardView struct {
+	Action       string                 `json:"action"`
 	Config       TrafficGuardConfig     `json:"config"`
 	State        string                 `json:"state"`
 	Until        *time.Time             `json:"until,omitempty"`
@@ -122,8 +124,16 @@ func trafficGuardEpoch(account *Account, cfg TrafficGuardConfig) time.Time {
 	if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(since) {
 		since = *account.TempUnschedulableUntil
 	}
-	if last := trafficGuardLast(account); last != nil && time.Unix(last.UntilUnix, 0).After(since) {
-		since = time.Unix(last.UntilUnix, 0)
+	if last := trafficGuardLast(account); last != nil {
+		boundary := time.Unix(last.UntilUnix, 0)
+		if last.UntilUnix == 0 {
+			// Exclude requests already in flight when scheduling stopped, including
+			// the same second as the persisted timestamp. Manual recovery learns anew.
+			boundary = time.Unix(last.TriggeredAtUnix+1, 0)
+		}
+		if boundary.After(since) {
+			since = boundary
+		}
 	}
 	return since
 }
@@ -264,12 +274,16 @@ func (s *trafficObservationStore) guardProgress(account int64, since, now time.T
 
 func OpenAITrafficGuardView(account *Account) TrafficGuardView {
 	cfg := OpenAITrafficGuardConfig(account)
-	v := TrafficGuardView{Config: cfg, State: "disabled", Groups: []TrafficGuardProgress{}}
+	v := TrafficGuardView{Action: "stop_scheduling", Config: cfg, State: "disabled", Groups: []TrafficGuardProgress{}}
 	if account == nil {
 		return v
 	}
 	if last := trafficGuardLast(account); last != nil {
 		v.LastEvidence = last.TrafficGuard
+	}
+	if !account.Schedulable {
+		v.State = "paused"
+		return v
 	}
 	if account.TempUnschedulableUntil != nil && time.Now().Before(*account.TempUnschedulableUntil) {
 		v.State, v.Until = "cooldown", account.TempUnschedulableUntil
@@ -289,10 +303,9 @@ func OpenAITrafficGuardView(account *Account) TrafficGuardView {
 	return v
 }
 
-// Optional extension keeps this conditional mutation explicit without changing
-// the semantics of the existing generic cooldown repository method.
+// Persist suspension conditionally; do not repurpose a timed cooldown as a pause.
 type TrafficGuardRepository interface {
-	TrySetTrafficGuardCooldown(context.Context, int64, string, time.Time, string) (bool, error)
+	TryStopTrafficGuardScheduling(context.Context, int64, string, string) (bool, error)
 }
 
 func (s *OpenAIGatewayService) applyOpenAITrafficGuard(c *gin.Context, account *Account, sample trafficObservationSample) {
@@ -344,11 +357,10 @@ func (s *OpenAIGatewayService) applyOpenAITrafficGuard(c *gin.Context, account *
 	if sample.at.Add(-sample.duration).Before(trafficGuardEpoch(latest, cfg)) {
 		return
 	}
-	until := time.Now().Add(time.Duration(cfg.CooldownMinutes) * time.Minute)
-	state := TempUnschedState{UntilUnix: until.Unix(), TriggeredAtUnix: time.Now().Unix(), MatchedKeyword: trafficGuardReason, RuleIndex: -1, Scope: "account", TriggerCount: trafficGuardStreak, TriggerThreshold: trafficGuardStreak, TriggerWindowMinutes: 10, ErrorMessage: "连续性能异常：首字升高且全程 TPS 下降；暂时冷却，不代表模型身份判定", TrafficGuard: evidence}
+	state := TempUnschedState{TriggeredAtUnix: time.Now().Unix(), MatchedKeyword: trafficGuardReason, RuleIndex: -1, Scope: "account", TriggerCount: trafficGuardStreak, TriggerThreshold: trafficGuardStreak, TriggerWindowMinutes: 10, ErrorMessage: "连续性能异常：首字升高且全程 TPS 下降；已停止调度，需手动恢复", TrafficGuard: evidence}
 	reason, _ := json.Marshal(state)
 	configJSON, _ := json.Marshal(cfg)
-	applied, err := repo.TrySetTrafficGuardCooldown(ctx, account.ID, string(configJSON), until, string(reason))
+	applied, err := repo.TryStopTrafficGuardScheduling(ctx, account.ID, string(configJSON), string(reason))
 	if err != nil {
 		logger.L().Warn("openai.traffic_guard_persist_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		return
@@ -356,6 +368,8 @@ func (s *OpenAIGatewayService) applyOpenAITrafficGuard(c *gin.Context, account *
 	if !applied {
 		return
 	}
-	s.BlockAccountScheduling(latest, until, trafficGuardReason)
-	logger.L().Warn("openai.traffic_guard_cooled", zap.Int64("account_id", account.ID), zap.Time("until", until))
+	// A short runtime bridge covers scheduler propagation. The durable
+	// schedulable=false flag continues to exclude the account after it expires.
+	s.BlockAccountScheduling(latest, time.Time{}, trafficGuardReason)
+	logger.L().Warn("openai.traffic_guard_paused", zap.Int64("account_id", account.ID))
 }

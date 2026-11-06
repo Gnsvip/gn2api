@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -137,7 +138,7 @@ func (r *trafficGuardRepo) GetByID(context.Context, int64) (*Account, error) {
 	copy := *r.account
 	return &copy, nil
 }
-func (r *trafficGuardRepo) TrySetTrafficGuardCooldown(_ context.Context, _ int64, cfgJSON string, until time.Time, reason string) (bool, error) {
+func (r *trafficGuardRepo) TryStopTrafficGuardScheduling(_ context.Context, _ int64, cfgJSON string, reason string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.fail != nil {
@@ -147,13 +148,18 @@ func (r *trafficGuardRepo) TrySetTrafficGuardCooldown(_ context.Context, _ int64
 	if !r.account.IsSchedulable() || cfgJSON != string(current) {
 		return false, nil
 	}
-	r.account.TempUnschedulableUntil = &until
-	r.account.TempUnschedulableReason = reason
+	r.account.Schedulable = false
+	var evidence TempUnschedState
+	if err := json.Unmarshal([]byte(reason), &evidence); err != nil {
+		return false, err
+	}
+	r.account.Extra = maps.Clone(r.account.Extra)
+	r.account.Extra[TrafficGuardLastExtraKey] = evidence
 	r.writes++
 	return true, nil
 }
 
-func TestTrafficGuardCooldownAtomicAndOptional(t *testing.T) {
+func TestTrafficGuardSuspensionAtomicAndManualRecovery(t *testing.T) {
 	now := time.Now()
 	a, store, sample := guardFixture(now)
 	guardAddRecent(store, sample, 3, 30*time.Second)
@@ -175,23 +181,30 @@ func TestTrafficGuardCooldownAtomicAndOptional(t *testing.T) {
 	}
 	wg.Wait()
 	require.Equal(t, 1, repo.writes)
-	require.True(t, a.Schedulable, "do not toggle manual switch")
+	require.False(t, a.Schedulable, "persist suspension until manual recovery")
 	require.False(t, a.IsSchedulable())
-	require.NotNil(t, a.TempUnschedulableUntil)
-	var state TempUnschedState
-	require.NoError(t, json.Unmarshal([]byte(a.TempUnschedulableReason), &state))
+	require.Nil(t, a.TempUnschedulableUntil, "no timed recovery")
+	state := trafficGuardLast(a)
+	require.NotNil(t, state)
+	require.Zero(t, state.UntilUnix)
 	require.Equal(t, trafficGuardReason, state.MatchedKeyword)
 	require.Len(t, state.TrafficGuard.Recent, 3)
-	require.Error(t, svc.CheckOpenAIWSAccountTurn(context.Background(), &selected), "stale WS account pointer cannot bypass persisted cooldown")
+	require.Error(t, svc.CheckOpenAIWSAccountTurn(context.Background(), &selected), "stale WS account pointer cannot bypass persisted suspension")
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(a))
+	// Even after legacy cooldown/runtime bridge expiry or a service restart,
+	// the persisted account switch keeps admission closed.
 	before := now.Add(-time.Second)
 	a.TempUnschedulableUntil = &before
-	require.NoError(t, svc.CheckOpenAIWSAccountTurn(context.Background(), &selected))
-	a.Schedulable = false
+	restarted := &OpenAIGatewayService{accountRepo: repo}
+	require.Error(t, restarted.CheckOpenAIWSAccountTurn(context.Background(), &selected))
 	require.Error(t, svc.CheckOpenAIWSAccountTurn(context.Background(), &selected))
 	svc.applyOpenAITrafficGuard(nil, &selected, sample)
 	require.Equal(t, 1, repo.writes)
 	a.Schedulable = true
+	require.NoError(t, restarted.CheckOpenAIWSAccountTurn(context.Background(), &selected))
+	require.Zero(t, guardMaxStreak(store, a, now), "manual recovery must not reuse pre-suspension evidence")
+	svc.applyOpenAITrafficGuard(nil, &selected, sample)
+	require.Equal(t, 1, repo.writes, "late completion must not suspend a recovered account again")
 	a.Extra = map[string]any{}
 	svc.applyOpenAITrafficGuard(nil, &selected, sample)
 	require.Equal(t, 1, repo.writes, "concurrent disable rejects stale selected config")
@@ -205,16 +218,21 @@ func TestTrafficGuardViewRetainsOnlyLatestEvidence(t *testing.T) {
 	a, _, _ := guardFixture(time.Now())
 	a.Extra[TrafficGuardLastExtraKey] = TempUnschedState{MatchedKeyword: trafficGuardReason, TrafficGuard: &TrafficGuardEvidence{BaselineSamples: 20}}
 	v := OpenAITrafficGuardView(a)
+	require.Equal(t, "stop_scheduling", v.Action)
 	require.Equal(t, 20, v.LastEvidence.BaselineSamples)
 	until := time.Now().Add(time.Minute)
 	a.TempUnschedulableUntil = &until
 	require.Equal(t, "cooldown", OpenAITrafficGuardView(a).State)
 	a.TempUnschedulableUntil = nil
+	a.Schedulable = false
+	require.Equal(t, "paused", OpenAITrafficGuardView(a).State)
 	delete(a.Extra, TrafficGuardExtraKey)
+	require.Equal(t, "paused", OpenAITrafficGuardView(a).State, "disabling protection must not resume scheduling")
+	a.Schedulable = true
 	require.Equal(t, "disabled", OpenAITrafficGuardView(a).State)
 }
 
-func TestTrafficGuardObservationDrivesCooldown(t *testing.T) {
+func TestTrafficGuardObservationStopsScheduling(t *testing.T) {
 	now := time.Now()
 	a, store, sample := guardFixture(now)
 	for _, age := range []time.Duration{time.Minute, 30 * time.Second} {
@@ -246,6 +264,8 @@ func TestTrafficGuardObservationDrivesCooldown(t *testing.T) {
 	store.mu.Unlock()
 	svc.observeOpenAITraffic(nil, a, &r, nil, trace, false)
 	require.Equal(t, 1, repo.writes)
+	require.False(t, a.Schedulable)
+	require.Nil(t, a.TempUnschedulableUntil)
 	require.Equal(t, 23, GetOpenAITrafficObservation(a.ID, time.Hour).ValidSamples)
 }
 
@@ -277,10 +297,9 @@ func TestTrafficGuardNativeWSStopsNextTurnOnly(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	// A different completed request places the account into cooldown mid-stream.
+	// A different completed request stops scheduling mid-stream.
 	repo.mu.Lock()
-	until := time.Now().Add(time.Minute)
-	repo.account.TempUnschedulableUntil = &until
+	repo.account.Schedulable = false
 	repo.mu.Unlock()
 	upstream.Send(`{"type":"response.output_text.delta","delta":"still delivered"}`)
 	upstream.Send(string(autoContinuationEvent("resp_guard_ws", autoContinuationAnswer)))

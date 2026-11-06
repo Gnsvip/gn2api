@@ -57,7 +57,7 @@ func TestTrafficGuardAdminSettings(t *testing.T) {
 	}
 	require.Equal(t, 400, put("0", `{"enabled":true,"cooldown_minutes":10}`).Code)
 	require.Empty(t, svc.writes)
-	require.Equal(t, 200, put("7", `{"enabled":true,"cooldown_minutes":10}`).Code)
+	require.Equal(t, 200, put("7", `{"enabled":true}`).Code)
 	cfg := service.OpenAITrafficGuardConfig(svc.account)
 	require.True(t, cfg.Enabled)
 	require.NotEmpty(t, cfg.Revision)
@@ -71,6 +71,7 @@ func TestTrafficGuardAdminSettings(t *testing.T) {
 	var view map[string]any
 	require.NoError(t, json.Unmarshal(out.Body.Bytes(), &view))
 	require.Contains(t, out.Body.String(), `"mode":"observe_and_protect"`)
+	require.Contains(t, out.Body.String(), `"action":"stop_scheduling"`)
 	svc.writeErr = errors.New("failed")
 	require.Equal(t, 500, put("7", `{"enabled":false,"cooldown_minutes":10}`).Code)
 	require.True(t, service.OpenAITrafficGuardConfig(svc.account).Enabled)

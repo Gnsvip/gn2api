@@ -261,12 +261,17 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			} else {
 				// 非订阅模式 或 订阅模式但 subscriptionService 未注入：回退到余额检查
 				if apiKeyBalanceBelowAuthThreshold(apiKey.User.Balance, cfg) {
-					if abortCodexBalanceStream(c, cfg, "Insufficient account balance") {
+					allowStream, release := prepareBalanceDenial(c, apiKeyService, apiKey.User.ID)
+					if release != nil {
+						defer release()
+					}
+					if allowStream && abortCodexBalanceStream(c, cfg, "Insufficient account balance") {
 						return
 					}
 					abortWithAPIKeyBalanceError(c)
 					return
 				}
+				apiKeyService.ResetBalanceDenial(apiKey.User.ID)
 			}
 		}
 

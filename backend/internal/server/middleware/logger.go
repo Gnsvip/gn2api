@@ -43,6 +43,11 @@ func Logger() gin.HandlerFunc {
 		reason, rejected := GetIngressRejectReason(c)
 		if rejected {
 			recordIngressReject(c, reason)
+			// The first balance denial remains a detailed 403 sample. Repeats
+			// retain exact counts/first/last timestamps in bounded aggregates.
+			if reason == IngressRejectBalanceDeniedRepeat {
+				return
+			}
 			allowed, droppedSummary := globalIngressRejectAccessSampler.allow(endTime)
 			if droppedSummary > 0 {
 				logger.FromContext(c.Request.Context()).Info("ingress rejection access logs dropped",

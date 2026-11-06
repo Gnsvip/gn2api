@@ -15,6 +15,7 @@ var ingressRejectReasons = map[string]struct{}{
 	"query_api_key_deprecated": {}, "api_key_required": {}, "invalid_api_key": {},
 	"invalid_auth_rate_limited": {},
 	"api_key_auth_overloaded":   {},
+	"balance_denied_repeat":     {},
 	"api_key_disabled":          {}, "ip_restricted": {}, "user_inactive": {}, "group_deleted": {},
 	"group_disabled": {}, "group_not_allowed": {}, "group_unassigned": {}, "other": {},
 }

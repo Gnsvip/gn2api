@@ -44,7 +44,7 @@ guard_error = False
 guard_config = dict(enabled=False, cooldown_minutes=10, revision='', since='0001-01-01T00:00:00Z')
 traffic_data = dict(mode='observe_only', started_at='2026-11-04T00:00:00Z', generated_at='2026-11-04T01:00:00Z',
     capacity=100000, capacity_limited=False, window_complete=True, valid_samples=24, excluded={'forward_error': 2, 'missing_ttft': 1},
-    protection=dict(config=guard_config, state='disabled', groups=[]),
+    protection=dict(action='stop_scheduling', config=guard_config, state='disabled', groups=[]),
     groups=[dict(model='gpt-6-astra', effort='xhigh', tier='unspecified', transport='websocket', mode='ws_semantic', context='128–230k',
         stats=dict(count=24, mean_ms=2500, p50_ms=1800, p95_ms=6500, p50_tps=12.34), earlier=dict(count=12, p50_ms=1600), later=dict(count=12, p50_ms=2000))], omitted_groups=0)
 errors = []
@@ -62,6 +62,9 @@ with sync_playwright() as p:
     def open_custom():
         page.locator('[data-row-id="8"] .mt-label').click()
         page.get_by_role('tab', name='自定义题目', exact=True).click()
+    def open_questions():
+        if not page.locator('.mt-question-picker').evaluate('(e) => e.open'):
+            page.get_by_label('测试题目', exact=True).click()
     # Fixture login belongs to the admin page, never the isolated artwork frame.
     page.add_init_script("if (window === window.top) localStorage.setItem('auth_token','fixture-admin');")
     page.on('pageerror', lambda e: errors.append(str(e)))
@@ -78,7 +81,7 @@ with sync_playwright() as p:
             guard_writes.append(r.request.post_data_json)
             guard_config.update(r.request.post_data_json)
             traffic_data['mode'] = 'observe_and_protect' if guard_config['enabled'] else 'observe_only'
-            traffic_data['protection']['state'] = 'cooldown' if traffic_data['protection'].get('until') else 'learning' if guard_config['enabled'] else 'disabled'
+            traffic_data['protection']['state'] = 'paused' if traffic_data['protection']['state'] == 'paused' else 'learning' if guard_config['enabled'] else 'disabled'
             r.fulfill(json={'code':0, 'data':guard_config})
         elif '/traffic-observation' in r.request.url:
             traffic_requests.append((r.request.method, parse_qs(urlsplit(r.request.url).query)))
@@ -268,29 +271,32 @@ with sync_playwright() as p:
     assert page.get_by_label('检测模型', exact=True).locator('option').count() == 1  # Never select unavailable astra.
     assert len(writes) == before
     page.get_by_role('button', name='关闭', exact=True).click()
-    # Custom prompt testing has its own settings and history, with real color classes.
+    # Questions replace the mode/template controls and stay independent of attribution.
     attribution_before = json.dumps(states['8']['history'])
     open_custom()
-    assert page.get_by_label('测试提示词', exact=True).input_value() == '{{challenge}}'
+    assert page.get_by_label('测试方式', exact=True).count() == 0
+    assert page.get_by_label('测试提示词', exact=True).count() == 0
+    assert page.get_by_label('提示词挑战次数', exact=True).count() == 0
+    assert not page.locator('.mt-question-picker').evaluate('(e) => e.open')
+    assert page.locator('.mt-question-picker').locator('..').evaluate('(e) => e.parentElement.classList.contains("mt-setting-grid")')
     page.get_by_role('switch', name='启用此页定时测试', exact=True).check()
-    page.get_by_label('测试提示词', exact=True).fill('hello')
     page.get_by_role('button', name='保存设置', exact=True).click()
-    assert '{{challenge}}' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
-    page.get_by_label('测试提示词', exact=True).fill('请认真完成：\n{{challenge}}')
+    assert '至少勾选一道题' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
+    open_questions()
+    page.get_by_label('测试 糖果形状题', exact=True).check()
+    page.get_by_label('测试题目', exact=True).click()
     page.get_by_label('测试模型', exact=True).select_option('gpt-6-sol')
     assert page.get_by_label('题目推理等级', exact=True).input_value() == 'xhigh'
     page.get_by_label('题目推理等级', exact=True).select_option('low')
-    page.get_by_label('提示词挑战次数', exact=True).select_option('2')
     page.get_by_label('测试间隔（分钟）', exact=True).fill('15')
-    page.get_by_role('switch', name='连续红点自动停止调度').check()
-    page.get_by_label('连续红点轮数', exact=True).fill('2')
+    page.get_by_role('switch', name='一个红点自动停止调度').check()
     page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
     assert '所有修改已保存' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='关闭', exact=True).click()
     page.locator('dialog').wait_for(state='detached')
-    assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-sol', prompt='请认真完成：\n{{challenge}}',
-                                  challenge_count=2, interval_minutes=15, auto_pause_enabled=True, auto_pause_threshold=2, test_mode='attribution', reasoning_effort='low'))
+    assert writes[-1] == ('8', dict(enabled=True, model='gpt-6-sol', cases=[dict(DEFAULT_QA_CASES[0], enabled=True, kind='exact')],
+                                  interval_minutes=15, auto_pause_enabled=True, auto_pause_threshold=1, test_mode='qa', reasoning_effort='low'))
     assert json.dumps(states['8']['history']) == attribution_before
     states['8']['prompt_test']['history'] = [dict(status=color, expected='gpt-6-sol', checked_at=NOW,
                                                  message=color) for color in ['green', 'yellow', 'red']]
@@ -313,31 +319,34 @@ with sync_playwright() as p:
     # Optional question selection is saved independently from the timer and attribution.
     attribution_before = json.dumps(states['8']['history'])
     open_custom()
-    page.get_by_label('测试方式', exact=True).select_option('qa')
     page.wait_for_function("document.querySelector('[aria-label=\"测试模型\"]').disabled === false")
-    assert page.get_by_label('测试提示词', exact=True).is_hidden()
+    assert page.get_by_label('测试提示词', exact=True).count() == 0
     assert not page.get_by_role('switch', name='启用此页定时测试', exact=True).is_checked()
-    assert not page.get_by_label('测试 糖果形状题', exact=True).is_checked()
+    open_questions()
+    page.get_by_label('测试 糖果形状题', exact=True).uncheck()
     candy_case = page.locator('.mt-case').first
-    candy_case.locator('summary span').click()
+    candy_case.locator('summary span').first.click()
     assert candy_case.get_by_label('预期答案', exact=True).input_value() == '21'
     assert candy_case.get_by_label('题目提示词', exact=True).input_value() == SERVER_QA_CASES[0]['prompt']
     assert '参赛者需要在活动前决定摸出的糖果数目' in candy_case.get_by_label('题目提示词', exact=True).input_value()
-    candy_case.locator('summary span').click()
+    candy_case.locator('summary span').first.click()
     single_red = page.get_by_role('switch', name='一个红点自动停止调度', exact=True)
+    page.get_by_label('测试题目', exact=True).click()
     single_red.check()
     assert page.get_by_label('连续红点轮数', exact=True).is_hidden()
     assert '包含人工标红' in page.locator('dialog').inner_text()
+    open_questions()
     page.get_by_role('button', name='＋ 添加自定义题', exact=True).click()
     custom = page.locator('.mt-case').last
     custom.get_by_label('题目名称', exact=True).fill('知识题')
     custom.get_by_label('题目提示词', exact=True).fill('Tell me whether you know who Tibo is in OpenAI based on your knowledge without searching online. Only return True or False.')
     custom.get_by_label('预期答案', exact=True).fill('True')
     page.get_by_label('测试 知识题', exact=True).check()
+    page.get_by_label('测试 糖果形状题', exact=True).check()
     page.get_by_role('switch', name='启用此页定时测试', exact=True).check()
     page.get_by_label('测试模型', exact=True).select_option('gpt-6.1-sol')
     page.get_by_label('题目推理等级', exact=True).select_option('high')
-    assert '每轮最多 1 次' in page.locator('dialog').inner_text()
+    assert '每轮最多 2 次' in page.locator('dialog').inner_text()
     page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('dialog[aria-busy]') === null")
     assert '所有修改已保存' in page.locator('dialog').inner_text()
@@ -347,14 +356,15 @@ with sync_playwright() as p:
     assert saved['test_mode'] == 'qa' and saved['enabled'] and saved['model'] == 'gpt-6.1-sol'
     assert saved['reasoning_effort'] == 'high'
     assert saved['auto_pause_enabled'] and saved['auto_pause_threshold'] == 1
-    assert [item['enabled'] for item in saved['cases']] == [False, True]
+    assert [item['enabled'] for item in saved['cases']] == [True, True]
     assert saved['cases'][1]['prompt'].endswith('Only return True or False.')
     assert json.dumps(states['8']['history']) == attribution_before
     open_custom()
     page.wait_for_function("document.querySelector('[aria-label=\"测试模型\"]').disabled === false")
-    assert page.get_by_label('测试方式', exact=True).input_value() == 'qa'
+    assert page.get_by_label('测试方式', exact=True).count() == 0
     assert page.get_by_label('测试模型', exact=True).input_value() == 'gpt-6.1-sol'
-    assert not page.get_by_label('测试 糖果形状题', exact=True).is_checked()
+    assert page.get_by_label('测试 糖果形状题', exact=True).is_checked()
+    assert page.get_by_label('测试题目', exact=True).inner_text() == '已选 2 道题'
     assert page.get_by_label('测试 知识题', exact=True).is_checked()
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-settings.png')))
     page.set_viewport_size({'width': 390, 'height': 844})
@@ -362,6 +372,17 @@ with sync_playwright() as p:
     footer = page.locator('.mt-settings-dialog > .mt-actions').bounding_box()
     assert footer['y'] >= 0 and footer['y'] + footer['height'] <= 844
     page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-qa-mobile.png')))
+    open_questions()
+    # Select two questions without closing the menu; Escape closes only the menu.
+    page.get_by_label('测试 糖果形状题', exact=True).check()
+    assert page.get_by_label('测试题目', exact=True).inner_text() == '已选 2 道题'
+    assert page.locator('.mt-question-picker').evaluate('(e) => e.open')
+    page.locator('dialog').screenshot(path=str(out.with_name('modeltrace-question-multiselect-mobile.png')))
+    page.get_by_label('测试 糖果形状题', exact=True).uncheck()
+    page.keyboard.press('Escape')
+    assert page.locator('.mt-settings-dialog').is_visible()
+    assert not page.locator('.mt-question-picker').evaluate('(e) => e.open')
+    open_questions()
     page.get_by_label('测试 知识题', exact=True).uncheck()
     page.get_by_role('button', name='保存设置', exact=True).click()
     assert '至少勾选一道题' in page.locator('[role=tabpanel]:visible').locator('.mt-save-error').inner_text()
@@ -607,9 +628,9 @@ with sync_playwright() as p:
     assert 'P50 1.80 秒' in panel.inner_text()
     assert 'WS semantic（含推理信号）' in panel.inner_text()
     assert '转发失败 2' in panel.inner_text()
-    assert panel.get_by_role('switch', name='连续性能异常自动冷却').count() == 1
-    assert not panel.get_by_role('switch', name='连续性能异常自动冷却').is_checked()
-    assert panel.get_by_label('性能异常冷却分钟').is_disabled()
+    assert panel.get_by_role('switch', name='连续性能异常自动停止调度').count() == 1
+    assert not panel.get_by_role('switch', name='连续性能异常自动停止调度').is_checked()
+    assert panel.get_by_label('性能异常冷却分钟').count() == 0
     assert '全程 TPS P50 12.34 token/s' in panel.inner_text()
     assert guard_writes == []
     assert page.locator('.mt-actions .mt-primary').is_hidden()
@@ -634,13 +655,11 @@ with sync_playwright() as p:
     assert traffic_requests[-1][1] == dict(window_minutes=['1440'])
     assert len(writes) == paid_writes
     # Only explicit save enables the guard. Observation refresh must not overwrite edits.
-    guard_toggle = panel.get_by_role('switch', name='连续性能异常自动冷却')
+    guard_toggle = panel.get_by_role('switch', name='连续性能异常自动停止调度')
     guard_toggle.check()
-    panel.get_by_label('性能异常冷却分钟').fill('15')
     page.get_by_role('button', name='刷新统计', exact=True).click()
     page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('暂无有效样本')")
     assert guard_toggle.is_checked()
-    assert panel.get_by_label('性能异常冷却分钟').input_value() == '15'
     assert guard_writes == []
     guard_error = True
     page.get_by_role('button', name='保存设置', exact=True).click()
@@ -648,21 +667,21 @@ with sync_playwright() as p:
     assert guard_toggle.is_checked() and guard_writes == []
     guard_error = False
     page.get_by_role('button', name='保存设置', exact=True).click()
-    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('自动冷却已开启')")
-    assert guard_writes == [dict(enabled=True, cooldown_minutes=15)]
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('自动停止已开启')")
+    assert guard_writes == [dict(enabled=True)]
     assert '保护已开启' in page.locator('.mt-header .mt-badge').inner_text()
     assert len(writes) == paid_writes  # No model tests are scheduled by protection.
-    traffic_data['protection'].update(state='cooldown', until='2026-11-05T12:00:00Z', last_evidence=dict(
+    traffic_data['protection'].update(state='paused', last_evidence=dict(
         model='gpt-6-astra', effort='high', transport='websocket', baseline_p50_ms=1000, baseline_tps=64,
         recent=[dict(at='2026-11-05T11:50:00Z', ttft_ms=6000, tps=20)]))
     page.get_by_role('button', name='刷新统计', exact=True).click()
-    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('账号冷却中')")
-    assert panel.get_by_text('上次冷却依据', exact=True).is_visible()
+    page.wait_for_function("document.querySelector('#mt-panel-traffic').textContent.includes('账号已停止调度')")
+    assert panel.get_by_text('上次触发依据', exact=True).is_visible()
     guard_toggle.uncheck()
     page.get_by_role('button', name='保存设置', exact=True).click()
     page.wait_for_function("document.querySelector('.mt-actions .mt-primary').dataset.dirty === 'false'")
-    assert guard_writes[-1] == dict(enabled=False, cooldown_minutes=15)
-    assert '账号冷却中' in panel.inner_text()  # Disabling does not cancel an active cooldown.
+    assert guard_writes[-1] == dict(enabled=False)
+    assert '账号已停止调度' in panel.inner_text()  # Disabling must never resume scheduling.
     page.get_by_role('button', name='关闭', exact=True).click()
     page.evaluate("history.pushState({},'', '/dashboard')")
     page.wait_for_function("document.querySelectorAll('.mt-row').length===0")
