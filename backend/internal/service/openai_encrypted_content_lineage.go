@@ -17,9 +17,10 @@ import (
 //
 // 上游判定某轮请求中的加密 reasoning/compaction 项不可解后，同一失效密文会随
 // 客户端维护的会话历史在后续每一轮重新出现，重复触发"整包被拒→剥离→重试/
-// 重连"。这里按会话记录已被上游拒绝过的 encrypted_content 摘要
-// （OpenAIWSStateStore，带 TTL 与容量自保护）；后续请求仅清理命中的 reasoning。
-// 命中 compaction 则明确失败，不能删除唯一的压缩历史。新密文不受旧摘要影响。
+// 重连"。这里同时按会话和账号+分组记录被拒的 encrypted_content 摘要
+// （OpenAIWSStateStore，带 TTL 与容量自保护）；客户端改变会话哈希后仍能命中，
+// 但不会污染其他账号或分组。后续请求仅清理命中的 reasoning；命中 compaction
+// 则恢复已验证副本，找不到副本时明确失败，不能删除唯一的压缩历史。
 
 const openAIWSFallbackReasonInvalidEncryptedContent = "invalid_encrypted_content"
 
@@ -69,6 +70,7 @@ func hasOpenAIEncryptedCompaction(reqBody map[string]any, invalid map[string]str
 
 func writeOpenAIEncryptedCompactionError(c *gin.Context) error {
 	setOpsUpstreamError(c, http.StatusBadRequest, errOpenAIEncryptedCompactionContext.Error(), "")
+	c.Header("X-Should-Retry", "false")
 	c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
 		"type": "invalid_request_error", "code": openAIWSFallbackReasonInvalidEncryptedContent,
 		"message": errOpenAIEncryptedCompactionContext.Error(),
@@ -84,6 +86,33 @@ const openAIWSIngressSessionHashContextKey = "openai_ws_ingress_session_hash"
 func openAIEncryptedContentDigest(encrypted string) string {
 	sum := sha256.Sum256([]byte(encrypted))
 	return hex.EncodeToString(sum[:])
+}
+
+// Check the canonical full window as well as the wire body: a native WS create
+// may contain only a delta whose rejected summary lives in the retained parent.
+func (s *OpenAIGatewayService) knownInvalidCompaction(c *gin.Context, accountID int64, body []byte) bool {
+	if s == nil || c == nil || accountID <= 0 {
+		return false
+	}
+	groupID := getOpenAIGroupIDFromContext(c)
+	invalid := s.sessionInvalidEncryptedContentDigests(groupID, "", accountID)
+	if len(invalid) == 0 {
+		return false // Normal requests do not scan large histories for this guard.
+	}
+	if t := compactionRecoveryTurn(c); t != nil && len(t.body) > 0 {
+		body = t.body
+	}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if !isOpenAICompactionType(item.Get("type").String()) {
+			continue
+		}
+		digest := openAIEncryptedContentDigest(item.Get("encrypted_content").String())
+		if _, found := invalid[digest]; found {
+			s.markOpenAIWSInvalidEncryptedContentLineage(groupID, "", []string{digest}, accountID)
+			return true
+		}
+	}
+	return false
 }
 
 // openAIEncryptedLineageItemType 限定 lineage 覆盖的项类型，与剥离端
@@ -338,29 +367,47 @@ func openAIEncryptedLineageAccountKey(sessionHash string, accountID int64) strin
 }
 
 func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineage(groupID int64, sessionHash string, digests []string, accountID int64) {
-	sessionHash = openAIEncryptedLineageAccountKey(sessionHash, accountID)
-	if s == nil || len(digests) == 0 || strings.TrimSpace(sessionHash) == "" {
+	if s == nil || len(digests) == 0 || accountID <= 0 {
 		return
 	}
 	stateStore := s.getOpenAIWSStateStore()
 	if stateStore == nil {
 		return
 	}
-	stateStore.MarkSessionInvalidEncryptedContent(groupID, sessionHash, digests, s.openAIWSSessionStickyTTL())
+	if sessionKey := openAIEncryptedLineageAccountKey(sessionHash, accountID); sessionKey != "" {
+		stateStore.MarkSessionInvalidEncryptedContent(groupID, sessionKey, digests, s.openAIWSSessionStickyTTL())
+	}
+	// The session hash includes the evolving request history. Keep an account
+	// scoped fingerprint as the authoritative negative cache so a later turn
+	// with appended input cannot send the same rejected cipher upstream again.
+	stateStore.MarkAccountInvalidEncryptedContent(groupID, accountID, digests, s.openAIWSSessionStickyTTL())
 }
 
-// sessionInvalidEncryptedContentDigests 返回会话已知失效密文摘要；全局无记录
-// 时（常态）零成本返回 nil。
+// sessionInvalidEncryptedContentDigests 返回会话和账号已知失效密文摘要；全局
+// 无记录时（常态）零成本返回 nil。
 func (s *OpenAIGatewayService) sessionInvalidEncryptedContentDigests(groupID int64, sessionHash string, accountID int64) map[string]struct{} {
-	sessionHash = openAIEncryptedLineageAccountKey(sessionHash, accountID)
-	if s == nil || strings.TrimSpace(sessionHash) == "" {
+	if s == nil || accountID <= 0 {
 		return nil
 	}
 	stateStore := s.getOpenAIWSStateStore()
 	if stateStore == nil || !stateStore.HasAnySessionInvalidEncryptedContent() {
 		return nil
 	}
-	return stateStore.GetSessionInvalidEncryptedContentDigests(groupID, sessionHash)
+	var result map[string]struct{}
+	if sessionKey := openAIEncryptedLineageAccountKey(sessionHash, accountID); sessionKey != "" {
+		result = stateStore.GetSessionInvalidEncryptedContentDigests(groupID, sessionKey)
+	}
+	accountDigests := stateStore.GetAccountInvalidEncryptedContentDigests(groupID, accountID)
+	if len(accountDigests) == 0 {
+		return result
+	}
+	if result == nil {
+		result = make(map[string]struct{}, len(accountDigests))
+	}
+	for digest := range accountDigests {
+		result[digest] = struct{}{}
+	}
+	return result
 }
 
 // Renew only when a request/replay actually uses a known invalid item, not on
@@ -433,7 +480,8 @@ func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 	if errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 		logOpenAIWSModeInfo("%s_revalidate account_id=%d turn=%d reason=preserve_compaction_context", logKey, accountID, turn)
 		// Let callers restore a verified undo record first. If none exists,
-		// they must preserve this window and let the upstream revalidate it.
+		// they must preserve this window and return a local terminal failure;
+		// sending the same known-bad cipher upstream again only creates a loop.
 		return payload, 0, stripErr
 	}
 	if stripErr != nil {

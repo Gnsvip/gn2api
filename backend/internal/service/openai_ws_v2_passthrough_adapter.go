@@ -773,6 +773,30 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 	}
 	firstClientMessage = s.beginPassthroughCompaction(c, recovery, firstClientMessage, initialRequestModel, account, firstStart)
 	resumeCompactionRecoveryTurn(c, previousRecovery)
+	// Check after verified restoration, but before opening/sending upstream.
+	// Subsequent creates use the same check after their admission hooks.
+	rejectInvalidCompaction := func(body []byte) error {
+		if !s.knownInvalidCompaction(c, account.ID, body) {
+			return nil
+		}
+		event, err := labelOpenAIWSStream(openAIRecompactionErrorEvent(errOpenAIEncryptedCompactionContext), gjson.GetBytes(body, "stream_id").String())
+		if err != nil {
+			return err
+		}
+		writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
+		defer cancel()
+		if err := clientConn.Write(writeCtx, coderws.MessageText, event); err != nil {
+			return err
+		}
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "encrypted compaction context unavailable", errOpenAIEncryptedCompactionContext)
+	}
+	if err := rejectInvalidCompaction(firstClientMessage); err != nil {
+		if hooks != nil && hooks.AfterTurn != nil {
+			hooks.AfterTurn(1, nil, err)
+		}
+		requesttiming.FinishRecorder(c, timingRecorder, http.StatusBadRequest)
+		return err
+	}
 	if s.shouldBridgeOpenAIWSPassthroughFirstMessage(account, firstClientMessage) {
 		return &openAIPassthroughRouteRestart{body: firstClientMessage, model: initialRequestModel, started: firstStart}
 	}
@@ -1183,6 +1207,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 					if err := hooks.BeforeTurn(turnNo); err != nil {
 						return payload, nil, err
 					}
+				}
+				if err := rejectInvalidCompaction(payload); err != nil {
+					return payload, nil, err
 				}
 				if hooks != nil && hooks.MapRequestModel != nil {
 					upstreamModel, err := hooks.MapRequestModel(turnNo, requestModelForThisFrame)

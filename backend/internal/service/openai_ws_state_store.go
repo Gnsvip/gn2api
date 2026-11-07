@@ -47,8 +47,9 @@ type openAIWSSessionConnBinding struct {
 	expiresAt time.Time
 }
 
-// openAIWSInvalidEncryptedBinding 记录一个会话中已被上游判定失效的
-// encrypted_content 摘要（invalid_encrypted_content lineage）。
+// openAIWSInvalidEncryptedBinding 记录已被上游判定失效的 encrypted_content
+// 摘要（invalid_encrypted_content lineage）。会话绑定用于热路径精确复用；
+// 账号绑定用于客户端改变会话哈希后仍阻断同一坏摘要。
 type openAIWSInvalidEncryptedBinding struct {
 	digests   map[string]struct{}
 	expiresAt time.Time
@@ -89,6 +90,10 @@ type OpenAIWSStateStore interface {
 	// 密文随客户端历史反复触发"整包被拒→剥离→重试/重连"。仅进程内有效。
 	MarkSessionInvalidEncryptedContent(groupID int64, sessionHash string, digests []string, ttl time.Duration)
 	GetSessionInvalidEncryptedContentDigests(groupID int64, sessionHash string) map[string]struct{}
+	// 账号+分组绑定不依赖客户端会话哈希；同一密文在后续新会话中仍视为
+	// 已知失效，但不会污染其他账号或分组。
+	MarkAccountInvalidEncryptedContent(groupID, accountID int64, digests []string, ttl time.Duration)
+	GetAccountInvalidEncryptedContentDigests(groupID, accountID int64) map[string]struct{}
 	// HasAnySessionInvalidEncryptedContent 是热路径快速探测：全局无记录时
 	// 调用方可跳过会话哈希计算与摘要匹配。
 	HasAnySessionInvalidEncryptedContent() bool
@@ -110,6 +115,7 @@ type defaultOpenAIWSStateStore struct {
 
 	sessionInvalidEncryptedMu sync.RWMutex
 	sessionInvalidEncrypted   map[string]openAIWSInvalidEncryptedBinding
+	accountInvalidEncrypted   map[string]openAIWSInvalidEncryptedBinding
 
 	lastCleanupUnixNano atomic.Int64
 }
@@ -124,6 +130,7 @@ func NewOpenAIWSStateStore(cache GatewayCache) OpenAIWSStateStore {
 		sessionToTurnState:      make(map[string]openAIWSTurnStateBinding, 256),
 		sessionToConn:           make(map[string]openAIWSSessionConnBinding, 256),
 		sessionInvalidEncrypted: make(map[string]openAIWSInvalidEncryptedBinding),
+		accountInvalidEncrypted: make(map[string]openAIWSInvalidEncryptedBinding),
 	}
 	store.lastCleanupUnixNano.Store(time.Now().UnixNano())
 	return store
@@ -431,28 +438,35 @@ func (s *defaultOpenAIWSStateStore) DeleteSessionConn(groupID int64, sessionHash
 	s.sessionToConnMu.Unlock()
 }
 
-func (s *defaultOpenAIWSStateStore) MarkSessionInvalidEncryptedContent(groupID int64, sessionHash string, digests []string, ttl time.Duration) {
-	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
-	if key == "" || len(digests) == 0 {
-		return
+func openAIWSAccountInvalidEncryptedKey(groupID, accountID int64) string {
+	if accountID <= 0 {
+		return ""
 	}
-	ttl = normalizeOpenAIWSTTL(ttl)
-	s.maybeCleanup()
+	return fmt.Sprintf("%d:%d", groupID, accountID)
+}
 
+func markInvalidEncryptedBinding(
+	bindings map[string]openAIWSInvalidEncryptedBinding,
+	key string,
+	digests []string,
+	ttl time.Duration,
+	capacity int,
+) int {
+	if key == "" || len(digests) == 0 {
+		return 0
+	}
 	now := time.Now()
-	overflowed := 0
-	s.sessionInvalidEncryptedMu.Lock()
-	ensureBindingCapacity(s.sessionInvalidEncrypted, key, openAIWSStateStoreMaxEntriesPerMap)
-	binding, ok := s.sessionInvalidEncrypted[key]
+	binding, ok := bindings[key]
 	if !ok || now.After(binding.expiresAt) || binding.digests == nil {
 		binding = openAIWSInvalidEncryptedBinding{digests: make(map[string]struct{}, len(digests))}
 	}
+	overflowed := 0
 	for _, digest := range digests {
 		digest = strings.TrimSpace(digest)
 		if digest == "" {
 			continue
 		}
-		if len(binding.digests) >= openAIWSInvalidEncryptedDigestsPerSession {
+		if len(binding.digests) >= capacity {
 			if _, exists := binding.digests[digest]; !exists {
 				overflowed++
 			}
@@ -461,13 +475,50 @@ func (s *defaultOpenAIWSStateStore) MarkSessionInvalidEncryptedContent(groupID i
 		binding.digests[digest] = struct{}{}
 	}
 	binding.expiresAt = now.Add(ttl)
-	s.sessionInvalidEncrypted[key] = binding
+	bindings[key] = binding
+	return overflowed
+}
+
+func (s *defaultOpenAIWSStateStore) MarkSessionInvalidEncryptedContent(groupID int64, sessionHash string, digests []string, ttl time.Duration) {
+	key := openAIWSSessionTurnStateKey(groupID, sessionHash)
+	if key == "" || len(digests) == 0 {
+		return
+	}
+	ttl = normalizeOpenAIWSTTL(ttl)
+	s.maybeCleanup()
+
+	s.sessionInvalidEncryptedMu.Lock()
+	ensureBindingCapacity(s.sessionInvalidEncrypted, key, openAIWSStateStoreMaxEntriesPerMap)
+	overflowed := markInvalidEncryptedBinding(s.sessionInvalidEncrypted, key, digests, ttl, openAIWSInvalidEncryptedDigestsPerSession)
 	s.sessionInvalidEncryptedMu.Unlock()
 
 	// HasAny/Get 在每个 OpenAI 请求热路径上抢同一把锁，日志 IO 必须在锁外。
 	if overflowed > 0 {
 		logOpenAIWSModeInfo(
 			"invalid_encrypted_lineage_capacity_overflow dropped_digests=%d capacity=%d",
+			overflowed,
+			openAIWSInvalidEncryptedDigestsPerSession,
+		)
+	}
+}
+
+func (s *defaultOpenAIWSStateStore) MarkAccountInvalidEncryptedContent(groupID, accountID int64, digests []string, ttl time.Duration) {
+	key := openAIWSAccountInvalidEncryptedKey(groupID, accountID)
+	if key == "" || len(digests) == 0 {
+		return
+	}
+	ttl = normalizeOpenAIWSTTL(ttl)
+	s.maybeCleanup()
+
+	s.sessionInvalidEncryptedMu.Lock()
+	ensureBindingCapacity(s.accountInvalidEncrypted, key, openAIWSStateStoreMaxEntriesPerMap)
+	overflowed := markInvalidEncryptedBinding(s.accountInvalidEncrypted, key, digests, ttl, openAIWSInvalidEncryptedDigestsPerSession)
+	s.sessionInvalidEncryptedMu.Unlock()
+	if overflowed > 0 {
+		logOpenAIWSModeInfo(
+			"invalid_encrypted_account_lineage_capacity_overflow account_id=%d group_id=%d dropped_digests=%d capacity=%d",
+			accountID,
+			groupID,
 			overflowed,
 			openAIWSInvalidEncryptedDigestsPerSession,
 		)
@@ -495,10 +546,31 @@ func (s *defaultOpenAIWSStateStore) GetSessionInvalidEncryptedContentDigests(gro
 	return digests
 }
 
+func (s *defaultOpenAIWSStateStore) GetAccountInvalidEncryptedContentDigests(groupID, accountID int64) map[string]struct{} {
+	key := openAIWSAccountInvalidEncryptedKey(groupID, accountID)
+	if key == "" {
+		return nil
+	}
+	s.maybeCleanup()
+
+	now := time.Now()
+	s.sessionInvalidEncryptedMu.RLock()
+	defer s.sessionInvalidEncryptedMu.RUnlock()
+	binding, ok := s.accountInvalidEncrypted[key]
+	if !ok || now.After(binding.expiresAt) || len(binding.digests) == 0 {
+		return nil
+	}
+	digests := make(map[string]struct{}, len(binding.digests))
+	for digest := range binding.digests {
+		digests[digest] = struct{}{}
+	}
+	return digests
+}
+
 func (s *defaultOpenAIWSStateStore) HasAnySessionInvalidEncryptedContent() bool {
 	s.sessionInvalidEncryptedMu.RLock()
 	defer s.sessionInvalidEncryptedMu.RUnlock()
-	return len(s.sessionInvalidEncrypted) > 0
+	return len(s.sessionInvalidEncrypted) > 0 || len(s.accountInvalidEncrypted) > 0
 }
 
 func (s *defaultOpenAIWSStateStore) maybeCleanup() {
@@ -537,6 +609,7 @@ func (s *defaultOpenAIWSStateStore) maybeCleanup() {
 
 	s.sessionInvalidEncryptedMu.Lock()
 	cleanupExpiredInvalidEncryptedBindings(s.sessionInvalidEncrypted, now, openAIWSStateStoreCleanupMaxPerMap)
+	cleanupExpiredInvalidEncryptedBindings(s.accountInvalidEncrypted, now, openAIWSStateStoreCleanupMaxPerMap)
 	s.sessionInvalidEncryptedMu.Unlock()
 }
 

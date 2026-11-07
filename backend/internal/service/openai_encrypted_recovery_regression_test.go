@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,6 +112,10 @@ func TestInvalidEncryptedLineageRenewsOnlyWhenUsed(t *testing.T) {
 	binding = store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)]
 	binding.expiresAt = time.Now().Add(-time.Second)
 	store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)] = binding
+	accountKey := openAIWSAccountInvalidEncryptedKey(1, 1)
+	accountBinding := store.accountInvalidEncrypted[accountKey]
+	accountBinding.expiresAt = time.Now().Add(-time.Second)
+	store.accountInvalidEncrypted[accountKey] = accountBinding
 	store.sessionInvalidEncryptedMu.Unlock()
 	store.lastCleanupUnixNano.Store(0)
 	require.Empty(t, svc.sessionInvalidEncryptedContentDigests(1, "session", 1))
@@ -222,7 +228,10 @@ func TestForwardEncryptedCompactionFailsWithoutDestructiveRetry(t *testing.T) {
 			}
 			body := []byte(`{"model":"gpt-6-astra","stream":false,"include":["reasoning.encrypted_content"],"input":[{"type":"reasoning","encrypted_content":"reasoning"},{"type":"compaction","encrypted_content":"stale"},{"role":"user","content":"continue"}]}`)
 			for turn := range 2 {
-				c, rec := httpBridgeContext("compaction-recovery")
+				// The client appends history between retries, so the derived
+				// session hash changes. The account-scoped fingerprint must still
+				// stop the second request before it reaches the upstream.
+				c, rec := httpBridgeContext(fmt.Sprintf("compaction-recovery-%d", turn))
 				result, err := svc.Forward(context.Background(), c, account, body)
 				require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext, "turn %d", turn)
 				require.Nil(t, result)
@@ -234,11 +243,11 @@ func TestForwardEncryptedCompactionFailsWithoutDestructiveRetry(t *testing.T) {
 			}
 			var sent []byte
 			if transport == "http" {
-				require.Equal(t, 2, upstream.callCount, "each request revalidates with its original transport")
+				require.Equal(t, 1, upstream.callCount, "a repeated known-invalid summary must fail locally without another upstream request")
 				sent = upstream.bodies[0]
 			} else {
 				require.Zero(t, upstream.callCount, "a cipher error must not change WS to HTTP")
-				require.Len(t, requests, 2, "each request revalidates over WS without a local permanent rejection")
+				require.Len(t, requests, 1, "a repeated known-invalid summary must fail locally without another WS request")
 				sent = <-requests
 			}
 			require.Equal(t, "stale", gjson.GetBytes(sent, `input.#(type=="compaction").encrypted_content`).String())
@@ -305,12 +314,23 @@ func TestWSIngressKnownInvalidCompactionAndReplacementHistory(t *testing.T) {
 				}
 				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-6-astra","input":`+input+`}`)))
 				_, message, readErr := client.Read(ctx)
-				require.NoError(t, readErr, "an old rejection must not block upstream revalidation")
-				require.Equal(t, "response.completed", gjson.GetBytes(message, "type").String())
+				require.NoError(t, readErr, "known-invalid compaction must return a terminal client event")
+				if rejected {
+					require.Equal(t, "response.failed", gjson.GetBytes(message, "type").String())
+					require.Equal(t, openAIWSFallbackReasonInvalidEncryptedContent, gjson.GetBytes(message, "response.error.code").String())
+				} else {
+					require.Equal(t, "response.completed", gjson.GetBytes(message, "type").String())
+				}
 				_ = client.Close(coderws.StatusNormalClosure, "done")
 				select {
 				case err := <-errCh:
-					require.NoError(t, err)
+					if rejected {
+						var closeErr *OpenAIWSClientCloseError
+						require.ErrorAs(t, err, &closeErr)
+						require.Equal(t, coderws.StatusPolicyViolation, closeErr.StatusCode())
+					} else {
+						require.NoError(t, err)
+					}
 				case <-ctx.Done():
 					t.Fatal("gateway did not finish")
 				}
@@ -318,11 +338,149 @@ func TestWSIngressKnownInvalidCompactionAndReplacementHistory(t *testing.T) {
 				writes := len(capture.writes)
 				capture.mu.Unlock()
 				if bridge {
-					require.NotNil(t, upstream.lastReq)
+					if rejected {
+						require.Nil(t, upstream.lastReq, "known-invalid compaction must not reach bridge HTTP upstream")
+					} else {
+						require.NotNil(t, upstream.lastReq)
+					}
 				} else {
-					require.Equal(t, 1, writes)
+					if rejected {
+						require.Zero(t, writes, "known-invalid compaction must not reach WS upstream")
+					} else {
+						require.Equal(t, 1, writes)
+					}
 				}
 			})
 		}
+	}
+}
+
+// The first rejection is a streamed terminal, not an HTTP 400. Both ordinary
+// and passthrough entrypoints must remember it even when there is no undo copy.
+func TestCompactionStreamingFailureIsRemembered(t *testing.T) {
+	for _, scenario := range []string{"http", "http_passthrough", "http_to_ws", "ws", "ws_passthrough", "ws_to_http", "ws_same_connection", "ws_passthrough_same_connection", "ws_to_http_same_connection"} {
+		t.Run(scenario, func(t *testing.T) {
+			path := strings.TrimSuffix(scenario, "_same_connection")
+			sameConnection := scenario != path
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				created := []byte(`{"type":"response.created","response":{"id":"resp_rejected","status":"in_progress"}}`)
+				if websocket.IsWebSocketUpgrade(r) {
+					conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					for {
+						if _, _, err := conn.ReadMessage(); err != nil {
+							return
+						}
+						calls.Add(1)
+						if conn.WriteMessage(websocket.TextMessage, created) != nil {
+							return
+						}
+						if conn.WriteMessage(websocket.TextMessage, []byte(recoveryCipherError)) != nil {
+							return
+						}
+					}
+				}
+				calls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\ndata: %s\n\n", created, recoveryCipherError)
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			base, _ := url.Parse(upstream.URL)
+			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+			if path != "http_to_ws" {
+				account.Type = AccountTypeAPIKey
+				account.Credentials = map[string]any{"api_key": "sk-test"}
+			}
+			account.Status, account.Schedulable = StatusActive, true
+			svc.cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+			if path == "http_passthrough" {
+				account.Extra = map[string]any{"openai_passthrough": true}
+			}
+			native := strings.HasPrefix(path, "ws")
+			if native {
+				svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+				mode := OpenAIWSIngressModeCtxPool
+				if path == "ws_to_http" {
+					mode = OpenAIWSIngressModeHTTPBridge
+				}
+				if path == "ws_passthrough" {
+					mode = OpenAIWSIngressModePassthrough
+					svc.openaiWSPassthroughDialer = &httpBridgeLocalDialer{url: "ws" + strings.TrimPrefix(upstream.URL, "http")}
+				}
+				account.Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": mode}
+			}
+			body := compactionTestBody(recoverySummary+","+recoveryUser, true)
+			if !native {
+				for turn := range 2 {
+					c, rec := httpBridgeContext(fmt.Sprintf("stream-rejection-%d", turn))
+					_, err := svc.Forward(c.Request.Context(), c, account, body)
+					require.Contains(t, rec.Body.String(), "invalid_encrypted_content")
+					if turn == 1 {
+						require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext)
+						require.Equal(t, http.StatusBadRequest, rec.Code)
+						require.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
+					}
+				}
+			} else {
+				errs := make(chan error, 2)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := coderws.Accept(w, r, nil)
+					if err != nil {
+						errs <- err
+						return
+					}
+					defer conn.CloseNow()
+					_, first, err := conn.Read(r.Context())
+					if err != nil {
+						errs <- err
+						return
+					}
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = r
+					c.Set("api_key", &APIKey{ID: 123})
+					errs <- svc.ProxyResponsesWebSocketFromClient(r.Context(), c, conn, account, "sk-test", first, nil)
+				}))
+				defer server.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				var conn *coderws.Conn
+				for turn := range 2 {
+					if conn == nil || !sameConnection {
+						var err error
+						conn, _, err = coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{HTTPHeader: http.Header{"Session-Id": {fmt.Sprintf("stream-rejection-%d", turn)}}})
+						require.NoError(t, err)
+						defer conn.CloseNow()
+					}
+					frame := append([]byte(`{"type":"response.create",`), body[1:]...)
+					require.NoError(t, conn.Write(ctx, coderws.MessageText, frame))
+					for {
+						_, event, err := conn.Read(ctx)
+						require.NoError(t, err)
+						if gjson.GetBytes(event, "type").String() == "response.failed" {
+							require.Equal(t, "invalid_encrypted_content", gjson.GetBytes(event, "response.error.code").String())
+							break
+						}
+					}
+					if sameConnection && turn == 0 {
+						continue
+					}
+					_ = conn.Close(coderws.StatusNormalClosure, "done")
+					select {
+					case err := <-errs:
+						if turn == 1 {
+							require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext)
+						}
+					case <-ctx.Done():
+						t.Fatal("gateway did not finish")
+					}
+				}
+			}
+			require.Equal(t, int32(1), calls.Load(), "a streamed rejection must block repeated bad summaries across client sessions")
+		})
 	}
 }

@@ -42,6 +42,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 }
 
 func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	// This guard must precede HTTP passthrough routing too. beginCompactionRecoveryTurn
+	// has already tried the verified undo/replacement before we reject the cipher.
+	if account != nil && s.knownInvalidCompaction(c, account.ID, body) {
+		if retry := s.retryCompactionHistory(c); retry != nil {
+			return nil, retry
+		}
+		return nil, writeOpenAIEncryptedCompactionError(c)
+	}
 	ctx = requesttiming.Context(c, ctx)
 	clearOpenAIWSLatency(c)
 	officialCodexClient := c != nil && openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
@@ -895,9 +903,12 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 				if retry := s.retryCompactionHistory(c); retry != nil {
 					return nil, retry
 				}
-				// No verified undo is available. An old negative cache must not
-				// permanently reject this window locally; keep every item and let
-				// the same account validate it on the selected transport.
+				if errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+					// The account-scoped negative cache means this exact cipher has
+					// already failed upstream. Do not send it again or fail over.
+					return nil, writeOpenAIEncryptedCompactionError(c)
+				}
+				return nil, stripErr
 			}
 			if strippedCount > 0 {
 				body = strippedBody

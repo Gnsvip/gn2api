@@ -4617,11 +4617,18 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_InvalidEncrypted
 		events: [][]byte{
 			[]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"The encrypted content could not be verified"}}`),
 			[]byte(`{"type":"response.failed","response":{"id":"resp_enc_lineage_1","model":"gpt-5.1","error":{"code":"invalid_encrypted_content","message":"The encrypted content could not be verified"}}}`),
+		},
+	}
+	// A rejected create has no reusable response lifecycle. The ingress retires
+	// that upstream socket before accepting the next client turn, so the next
+	// turn must acquire a fresh connection instead of consuming a stale event.
+	upstreamConn2 := &openAIWSCaptureConn{
+		events: [][]byte{
 			[]byte(`{"type":"response.completed","response":{"id":"resp_enc_lineage_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
 	dialer := &openAIWSQueueDialer{
-		conns: []openAIWSClientConn{upstreamConn},
+		conns: []openAIWSClientConn{upstreamConn, upstreamConn2},
 	}
 	pool := newOpenAIWSConnPool(cfg)
 	pool.setClientDialerForTest(dialer)
@@ -4709,13 +4716,13 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_InvalidEncrypted
 		return message
 	}
 
-	// turn1：携带失效密文，上游以 invalid_encrypted_content 拒绝（error + response.failed 透传给客户端）。
+	// turn1：携带失效密文，上游以 invalid_encrypted_content 拒绝。这个
+	// rejected create 没有可复用的 response 生命周期，网关透传终止 error
+	// 并退役当前上游 WS；下一轮会建立新连接。
 	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"stale-cipher","summary":[]},{"type":"input_text","text":"hi"}]}`)
 	firstEvent := readMessage()
 	require.Equal(t, "error", gjson.GetBytes(firstEvent, "type").String())
 	require.Equal(t, "invalid_encrypted_content", gjson.GetBytes(firstEvent, "error.code").String())
-	secondEvent := readMessage()
-	require.Equal(t, "response.failed", gjson.GetBytes(secondEvent, "type").String())
 
 	// turn2：客户端历史仍带同一失效密文，进场应被 lineage 预剥离后再发上游。
 	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"input":[{"type":"reasoning","id":"rs_1","encrypted_content":"stale-cipher","summary":[]},{"type":"input_text","text":"hi"},{"type":"input_text","text":"again"}]}`)
@@ -4734,6 +4741,9 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_InvalidEncrypted
 	upstreamConn.mu.Lock()
 	writes := append([]map[string]any(nil), upstreamConn.writes...)
 	upstreamConn.mu.Unlock()
+	upstreamConn2.mu.Lock()
+	writes = append(writes, upstreamConn2.writes...)
+	upstreamConn2.mu.Unlock()
 	require.Len(t, writes, 2, "两轮各应发送一次上游请求")
 
 	firstUpstream := requestToJSONString(writes[0])

@@ -757,6 +757,7 @@ func (s *OpenAIGatewayService) CloseOpenAIWSPool() {
 	if s.openaiWSPool != nil {
 		s.openaiWSPool.Close()
 	}
+	s.openaiCompactionRecovery.closePersistence()
 }
 
 func (s *OpenAIGatewayService) InvalidateAgentIdentityWSConnections(accountID int64) {

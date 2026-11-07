@@ -33,9 +33,9 @@ func TestEncryptedLineageAccountIsolation(t *testing.T) {
 	digest := openAIEncryptedContentDigest("summary-accepted-only-by-original-account")
 	s.markOpenAIWSInvalidEncryptedContentLineage(1, "same-client-session", []string{digest}, 22)
 	require.Contains(t, s.sessionInvalidEncryptedContentDigests(1, "same-client-session", 22), digest)
+	require.Contains(t, s.sessionInvalidEncryptedContentDigests(1, "new-client-session", 22), digest, "account-scoped rejection must survive a changing request hash")
 	require.Empty(t, s.sessionInvalidEncryptedContentDigests(1, "same-client-session", 21), "a rejected destination must not poison the original account")
 	require.Empty(t, s.sessionInvalidEncryptedContentDigests(2, "same-client-session", 22))
-	require.Empty(t, s.sessionInvalidEncryptedContentDigests(1, "other-session", 22))
 	require.Empty(t, s.sessionInvalidEncryptedContentDigests(1, "same-client-session", 0))
 	// Old session-wide records do not prove which account rejected the cipher.
 	s.getOpenAIWSStateStore().MarkSessionInvalidEncryptedContent(1, "same-client-session", []string{digest}, time.Hour)

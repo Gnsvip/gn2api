@@ -789,6 +789,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				c.Set(openAIWSIngressSessionHashContextKey, sessionHash)
 			}
 			toolOutputCoverage := AnalyzeToolCallOutputContextCoverageBytes(currentBridgePayload.payloadRaw)
+			if s.knownInvalidCompaction(c, account.ID, currentBridgePayload.payloadRaw) {
+				return finishRecoveryError(turn, errOpenAIEncryptedCompactionContext)
+			}
 			needsBridgeReplay := currentBridgePayload.previousResponseID != "" ||
 				(toolOutputCoverage.HasFunctionCallOutput && !toolOutputCoverage.ContextCoversAllCallIDs)
 			// 剥离本会话已知失效的加密项，阻断同一失效密文随历史反复触发上游拒绝。
@@ -808,6 +811,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
 					}
+					return finishRecoveryError(turn, stripErr)
 				}
 				if strippedCount > 0 {
 					currentBridgePayload.payloadRaw = strippedPayload
@@ -826,6 +830,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 							return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
 						}
+						return finishRecoveryError(turn, stripErr)
 					}
 				}
 				if needsBridgeReplay && bridgeAccountFailoverInputExists {
@@ -841,6 +846,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 							return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
 						}
+						return finishRecoveryError(turn, stripErr)
 					}
 				}
 			}
@@ -1805,6 +1811,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		skipBeforeTurn = false
+		if s.knownInvalidCompaction(c, account.ID, currentPayload) {
+			return finishRecoveryError(turn, errOpenAIEncryptedCompactionContext)
+		}
 		// 剥离本会话已知失效的加密项，阻断同一失效密文随历史反复触发上游拒绝。
 		// 历史序列须同步剥离，否则与已剥离的当前 input 项错位，prefix 复用失配。
 		if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash, account.ID); len(invalidDigests) > 0 {
@@ -1821,6 +1830,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
 				}
+				return finishRecoveryError(turn, stripErr)
 			}
 			if strippedCount > 0 {
 				currentPayload = strippedPayload
@@ -1912,6 +1922,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
 					}
+					return finishRecoveryError(turn, stripErr)
 				}
 			}
 		}

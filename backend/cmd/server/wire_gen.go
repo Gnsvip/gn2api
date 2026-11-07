@@ -365,6 +365,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	v := provideCleanup(openAIRequestTimezoneRefreshWorker, client, redisClient, opsMetricsCollector, opsAggregationService, opsAlertEvaluatorService, opsCleanupService, opsScheduledReportService, opsSystemLogSink, opsService, opsIngressRejectAggregator, apiKeyService, authCacheInvalidationWorker, schedulerSnapshotService, tokenRefreshService, accountExpiryService, cnProviderBalanceCheckService, openAICodexVersionSyncService, claudeCodeVersionSyncService, proxyExpiryService, subscriptionExpiryService, usageCleanupService, idempotencyCleanupService, geminiCachedContentService, batchImageCleanupService, batchImageWorkerRuntime, pricingService, emailQueueService, billingCacheService, usageRecordWorkerPool, balanceNotifyService, digestSessionStore, subscriptionService, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, grokOAuthService, openAIGatewayService, scheduledTestRunnerService, backupService, paymentOrderExpiryService, channelMonitorRunner, channelMonitorV2Aggregator, userPlatformQuotaUsageFlusher, upstreamBillingProbeService, ollamaCloudUsageService, openCodeGoUsageService, auditLogService, openAIQuotaAutoResetService, promptService, pluginManager)
 	application := &Application{
 		Server:        httpServer,
+		OpenAIGateway: openAIGatewayService,
 		PromptAudit:   promptService,
 		PluginManager: pluginManager,
 		Cleanup:       v,
@@ -376,6 +377,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 
 type Application struct {
 	Server        *http.Server
+	OpenAIGateway *service.OpenAIGatewayService
 	PromptAudit   *securityaudit.PromptService
 	PluginManager *service.PluginManager
 	Cleanup       func()

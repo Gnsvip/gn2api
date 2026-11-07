@@ -28,7 +28,8 @@ const (
 )
 
 // Only explicit, successfully completed compactions are retained. This is a
-// bounded in-memory undo record, not a conversation log or a model summary.
+// bounded undo record, not a conversation log or a model summary. Production
+// also keeps encrypted, expiring snapshots across graceful process restarts.
 // Input uses the client's canonical names, before account-specific transforms.
 type openAICompactionRecoveryEntry struct {
 	scope, key      string
@@ -52,6 +53,8 @@ type openAICompactionRecoveryStore struct {
 	entries map[string]*openAICompactionRecoveryEntry
 	lru     list.List
 	bytes   int
+	disk    *openAICompactionRecoveryDisk
+	closed  bool
 }
 
 func (s *OpenAIGatewayService) compactionRecoveryStore() *openAICompactionRecoveryStore {
@@ -68,12 +71,13 @@ func (s *openAICompactionRecoveryStore) remove(e *openAICompactionRecoveryEntry)
 	if e.timer != nil {
 		e.timer.Stop()
 	}
+	s.notifyPersistence()
 }
 
 func (s *openAICompactionRecoveryStore) expire(e *openAICompactionRecoveryEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.entries[e.key] != e {
+	if s.closed || s.entries[e.key] != e {
 		return
 	}
 	if wait := time.Until(e.expires); wait > 0 {
@@ -155,6 +159,9 @@ func (s *openAICompactionRecoveryStore) put(scope string, source, output []json.
 func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed || !time.Now().Before(e.expires) {
+		return false
+	}
 	if previous := s.entries[e.key]; previous != nil {
 		// A cipher must never acquire a different undo history via a race.
 		return false
@@ -175,7 +182,13 @@ func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry)
 		node = prev
 	}
 	size := len(e.input) + len(e.output)*sha256.Size
-	for len(s.entries) >= openAICompactionRecoveryMaxEntries || s.bytes+size > openAICompactionRecoveryMaxBytes {
+	maxBytes := openAICompactionRecoveryMaxBytes
+	if s.disk != nil {
+		// Leave room for encoding, authentication and one atomic replacement
+		// under the separate hard disk cap. No second plaintext history cache.
+		maxBytes = openAICompactionRecoveryDurableBytes
+	}
+	for len(s.entries) >= openAICompactionRecoveryMaxEntries || s.bytes+size > maxBytes {
 		if s.lru.Back() == nil {
 			return false
 		}
@@ -184,7 +197,8 @@ func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry)
 	e.element = s.lru.PushFront(e)
 	s.entries[e.key] = e
 	s.bytes += size
-	e.timer = time.AfterFunc(openAICompactionRecoveryTTL, func() { s.expire(e) })
+	e.timer = time.AfterFunc(time.Until(e.expires), func() { s.expire(e) })
+	s.notifyPersistence()
 	return true
 }
 
@@ -244,6 +258,7 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 			if s.entries[key] == e {
 				e.expires = time.Now().Add(openAICompactionRecoveryTTL)
 				s.lru.MoveToFront(e.element)
+				s.notifyPersistence()
 			}
 			s.mu.Unlock()
 			if !force && !invalid {
@@ -317,6 +332,7 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 			}
 			e.expires = time.Now().Add(openAICompactionRecoveryTTL)
 			s.lru.MoveToFront(e.element)
+			s.notifyPersistence()
 		}
 	}
 	s.mu.Unlock()
@@ -332,7 +348,16 @@ func (s *OpenAIGatewayService) noteCompactionStreamFailure(c *gin.Context, data 
 		return
 	}
 	t := compactionRecoveryTurn(c)
-	if t == nil || t.scope == "" || !isCompactionCipherError(data) {
+	if t == nil || !isCompactionCipherError(data) {
+		return
+	}
+	// Streaming failures may already be visible, so recovery belongs to the
+	// next explicit create. Remember the rejection even without an undo record.
+	if t.accountID > 0 && compactionRecoveryBodyHasSummary(t.body) {
+		s.markOpenAIWSInvalidEncryptedContentLineage(getOpenAIGroupIDFromContext(c), t.scope,
+			collectOpenAIEncryptedContentDigestsRaw(t.body), t.accountID)
+	}
+	if t.scope == "" {
 		return
 	}
 	store := s.compactionRecoveryStore()
@@ -348,12 +373,14 @@ func (s *OpenAIGatewayService) noteCompactionStreamFailure(c *gin.Context, data 
 		store.mu.Lock()
 		if entry := store.entries[key]; entry != nil {
 			entry.invalid = true
+			store.notifyPersistence()
 		}
 		store.mu.Unlock()
 	}
 }
 
 type openAICompactionRecoveryTurn struct {
+	accountID            int64
 	maintenanceModel     string // effective channel model for internal compaction
 	maintenanceReasoning []byte // effective outbound settings, separate from replay's client settings
 	scope                string
@@ -390,7 +417,10 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 	if s == nil || c == nil {
 		return body
 	}
-	t := &openAICompactionRecoveryTurn{}
+	t := &openAICompactionRecoveryTurn{body: body}
+	if len(accounts) > 0 && accounts[0] != nil {
+		t.accountID = accounts[0].ID
+	}
 	c.Set(openAICompactionRecoveryContextKey, t)
 	if len(body) > openAICompactionRecoveryMaxRaw {
 		return body
@@ -405,7 +435,7 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 	}
 	t.body = body
 	t.scope = fmt.Sprintf("%d:%s", getOpenAIGroupIDFromContext(c), scope)
-	if restored, ok := s.compactionRecoveryStore().restore(t.scope, body, false); ok {
+	if restored, ok := s.compactionRecoveryStore().restore(t.scope, body, s.knownInvalidCompaction(c, t.accountID, body)); ok {
 		t.body, body = restored, restored
 		t.restored = true
 		logOpenAIWSModeInfo("compaction_context_restored phase=ingress scope=%s bytes=%d", t.scope, len(body))

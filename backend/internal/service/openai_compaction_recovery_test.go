@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -22,6 +26,216 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// Restart recovery is a correctness/security boundary: keep these cases in the
+// existing suite to guard against lost history and cross-session restoration.
+func TestCompactionRecoveryProductionStartup(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	svc.cfg.JWT.Secret = "production-startup-test-secret"
+	svc.StartCompactionRecoveryPersistence()
+	t.Cleanup(svc.CloseOpenAIWSPool)
+	require.NotNil(t, svc.compactionRecoveryStore().disk)
+	require.DirExists(t, filepath.Join(dir, "compaction-recovery"))
+}
+
+func TestCompactionRecoveryPersistence(t *testing.T) {
+	newStore := func(t *testing.T, dir, key string) *openAICompactionRecoveryStore {
+		t.Helper()
+		store := (&OpenAIGatewayService{}).compactionRecoveryStore()
+		require.NoError(t, store.startPersistence(dir, key))
+		t.Cleanup(store.closePersistence)
+		return store
+	}
+	source := recoveryItems(t, recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained)
+	output := recoveryItems(t, recoverySummary+","+recoveryRetained)
+	body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
+	body, _ = sjson.SetBytes(body, "previous_response_id", "resp_expired")
+	for _, scenario := range []string{"restart", "rejected_before_restart", "corrupt", "wrong_key", "expired", "edited_window", "other_scope", "replacement"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			store := newStore(t, dir, "test-secret")
+			require.True(t, store.put("scope", source, output))
+			if scenario == "rejected_before_restart" {
+				store.mu.Lock()
+				store.entries["scope:"+openAIEncryptedContentDigest("recovery-test-cipher")].invalid = true
+				store.notifyPersistence()
+				store.mu.Unlock()
+			}
+			if scenario == "expired" {
+				store.mu.Lock()
+				for _, e := range store.entries {
+					e.expires = time.Now().Add(300 * time.Millisecond)
+				}
+				store.mu.Unlock()
+			}
+			if scenario == "replacement" {
+				fresh := recoveryItems(t, strings.ReplaceAll(recoverySummary, "recovery-test-cipher", "fresh-cipher"))
+				require.True(t, store.putReplacement("scope", 42, body, source, fresh))
+			}
+			store.closePersistence() // Graceful restart drains asynchronous writes.
+			files, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			for _, f := range files {
+				require.NotContains(t, f.Name(), ".tmp")
+				data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+				require.NoError(t, err)
+				require.NotContains(t, string(data), "7391")
+				require.NotContains(t, string(data), "recovery-test-cipher")
+				if scenario == "corrupt" {
+					data[len(data)-1] ^= 1
+					require.NoError(t, os.WriteFile(filepath.Join(dir, f.Name()), data, 0600))
+				}
+			}
+			key := "test-secret"
+			if scenario == "wrong_key" {
+				key = "different-secret"
+			}
+			if scenario == "expired" {
+				time.Sleep(350 * time.Millisecond)
+			}
+			loaded := newStore(t, dir, key)
+			if scenario == "expired" || scenario == "corrupt" || scenario == "wrong_key" {
+				require.Empty(t, loaded.entries)
+				files, err = os.ReadDir(dir)
+				require.NoError(t, err)
+				require.Empty(t, files)
+				return
+			}
+			nextBody, scope := body, "scope"
+			if scenario == "edited_window" {
+				nextBody = []byte(strings.ReplaceAll(string(body), "retained-tail", "edited-tail"))
+			}
+			if scenario == "other_scope" {
+				scope = "other-key-thread-group"
+			}
+			next, ok := loaded.restore(scope, nextBody, scenario != "rejected_before_restart")
+			if scenario == "edited_window" || scenario == "other_scope" {
+				require.False(t, ok)
+				require.Equal(t, nextBody, next)
+				return
+			}
+			require.True(t, ok)
+			require.False(t, gjson.GetBytes(next, "previous_response_id").Exists())
+			require.Contains(t, string(next), "7391")
+			require.Contains(t, string(next), "data:image/png;base64,AAA=")
+			require.JSONEq(t, "["+recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained+","+recoveryUser+"]", gjson.GetBytes(next, "input").Raw)
+			require.Equal(t, "xhigh", gjson.GetBytes(next, "reasoning.effort").String())
+			if scenario == "replacement" {
+				replaced, ok := loaded.replace("scope", 42, next)
+				require.True(t, ok)
+				require.Contains(t, string(replaced), "fresh-cipher")
+				_, ok = loaded.replace("scope", 43, next)
+				require.False(t, ok, "replacement cipher belongs to its producing account")
+			}
+		})
+	}
+}
+
+func TestCompactionRecoveryPersistencePrunesOnlyOwnedFiles(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("untouched"), 0600))
+	stale := compactionDiskName("old") + ".tmp"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, stale), []byte("partial"), 0600))
+	store := (&OpenAIGatewayService{}).compactionRecoveryStore()
+	require.NoError(t, store.startPersistence(dir, "test-secret"))
+	t.Cleanup(store.closePersistence)
+	source := recoveryItems(t, recoveryImage)
+	for i := range openAICompactionRecoveryPerScope + 2 {
+		require.True(t, store.put("scope", source, recoveryItems(t, strings.ReplaceAll(recoverySummary, "recovery-test-cipher", fmt.Sprint(i)))))
+	}
+	store.closePersistence()
+	files, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, files, openAICompactionRecoveryPerScope+1)
+	_, err = os.Stat(filepath.Join(dir, stale))
+	require.True(t, os.IsNotExist(err))
+	keep, err := os.ReadFile(filepath.Join(dir, "keep.txt"))
+	require.NoError(t, err)
+	require.Equal(t, "untouched", string(keep))
+}
+
+func TestCompactionRecoveryPersistenceProcessRestart(t *testing.T) {
+	if dir := os.Getenv("GN2API_RECOVERY_TEST_DIR"); dir != "" {
+		store := (&OpenAIGatewayService{}).compactionRecoveryStore()
+		require.NoError(t, store.startPersistence(dir, "process-test-secret"))
+		defer store.closePersistence()
+		if os.Getenv("GN2API_RECOVERY_TEST_PHASE") == "write" {
+			require.True(t, store.put("scope", recoveryItems(t, recoveryImage+","+recoveryRetained), recoveryItems(t, recoverySummary+","+recoveryRetained)))
+			return
+		}
+		body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
+		next, ok := store.restore("scope", body, true)
+		require.True(t, ok)
+		require.JSONEq(t, "["+recoveryImage+","+recoveryRetained+","+recoveryUser+"]", gjson.GetBytes(next, "input").Raw)
+		return
+	}
+	dir := t.TempDir()
+	for _, phase := range []string{"write", "read"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCompactionRecoveryPersistenceProcessRestart$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "GN2API_RECOVERY_TEST_DIR="+dir, "GN2API_RECOVERY_TEST_PHASE="+phase)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		require.NoError(t, err, "%s: %s", phase, out)
+	}
+}
+
+func TestCompactionRecoveryPersistenceConcurrentExpiry(t *testing.T) {
+	dir := t.TempDir()
+	store := (&OpenAIGatewayService{}).compactionRecoveryStore()
+	require.NoError(t, store.startPersistence(dir, "test-secret"))
+	t.Cleanup(store.closePersistence)
+	source, output := recoveryItems(t, recoveryImage), recoveryItems(t, recoverySummary)
+	body := compactionTestBody(recoverySummary+","+recoveryUser, true)
+	var wg sync.WaitGroup
+	failures := make(chan string, 32)
+	for i := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			scope := fmt.Sprint(i)
+			if !store.put(scope, source, output) {
+				failures <- "put"
+				return
+			}
+			for range 5 {
+				if _, ok := store.restore(scope, body, true); !ok {
+					failures <- "restore"
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+	store.closePersistence()
+	loaded := (&OpenAIGatewayService{}).compactionRecoveryStore()
+	require.NoError(t, loaded.startPersistence(dir, "test-secret"))
+	t.Cleanup(loaded.closePersistence)
+	require.Len(t, loaded.entries, 32)
+	loaded.mu.Lock()
+	var expired *openAICompactionRecoveryEntry
+	for _, e := range loaded.entries {
+		expired = e
+		break
+	}
+	expired.expires = time.Now().Add(-time.Second)
+	loaded.mu.Unlock()
+	loaded.expire(expired)
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dir, compactionDiskName(expired.key)))
+		return os.IsNotExist(err)
+	}, 3*time.Second, 10*time.Millisecond, "idle expiry must also remove the disk snapshot")
+	loaded.closePersistence()
+	files, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, files, 31)
+}
 
 const recoveryImage = `{"type":"message","role":"user","content":[{"type":"input_text","text":"The secret before compression is 7391."},{"type":"input_image","image_url":"data:image/png;base64,AAA="}]}`
 const recoveryRetained = `{"type":"message","role":"user","content":[{"type":"input_text","text":"retained-tail"}]}`
@@ -661,8 +875,8 @@ func runCompactionRecoveryNativeClientFailures(t *testing.T, svc *OpenAIGatewayS
 }
 
 func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
-	for _, bridge := range []bool{false, true} {
-		t.Run(fmt.Sprint(bridge), func(t *testing.T) {
+	for _, scenario := range []string{"ws", "http_bridge", "ws_restart", "http_bridge_restart", "passthrough_restart"} {
+		t.Run(scenario, func(t *testing.T) {
 			requests := make(chan []byte, 4)
 			events := [][]byte{[]byte(`{"type":"response.created","response":{"id":"resp_ok","status":"in_progress"}}`), autoContinuationEvent("resp_ok", autoContinuationAnswer)}
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -693,6 +907,11 @@ func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
 			defer upstream.Close()
 			svc, account, _ := httpBridgeFixture(t, upstream.URL)
 			closeRecoveryStore(t, svc.compactionRecoveryStore())
+			restart := strings.HasSuffix(scenario, "_restart")
+			dir := t.TempDir()
+			if restart {
+				require.NoError(t, svc.compactionRecoveryStore().startPersistence(dir, "test-secret"))
+			}
 			base, _ := url.Parse(upstream.URL)
 			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
 			svc.cfg.Gateway.OpenAIWS.APIKeyEnabled = true
@@ -701,16 +920,30 @@ func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
 			account.Status, account.Schedulable = StatusActive, true
 			account.Credentials = map[string]any{"api_key": "sk-test"}
 			mode := OpenAIWSIngressModeCtxPool
-			if bridge {
+			if strings.HasPrefix(scenario, "http_bridge") {
 				mode = OpenAIWSIngressModeHTTPBridge
+			}
+			if scenario == "passthrough_restart" {
+				mode = OpenAIWSIngressModePassthrough
+				svc.openaiWSPassthroughDialer = &httpBridgeLocalDialer{url: "ws" + strings.TrimPrefix(upstream.URL, "http")}
 			}
 			account.Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": mode}
 			c, _ := httpBridgeContext("recovery-e2e")
 			svc.beginCompactionRecoveryTurn(c, compactionTestBody(recoveryImage+","+recoveryTrigger, true), false)
 			svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 			body := compactionTestBody(recoverySummary+","+recoveryUser, true)
-			scope, _ := resolveOpenAIWSExecutionScope(c, body, 123)
-			svc.markOpenAIWSInvalidEncryptedContentLineage(0, scope, []string{openAIEncryptedContentDigest("recovery-test-cipher")}, account.ID)
+			if restart {
+				svc.beginCompactionRecoveryTurn(c, body, false)
+				svc.noteCompactionStreamFailure(c, []byte(recoveryCipherError))
+				svc.compactionRecoveryStore().closePersistence()
+				svc.openaiCompactionRecoveryOnce = sync.Once{}
+				svc.openaiCompactionRecovery = nil
+				require.NoError(t, svc.compactionRecoveryStore().startPersistence(dir, "test-secret"))
+				t.Cleanup(svc.compactionRecoveryStore().closePersistence)
+			} else {
+				scope, _ := resolveOpenAIWSExecutionScope(c, body, 123)
+				svc.markOpenAIWSInvalidEncryptedContentLineage(0, scope, []string{openAIEncryptedContentDigest("recovery-test-cipher")}, account.ID)
+			}
 			runCompactionRecoveryNativeClient(t, svc, account, [][]byte{body})
 			require.Len(t, requests, 1, "known-invalid summary should be restored before any upstream attempt")
 			sent := <-requests

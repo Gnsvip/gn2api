@@ -33,6 +33,7 @@ func (s *OpenAIGatewayService) retryCompactionError(c *gin.Context, data []byte)
 		return nil
 	}
 	if isCompactionCipherError(data) {
+		s.noteCompactionStreamFailure(c, data)
 		return s.retryCompactionHistory(c)
 	}
 	t := compactionRecoveryTurn(c)
@@ -74,6 +75,10 @@ func compactionRecoveryOutputDeadline(c *gin.Context, started time.Time, timeout
 func openAIRecompactionErrorEvent(cause error) []byte {
 	// Do not expose an upstream body (or restored history) in the client error.
 	code, message := "context_recovery_failed", "History was restored, but automatic compaction could not complete. The previous context was not discarded."
+	if errors.Is(cause, errOpenAIEncryptedCompactionContext) {
+		code = openAIWSFallbackReasonInvalidEncryptedContent
+		message = errOpenAIEncryptedCompactionContext.Error()
+	}
 	if errors.Is(cause, ErrInsufficientBalance) {
 		return CodexBalanceFailedEvent(context.Background(), "Insufficient account balance to continue automatic context recovery.")
 	}
@@ -221,6 +226,7 @@ func (s *openAICompactionRecoveryStore) replace(scope string, accountID int64, b
 			} else {
 				undo.expires = time.Now().Add(openAICompactionRecoveryTTL)
 				s.lru.MoveToFront(undo.element)
+				s.notifyPersistence()
 			}
 		}
 	}
