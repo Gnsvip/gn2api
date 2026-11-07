@@ -243,22 +243,18 @@ func TestPassthroughLifecycle_LaterTurnPreOutputRateLimitRequestsReconnect(t *te
 
 	resetAt := time.Now().Add(90 * time.Minute).Unix()
 	upstream.Send(fmt.Sprintf(`{"type":"error","error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":%d}}`, resetAt))
-	_, err = readPassthroughLifecycleFrame(t, clientConn, time.Second)
-	var websocketCloseErr coderws.CloseError
-	require.ErrorAs(t, err, &websocketCloseErr)
-	require.Equal(t, coderws.StatusTryAgainLater, websocketCloseErr.Code)
-	require.Equal(t, "upstream rate limit exceeded; please reconnect", websocketCloseErr.Reason)
+	failure, err := readPassthroughLifecycleFrame(t, clientConn, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "rate_limit_exceeded", gjson.GetBytes(failure, "error.code").String())
 	require.Len(t, repo.rateLimitCalls, 1)
 	require.WithinDuration(t, time.Unix(resetAt, 0), repo.rateLimitCalls[0], 2*time.Second)
-
+	_ = clientConn.CloseNow()
 	select {
-	case err := <-serverErr:
-		var closeErr *OpenAIWSClientCloseError
-		require.ErrorAs(t, err, &closeErr)
-		require.Equal(t, coderws.StatusTryAgainLater, closeErr.StatusCode())
-	case <-time.After(time.Second):
-		t.Fatal("later-turn rate limit did not terminate passthrough")
+	case <-serverErr:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not exit")
 	}
+
 	select {
 	case replay := <-upstream.writes:
 		t.Fatalf("later-turn reconnect must not replay the retained first request: %s", replay)

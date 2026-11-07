@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -96,9 +97,10 @@ func TestOpenAINativeMetadataAndKeepaliveDoNotDisarmFirstOutputTimeout(t *testin
 
 	_, err := svc.handleStreamingResponse(context.Background(), resp, c, account, time.Now(), "test-model", "test-model")
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.True(t, failoverErr.SafeToFailoverAfterWrite)
-	require.Empty(t, recorder.Body.String())
+	require.Error(t, err)
+	require.False(t, errors.As(err, &failoverErr))
+	require.Contains(t, recorder.Body.String(), "first_output_timeout")
+	require.Contains(t, recorder.Body.String(), "response.created")
 	select {
 	case <-writerDone:
 	case <-time.After(time.Second):

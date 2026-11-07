@@ -247,7 +247,7 @@ func TestCompactionRecoveryDoesNotReplayAfterClientOutput(t *testing.T) {
 			require.Contains(t, rec.Body.String(), "already-delivered")
 			require.Empty(t, compactionRecoveryTurn(c).body, "release temporary plaintext at turn end")
 			for _, e := range svc.compactionRecoveryStore().entries {
-				require.False(t, e.invalid)
+				require.True(t, e.invalid, "remember rejection for the next explicit request")
 			}
 		})
 	}
@@ -421,6 +421,9 @@ func TestCompactionRecoveryEndToEnd(t *testing.T) {
 						if failure == "error" {
 							errEvent = []byte(`{"type":"error","error":{"code":"invalid_encrypted_content","message":"Cannot decrypt compaction"}}`)
 						}
+						if failure == "error" {
+							return [][]byte{created("resp_rejected"), errEvent, []byte(recoveryCipherError)}
+						}
 						return [][]byte{created("resp_rejected"), errEvent}
 					}
 					if strings.Contains(string(raw), "lookup result") {
@@ -496,26 +499,38 @@ func TestCompactionRecoveryEndToEnd(t *testing.T) {
 					bodies[1], _ = sjson.SetBytes(bodies[1], "previous_response_id", "resp_recovered")
 					bodies[2] = compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
 				}
+				failedTurn := 1
+				if strings.HasSuffix(path, "_delta_compact") {
+					failedTurn = 2
+				}
+				// The client observes the failure, then explicitly starts a new response.
+				bodies = append(bodies[:failedTurn+1], append([][]byte{bodies[failedTurn]}, bodies[failedTurn+1:]...)...)
 				if native {
-					runCompactionRecoveryNativeClient(t, svc, account, bodies)
+					runCompactionRecoveryNativeClientFailures(t, svc, account, bodies, map[int]bool{failedTurn: true})
 				} else {
 					for i, body := range bodies {
 						c, rec := httpBridgeContext("recovery-e2e")
 						result, err := svc.Forward(c.Request.Context(), c, account, body)
+						if i == failedTurn {
+							require.Contains(t, rec.Body.String(), "invalid_encrypted_content")
+							require.NotContains(t, rec.Body.String(), "resp_recovered")
+							require.Len(t, requests, i+1, "failure must not cause a hidden retry")
+							continue
+						}
 						require.NoError(t, err, "turn %d: %s", i, rec.Body.String())
 						require.NotNil(t, result)
 						require.NotContains(t, rec.Body.String(), "response.failed")
-						if i == 1 {
+						if i == failedTurn+1 {
 							require.Contains(t, rec.Body.String(), "resp_recovered")
 							require.NotContains(t, rec.Body.String(), "resp_rejected")
 						}
-						if i == 2 && path == "http_to_ws" {
+						if i == failedTurn+2 && path == "http_to_ws" {
 							require.True(t, c.GetBool("openai_ws_auto_incremental_succeeded"), c.GetString("openai_ws_auto_incremental_reason"))
 						}
 					}
 				}
 				require.Equal(t, int32(1), rejected.Load(), "next turn must not submit the invalid summary again")
-				require.Len(t, requests, 4, "compact + rejected request + automatic recovery + tool continuation")
+				require.Len(t, requests, 4, "compact + visible rejection + explicit new response + tool continuation")
 				if strings.HasSuffix(path, "_delta_compact") {
 					<-requests // initial generation, before the incremental compact
 					compact, rejected, restored := <-requests, <-requests, <-requests
@@ -557,6 +572,10 @@ func TestCompactionRecoveryEndToEnd(t *testing.T) {
 }
 
 func runCompactionRecoveryNativeClient(t *testing.T, svc *OpenAIGatewayService, account *Account, bodies [][]byte, customize ...func(*OpenAIWSIngressHooks)) {
+	runCompactionRecoveryNativeClientFailures(t, svc, account, bodies, nil, customize...)
+}
+
+func runCompactionRecoveryNativeClientFailures(t *testing.T, svc *OpenAIGatewayService, account *Account, bodies [][]byte, failures map[int]bool, customize ...func(*OpenAIWSIngressHooks)) {
 	t.Helper()
 	errs := make(chan error, 1)
 	var before, after atomic.Int32
@@ -607,8 +626,14 @@ func runCompactionRecoveryNativeClient(t *testing.T, svc *OpenAIGatewayService, 
 				require.Equal(t, lane, gjson.GetBytes(message, "stream_id").String(), "response event must belong to its originating lane")
 			}
 			kind := gjson.GetBytes(message, "type").String()
-			require.NotEqual(t, "error", kind, string(message))
-			require.NotEqual(t, "response.failed", kind, string(message))
+			if !failures[i] {
+				require.NotEqual(t, "error", kind, string(message))
+				require.NotEqual(t, "response.failed", kind, string(message))
+			}
+			if kind == "response.failed" {
+				require.True(t, failures[i])
+				break
+			}
 			if kind == "response.created" {
 				created++
 			}
@@ -616,7 +641,7 @@ func runCompactionRecoveryNativeClient(t *testing.T, svc *OpenAIGatewayService, 
 				break
 			}
 		}
-		require.Equal(t, 1, created, "failed attempt lifecycle must stay private")
+		require.Equal(t, 1, created, "each explicit response has its own lifecycle")
 	}
 	_ = conn.Close(coderws.StatusNormalClosure, "done")
 	select {

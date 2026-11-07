@@ -105,16 +105,6 @@ func shouldLogOpenAIWSEvent(idx int, eventType string) bool {
 	return false
 }
 
-func shouldLogOpenAIWSBufferedEvent(idx int) bool {
-	if idx <= openAIWSBufferLogHeadLimit {
-		return true
-	}
-	if openAIWSBufferLogEveryN > 0 && idx%openAIWSBufferLogEveryN == 0 {
-		return true
-	}
-	return false
-}
-
 func openAIWSEventMayContainModel(eventType string) bool {
 	switch eventType {
 	case "response.created",
@@ -218,8 +208,15 @@ func parseOpenAIWSErrorEventFields(message []byte) (code string, errType string,
 	if len(message) == 0 {
 		return "", "", ""
 	}
-	values := gjson.GetManyBytes(message, "error.code", "error.type", "error.message")
-	return strings.TrimSpace(values[0].String()), strings.TrimSpace(values[1].String()), strings.TrimSpace(values[2].String())
+	failure := gjson.GetBytes(message, "error")
+	if !failure.IsObject() {
+		failure = gjson.ParseBytes(message)
+	}
+	errType = strings.TrimSpace(failure.Get("type").String())
+	if errType == "error" {
+		errType = ""
+	}
+	return strings.TrimSpace(failure.Get("code").String()), errType, strings.TrimSpace(failure.Get("message").String())
 }
 
 func summarizeOpenAIWSErrorEventFieldsFromRaw(codeRaw, errTypeRaw, errMessageRaw string) (code string, errType string, errMessage string) {

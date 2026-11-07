@@ -87,7 +87,7 @@ func TestForwardAsChatCompletions_ResponseFailed_PassthroughRule(t *testing.T) {
 	require.Contains(t, errMsg, "context window")
 }
 
-func TestResponsesStreamAccessStateFailoverPrecedesPassthroughRule(t *testing.T) {
+func TestResponsesStreamAccessStateFailureIsDelivered(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	stream := "event: response.failed\n" +
 		`data: {"type":"response.failed","response":{"status":"failed","error":{"code":"account_disabled","message":"Your account is disabled"}}}` + "\n\n"
@@ -124,13 +124,12 @@ func TestResponsesStreamAccessStateFailoverPrecedesPassthroughRule(t *testing.T)
 			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
 			err := tt.run(svc, c, resp, &Account{ID: 11, Platform: PlatformOpenAI, Type: AccountTypeOAuth})
 
+			require.Error(t, err)
 			var failoverErr *UpstreamFailoverError
-			require.ErrorAs(t, err, &failoverErr)
-			require.True(t, failoverErr.IsCredentialFailure())
-			require.Equal(t, OpenAIUpstreamAccessStateReason, failoverErr.Reason)
-			require.False(t, failoverErr.RetryableOnSameAccount)
-			require.Equal(t, http.StatusBadGateway, failoverErr.ClientStatusCode)
-			require.False(t, c.Writer.Written(), "passthrough rule must not commit a response before account failover")
+			require.False(t, errors.As(err, &failoverErr), "stream errors must not be swallowed to switch accounts")
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Contains(t, rec.Body.String(), "account_disabled")
+			require.Contains(t, rec.Body.String(), "response.failed")
 		})
 	}
 }

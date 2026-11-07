@@ -197,15 +197,13 @@ func TestHTTPToWSPersistedContextRecovery(t *testing.T) {
 			timing := requesttiming.Attach(second, time.Now(), 0)
 			result, err := s.Forward(ctx, second, account, full)
 			recoverable := mode == "error" || mode == "failed" || mode == "message_only" || mode == "full_rejected"
-			if recoverable && mode != "full_rejected" {
-				require.NoError(t, err)
-				require.NotNil(t, result)
-				require.NotContains(t, rec.Body.String(), "unsupported_persisted_item_context")
-				require.NotContains(t, rec.Body.String(), "replay fixture", "discard rejected attempt's buffered preamble")
-				require.Equal(t, 1, strings.Count(rec.Body.String(), `"type":"response.completed"`))
-			} else {
-				require.Error(t, err)
+			_ = result
+			if mode != "canceled" {
+				require.Contains(t, rec.Body.String(), "replay fixture", "notifications cannot be hidden")
+				require.NotContains(t, rec.Body.String(), `"type":"response.completed"`)
 			}
+			require.EqualValues(t, 2, calls.Load(), "no hidden recovery in the failed response")
+
 			require.Zero(t, httpUpstream.callCount, "full-input rejection must remain terminal")
 			delta := <-requests
 			require.Equal(t, "resp_1", gjson.GetBytes(delta, "previous_response_id").String())
@@ -213,6 +211,13 @@ func TestHTTPToWSPersistedContextRecovery(t *testing.T) {
 				require.Len(t, gjson.GetBytes(delta, "input").Array(), 1)
 			}
 			if recoverable {
+				next, nextResponse := httpBridgeContext("persisted-recovery")
+				_, err = s.Forward(context.Background(), next, account, full)
+				if mode == "full_rejected" {
+					require.Contains(t, nextResponse.Body.String(), "unsupported_persisted_item_context")
+				} else {
+					require.NoError(t, err)
+				}
 				require.Equal(t, int32(3), calls.Load(), "one rejected delta and only one full-history recovery")
 				require.Equal(t, int32(2), dials.Load(), "the rejected socket must be retired")
 				replay := <-requests
@@ -230,11 +235,9 @@ func TestHTTPToWSPersistedContextRecovery(t *testing.T) {
 				require.NoError(t, err)
 				require.JSONEq(t, expectedInput, gjson.GetBytes(replay, "input").Raw)
 				summary, _ := timing.Finish(200)
-				require.Len(t, summary.Attempts, 2)
+				require.Len(t, summary.Attempts, 1)
 				require.NotNil(t, summary.Attempts[0].Incremental)
-				require.NotNil(t, summary.Attempts[1].Incremental)
 				require.True(t, *summary.Attempts[0].Incremental)
-				require.False(t, *summary.Attempts[1].Incremental)
 				require.False(t, second.GetBool("openai_ws_auto_incremental_succeeded"))
 				if mode != "full_rejected" {
 					thirdBody, _ := sjson.SetRawBytes(full, "input.-1", []byte(autoContinuationAnswer))

@@ -367,28 +367,6 @@ func (s *OpenAIGatewayService) handleOpenAIWSDialTransientFailure(ctx context.Co
 	s.handleOpenAIAccountUpstreamError(ctx, account, dialErr.StatusCode, dialErr.ResponseHeaders, dialErr.ResponseBody, canonicalModel)
 }
 
-const (
-	openAIWSPreambleMaxEvents = 64
-	openAIWSPreambleMaxBytes  = 256 * 1024
-)
-
-// Progress is client output too. Typed reasoning items/parts must not wait
-// for text or completion. This transport boundary is independent of TTFT:
-// once delivered, the attempt must not be transparently replayed.
-func openAIWSDataStartsStreamingOutput(data []byte, eventType string) bool {
-	switch eventType {
-	case "response.output_item.added":
-		if gjson.GetBytes(data, "item.type").String() == "reasoning" {
-			return true
-		}
-	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
-		if gjson.GetBytes(data, "part.type").String() == "summary_text" {
-			return true
-		}
-	}
-	return openAIStreamDataStartsClientOutput(string(data), eventType)
-}
-
 func isOpenAIWSTokenEvent(eventType string) bool {
 	eventType = strings.TrimSpace(eventType)
 	if eventType == "" {

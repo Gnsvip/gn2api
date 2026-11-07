@@ -210,19 +210,27 @@ func TestHTTPToWSMissingToolReplaySafety(t *testing.T) {
 			}
 			_, err = s.Forward(ctx, second, a, body)
 			replayed := mode == "custom" || mode == "failed_custom" || strings.HasPrefix(mode, "repeat_")
-			if mode == "custom" || mode == "failed_custom" {
-				require.NoError(t, err)
-				require.Contains(t, recorder.Body.String(), "resp_replayed")
-			} else {
-				require.Contains(t, recorder.Body.String(), "response.failed")
+			require.Contains(t, recorder.Body.String(), "No tool output found")
+			require.NotContains(t, recorder.Body.String(), "resp_replayed")
+			require.EqualValues(t, 2, calls.Load(), "no hidden replay after a forwarded error")
+			if replayed {
+				next, nextResponse := httpBridgeContext("missing-tool-safety")
+				_, err = s.Forward(ctx, next, a, body)
+				if strings.HasPrefix(mode, "repeat_") {
+					require.Contains(t, nextResponse.Body.String(), "No tool output found")
+				} else {
+					require.NoError(t, err)
+					require.Contains(t, nextResponse.Body.String(), "resp_replayed")
+				}
 			}
+
 			wantCalls, wantDials := int32(2), int32(1)
 			if replayed {
 				wantCalls, wantDials = 3, 2
 			}
 			require.Equal(t, wantCalls, calls.Load(), "never loop on a second tool error")
 			require.Equal(t, wantDials, dials.Load(), "replay uses a fresh upstream socket")
-			require.Equal(t, replayed, second.GetBool("openai_ws_auto_incremental_replay"))
+			require.False(t, second.GetBool("openai_ws_auto_incremental_replay"))
 			require.False(t, second.GetBool("openai_ws_auto_incremental_succeeded"))
 			require.Zero(t, httpUpstream.callCount)
 			initial := <-requests

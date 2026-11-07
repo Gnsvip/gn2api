@@ -270,6 +270,7 @@ type openAIWSPassthroughDeadlinePhase uint8
 const (
 	openAIWSPassthroughDeadlinePhaseFirstSemantic openAIWSPassthroughDeadlinePhase = iota + 1
 	openAIWSPassthroughDeadlinePhaseActiveRead
+	openAIWSPassthroughDeadlinePhaseFailureDrain
 )
 
 type openAIWSPassthroughFirstOutputDeadline struct {
@@ -448,7 +449,7 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) ReadFrame(ctx context.Context)
 			}
 			cancelRead()
 			<-readResultCh
-			if state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
+			if state.deadline.phase != openAIWSPassthroughDeadlinePhaseFirstSemantic {
 				return coderws.MessageText, nil, &openAIWSPassthroughActiveTurnTimeoutError{}
 			}
 			return coderws.MessageText, nil, &openAIWSPassthroughFirstOutputTimeoutError{deadline: state.deadline}
@@ -513,6 +514,18 @@ func (c *openAIWSPassthroughFirstOutputFrameConn) observeUpstreamActivity(msgTyp
 		return
 	}
 	state := c.deadlineState()
+	if state.armed && state.deadline.phase == openAIWSPassthroughDeadlinePhaseFailureDrain {
+		return
+	}
+	if msgType == coderws.MessageText && gjson.GetBytes(payload, "type").String() == "error" {
+		c.mu.Lock()
+		c.state.generation++
+		c.state.armed = true
+		c.state.deadline = openAIWSPassthroughFirstOutputDeadline{timeout: openAIStreamFailureDrainTimeout, startedAt: time.Now(), phase: openAIWSPassthroughDeadlinePhaseFailureDrain}
+		c.mu.Unlock()
+		c.notifyDeadlineChanged()
+		return
+	}
 	if state.armed && state.deadline.phase == openAIWSPassthroughDeadlinePhaseActiveRead {
 		c.armActiveReadDeadline()
 		return
@@ -760,6 +773,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 	}
 	firstClientMessage = s.beginPassthroughCompaction(c, recovery, firstClientMessage, initialRequestModel, account, firstStart)
 	resumeCompactionRecoveryTurn(c, previousRecovery)
+	if s.shouldBridgeOpenAIWSPassthroughFirstMessage(account, firstClientMessage) {
+		return &openAIPassthroughRouteRestart{body: firstClientMessage, model: initialRequestModel, started: firstStart}
+	}
 	// Recovery stores the client settings, before applying policy. Re-entering
 	// this function must not map an already mapped effort a second time.
 	originalFirstClientMessage := firstClientMessage
@@ -1097,6 +1113,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 					inheritedModel = capturedSessionModel
 				}
 				payload = s.beginPassthroughCompaction(c, recovery, payload, inheritedModel, account, responseCreateAt)
+				if s.shouldBridgeOpenAIWSPassthroughFirstMessage(account, payload) {
+					// This explicit create has not passed admission yet. The bridge
+					// runs BeforeTurn, but its first frame needs request pricing here.
+					if hooks != nil && hooks.BeforeRequest != nil {
+						if err := hooks.BeforeRequest(int(completedTurns.Load())+1, payload, inheritedModel); err != nil {
+							return payload, nil, err
+						}
+					}
+					return payload, nil, &openAIPassthroughRouteRestart{body: payload, completed: int(completedTurns.Load()), model: inheritedModel, started: responseCreateAt}
+				}
 				if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesCompatibilityBodyWithOptions(payload, account, openAIResponsesCompatibilityOptions{Config: s.cfg, ResponsesLite: responsesLite, OfficialClient: officialClient, PreserveHistory: preserveCompactionRecoveryHistory(c)}); normalizeErr != nil {
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeErr)
 				} else if compatibilityChanged {
@@ -1401,6 +1427,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 				if context.Cause(ctx) != nil {
 					return
 				}
+				var route *openAIPassthroughRouteRestart
+				if errors.As(exit.Err, &route) {
+					return
+				}
 				var currentTurn *openAIWSCurrentTurnFailoverError
 				if errors.As(exit.Err, &currentTurn) {
 					return // Keep the client socket for the replacement account.
@@ -1431,79 +1461,22 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 					return nil
 				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
-				if (eventType == "error" || eventType == "response.failed") && isCompactionRecoveryError(payload) {
-					if recovery.canRetry() && ctx.Err() == nil {
-						if retry := s.retryCompactionError(c, payload); retry != nil {
-							return &openAIPassthroughCompactionRetry{retry: retry}
-						}
-					}
-					if turn := compactionRecoveryTurn(c); turn != nil && (turn.retried || turn.recompacted) {
-						// Recovery was exhausted. Forward the terminal failure instead
-						// of restarting the same repair through account failover.
-						return nil
-					}
-				}
+				// Error events belong to the current response and must reach the
+				// client immediately. Reconnect/replay is allowed only before events.
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
 				}
-				if (eventType == "error" || eventType == "response.failed") && markOpenAIWSV2PassthroughCyberPolicy(c, payload) {
+				if eventType != "error" && eventType != "response.failed" {
 					return nil
 				}
-				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
-				parentError := gjson.GetBytes(payload, "error")
-				if eventType == "response.failed" {
-					parentError = gjson.GetBytes(payload, "response.error")
+				s.noteCompactionStreamFailure(c, payload)
+				if markOpenAIWSV2PassthroughCyberPolicy(c, payload) {
+					return nil
 				}
-				if (eventType == "error" || eventType == "response.failed") &&
-					(parentError.Get("code").String() == "previous_response_not_found" || openAIWSIsPersistedContextRejection(parentError)) && recovery.canRetry() && ctx.Err() == nil &&
-					s.cfg != nil && s.cfg.Gateway.OpenAIWS.IngressPreviousResponseRecoveryEnabled {
-					recovery.mu.Lock()
-					hasParent := gjson.GetBytes(recovery.metadata, "previous_response_id").String() != ""
-					recovery.mu.Unlock()
-					if hasParent {
-						return &openAIPassthroughCompactionRetry{parentMissing: true}
-					}
-				}
-				if (eventType == "error" || eventType == "response.failed") && recovery.canRetry() {
-					retryable := openAIStreamFailedEventShouldFailover(payload, errMsgRaw)
-					if eventType == "error" {
-						retryable = openAIStreamErrorEventShouldFailover(payload, errMsgRaw)
-					}
-					if retryable {
-						_, currentModel := usageMeta.turnModels("")
-						failure := s.newOpenAIStreamFailoverErrorWithModel(c, account, true,
-							openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"), payload, errMsgRaw, currentModel, handshakeHeaders)
-						// Build the replay only after joining the client reader: a
-						// concurrent cancel/session edit can still invalidate it.
-						return newOpenAIWSCurrentTurnFailoverError(failure, nil)
-					}
-				}
-				isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw)
-				if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
+				if !failureAccountSideEffectsApplied {
 					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
 				}
-				if eventType != "error" {
-					return nil
-				}
-				if wroteDownstream || !isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw) {
-					return nil
-				}
-				s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, payload, errCodeRaw, errTypeRaw, errMsgRaw, capturedSessionModel)
-				logOpenAIWSV2Passthrough(
-					"relay_rate_limit_failover account_id=%d err_code=%s err_type=%s err_message=%s",
-					account.ID,
-					truncateOpenAIWSLogValue(errCodeRaw, openAIWSLogValueMaxLen),
-					truncateOpenAIWSLogValue(errTypeRaw, openAIWSLogValueMaxLen),
-					truncateOpenAIWSLogValue(errMsgRaw, openAIWSLogValueMaxLen),
-				)
-				if completedTurns.Load() > 0 {
-					return NewOpenAIWSClientCloseError(
-						coderws.StatusTryAgainLater,
-						"upstream rate limit exceeded; please reconnect",
-						errors.New("later passthrough turn was rate limited before output"),
-					)
-				}
-				return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, payload, errMsgRaw)
+				return nil
 			},
 			OnTrace: func(event openaiwsv2.RelayTraceEvent) {
 				logOpenAIWSV2Passthrough(
@@ -1601,6 +1574,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 	)
 
 	relayErr := relayExit.Err
+	var route *openAIPassthroughRouteRestart
+	if errors.As(relayErr, &route) {
+		return route
+	}
 	var compact *openAIPassthroughCompactionRetry
 	if errors.As(relayErr, &compact) {
 		// RunEntry has joined the client reader. A concurrent cancel or session

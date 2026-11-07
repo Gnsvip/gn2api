@@ -70,7 +70,9 @@ func testCompactionReviewWSInheritedModel(t *testing.T, mode string, mapped bool
 				case strings.Contains(string(raw), "recovery-test-cipher"):
 					terminal = []byte(recoveryCipherError)
 				case strings.Contains(string(raw), "7391"):
-					terminal = []byte(recompactLimit)
+					if got := gjson.GetBytes(raw, "model").String(); (mapped && got != "gpt-5.1") || (!mapped && got != "gpt-6-astra") {
+						t.Errorf("restored request model %q", got)
+					}
 				}
 				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_start","status":"in_progress"}}`))
 				if conn.WriteMessage(websocket.TextMessage, terminal) != nil {
@@ -109,13 +111,9 @@ func testCompactionReviewWSInheritedModel(t *testing.T, mode string, mapped bool
 	t.Cleanup(func() {
 		mu.Lock()
 		defer mu.Unlock()
-		expected := "gpt-6-astra"
-		if mapped {
-			expected = "gpt-5.1"
-		}
-		require.Equal(t, []string{expected}, compactModels, "internal compaction must use the effective session model")
+		require.Empty(t, compactModels, "no hidden compaction in a delivered response")
 	})
-	runCompactionRecoveryNativeClient(t, svc, account, [][]byte{first, second}, func(hooks *OpenAIWSIngressHooks) {
+	runCompactionRecoveryNativeClientFailures(t, svc, account, [][]byte{first, second, second}, map[int]bool{1: true}, func(hooks *OpenAIWSIngressHooks) {
 		if mapped {
 			hooks.MapRequestModel = func(_ int, model string) (string, error) {
 				require.Equal(t, "gpt-6-astra", model)

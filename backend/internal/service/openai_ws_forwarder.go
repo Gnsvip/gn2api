@@ -25,8 +25,6 @@ const (
 	openAIWSIDValueMaxLen       = 64
 	openAIWSEventLogHeadLimit   = 20
 	openAIWSEventLogEveryN      = 50
-	openAIWSBufferLogHeadLimit  = 8
-	openAIWSBufferLogEveryN     = 20
 	openAIWSPrewarmEventLogHead = 10
 	openAIWSPayloadKeySizeTopN  = 6
 

@@ -49,10 +49,13 @@ func TestCompactionRecompactEndToEnd(t *testing.T) {
 					case strings.Contains(string(raw), "lookup result"):
 						terminal = autoContinuationEvent("resp_tool_done", autoContinuationAnswer)
 					default:
-						terminal = autoContinuationEvent("resp_recovered", autoContinuationCall)
+						terminal = autoContinuationEvent("resp_recovered", strings.ReplaceAll(autoContinuationCall, "call_lookup", "fc_lookup"))
+					}
+					if gjson.GetBytes(terminal, "type").String() == "response.failed" {
+						terminal, _ = sjson.SetBytes(terminal, "response.id", fmt.Sprintf("resp_rejected_%d", len(requests)))
 					}
 					if failure == "error" && gjson.GetBytes(terminal, "type").String() == "response.failed" {
-						terminal = []byte(`{"type":"error","error":` + gjson.GetBytes(terminal, "response.error").Raw + `}`)
+						return [][]byte{[]byte(`{"type":"response.created","response":{"id":"resp_start","status":"in_progress"}}`), []byte(`{"type":"error","error":` + gjson.GetBytes(terminal, "response.error").Raw + `}`), terminal}
 					}
 					return [][]byte{[]byte(`{"type":"response.created","response":{"id":"resp_start","status":"in_progress"}}`), terminal}
 				}
@@ -139,7 +142,31 @@ func TestCompactionRecompactEndToEnd(t *testing.T) {
 				original := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, path != "http_json")
 				svc.beginCompactionRecoveryTurn(c, original, false)
 				require.True(t, svc.compactionRecoveryStore().put(compactionRecoveryTurn(c).scope, source, recoveryItems(t, recoverySummary+","+recoveryRetained)))
-				bodies := [][]byte{original, compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser+","+autoContinuationCall+","+autoContinuationTool, path != "http_json")}
+				bodies := [][]byte{original, compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser+","+strings.ReplaceAll(autoContinuationCall, "call_lookup", "fc_lookup")+","+strings.ReplaceAll(autoContinuationTool, "call_lookup", "fc_lookup"), path != "http_json")}
+				explicit := path != "http_json" && failure != "http400"
+				if explicit {
+					// The failed generation is delivered; these are separate client requests.
+					if native {
+						runCompactionRecoveryNativeClientFailures(t, svc, account, [][]byte{original, original}, map[int]bool{0: true, 1: true})
+					} else {
+						for range 2 {
+							request, rec := httpBridgeContext("recovery-e2e")
+							_, _ = svc.Forward(request.Request.Context(), request, account, original)
+							require.NotContains(t, rec.Body.String(), "response.completed")
+							require.Contains(t, rec.Body.String(), "error")
+						}
+					}
+					require.Len(t, requests, 2, "neither failed response may replay itself")
+					require.Empty(t, compacts, "compaction is a new explicit operation")
+					compactCtx, _ := httpBridgeContext("recovery-e2e")
+					window, compactErr := svc.runRecoveryCompact(compactCtx.Request.Context(), compactCtx, account, original, source, 1)
+					require.NoError(t, compactErr)
+					rawWindow, marshalErr := json.Marshal(window)
+					require.NoError(t, marshalErr)
+					bodies[0], _ = sjson.SetRawBytes(original, "input", append(append(rawWindow[:len(rawWindow)-1], ','), append([]byte(recoveryUser), ']')...))
+					bodies[1], _ = sjson.SetRawBytes(bodies[0], "input.-1", []byte(strings.ReplaceAll(autoContinuationCall, "call_lookup", "fc_lookup")))
+					bodies[1], _ = sjson.SetRawBytes(bodies[1], "input.-1", []byte(strings.ReplaceAll(autoContinuationTool, "call_lookup", "fc_lookup")))
+				}
 				if native {
 					runCompactionRecoveryNativeClient(t, svc, account, bodies)
 				} else {

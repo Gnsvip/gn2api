@@ -269,36 +269,24 @@ func TestHTTPToWSAutoContinuationRecoveryKeepsFullTools(t *testing.T) {
 			_, err := s.Forward(context.Background(), first, a, autoContinuationBody(true))
 			require.NoError(t, err)
 			<-requests
-			second, _ := httpBridgeContext("recover-incremental")
-			timing := requesttiming.Attach(second, time.Now(), 0)
+			second, rejectedResponse := httpBridgeContext("recover-incremental")
+			requesttiming.Attach(second, time.Now(), 0)
 			_, err = s.Forward(context.Background(), second, a, autoContinuationBody(true, autoContinuationCall, autoContinuationTool))
-			require.NoError(t, err)
-			if mode != "http_fallback" {
-				require.Equal(t, int32(3), calls.Load(), "one delta followed by one full replay")
-				require.True(t, second.GetBool("openai_ws_auto_incremental_replay"))
-			}
+			require.Contains(t, rejectedResponse.Body.String(), `"type":"`)
+			require.NotContains(t, rejectedResponse.Body.String(), `"type":"response.completed"`)
+			require.EqualValues(t, 2, calls.Load(), "a delivered error cannot trigger silent replay")
+
 			require.False(t, second.GetBool("openai_ws_auto_incremental_succeeded"), "a full replay is not a successful delta")
 			delta := <-requests
 			require.Equal(t, "resp_1", gjson.GetBytes(delta, "previous_response_id").String())
 			require.Len(t, gjson.GetBytes(delta, "input").Array(), 1)
-			var replay []byte
-			if mode == "http_fallback" {
-				require.Equal(t, 1, httpUpstream.callCount)
-				replay = httpUpstream.bodies[0]
-				summary, _ := timing.Finish(200)
-				require.Len(t, summary.Attempts, 2)
-				ws, httpAttempt := summary.Attempts[0], summary.Attempts[1]
-				require.Equal(t, "websocket", ws.Transport)
-				require.NotNil(t, ws.InputItems)
-				require.Equal(t, 1, *ws.InputItems)
-				require.True(t, *ws.ContinuationAnchor)
-				require.Equal(t, "http", httpAttempt.Transport)
-				require.Equal(t, 4, *httpAttempt.InputItems)
-				require.False(t, *httpAttempt.ContinuationAnchor)
-			} else {
-				require.Zero(t, httpUpstream.callCount)
-				replay = <-requests
-			}
+			next, _ := httpBridgeContext("recover-incremental")
+			_, err = s.Forward(context.Background(), next, a, autoContinuationBody(true, autoContinuationCall, autoContinuationTool))
+			require.NoError(t, err)
+			require.EqualValues(t, 3, calls.Load())
+			require.Zero(t, httpUpstream.callCount, "event errors must not secretly switch this response to HTTP")
+			replay := <-requests
+
 			require.False(t, gjson.GetBytes(replay, "previous_response_id").Exists())
 			require.Len(t, gjson.GetBytes(replay, "input").Array(), 4)
 			require.Equal(t, "call_lookup", gjson.GetBytes(replay, "input.2.call_id").String())

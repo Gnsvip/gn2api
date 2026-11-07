@@ -21,6 +21,17 @@ type openAIPassthroughCompactionRetry struct {
 	recorder      *requesttiming.Recorder
 }
 
+type openAIPassthroughRouteRestart struct {
+	body      []byte
+	completed int
+	model     string
+	started   time.Time
+}
+
+func (*openAIPassthroughRouteRestart) Error() string {
+	return "route restored websocket request before upstream write"
+}
+
 type openAIWSRecoveryResumeKey struct{}
 type openAIWSRecoveryResume struct {
 	previous *openAICompactionRecoveryTurn
@@ -51,6 +62,16 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(ctx context.
 			return s.ProxyResponsesWebSocketFromClient(context.WithValue(ctx, openAIWSRecoveryResumeKey{}, resume), c, client, account, token, first, attemptHooks)
 		}
 		err := s.proxyResponsesWebSocketV2PassthroughOnce(ctx, c, client, account, token, first, attemptHooks, decision, previous, recorder, offset, replay)
+		var route *openAIPassthroughRouteRestart
+		if errors.As(err, &route) {
+			if controlErr := pendingWSCompactionControl(ctx); controlErr != nil {
+				return controlErr
+			}
+			// No upstream or downstream event belongs to this new create yet.
+			// Re-enter routing with the full window, preserving the reader and turn number.
+			routeHooks := offsetCompactionHooks(hooks, offset+route.completed, route.model, route.started)
+			return s.ProxyResponsesWebSocketFromClient(ctx, c, client, account, token, route.body, routeHooks)
+		}
 		var recovery *openAIPassthroughCompactionRetry
 		if !errors.As(err, &recovery) {
 			var failover *UpstreamFailoverError

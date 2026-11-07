@@ -112,7 +112,7 @@ func TestOpenAINativeFirstOutputTimeoutDisabledPreservesSynchronousStream(t *tes
 	require.Contains(t, rec.Body.String(), "response.completed")
 }
 
-func TestOpenAINativeFirstOutputTimeoutIgnoresPreambleAndCleansReader(t *testing.T) {
+func TestOpenAINativeFirstOutputTimeoutAfterCreatedDoesNotReplay(t *testing.T) {
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 1,
 		MaxLineSize:                     defaultMaxLineSize,
@@ -124,7 +124,7 @@ func TestOpenAINativeFirstOutputTimeoutIgnoresPreambleAndCleansReader(t *testing
 		defer func() { _ = pw.Close() }()
 		_, _ = pw.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_slow\"}}\n\n"))
 		_, _ = pw.Write([]byte("data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_slow\"}}\n\n"))
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(1200 * time.Millisecond)
 	}()
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -132,15 +132,14 @@ func TestOpenAINativeFirstOutputTimeoutIgnoresPreambleAndCleansReader(t *testing
 	body := &firstOutputCloseTrackingBody{ReadCloser: pr, closed: make(chan struct{})}
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
 
-	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now().Add(-2*time.Second), "model", "model")
+	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	require.Error(t, err)
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
-	require.Contains(t, string(failoverErr.ResponseBody), "first_output_timeout")
-	require.True(t, failoverErr.SafeToFailoverAfterWrite)
-	require.Empty(t, rec.Body.String())
+	require.False(t, errors.As(err, &failoverErr))
+	require.ErrorContains(t, err, "timeout after response started")
+	require.Contains(t, rec.Body.String(), "response.created")
+	require.Contains(t, rec.Body.String(), "upstream_first_output_timeout")
 	select {
 	case <-body.closed:
 	default:
@@ -367,19 +366,19 @@ func TestOpenAINativeFirstOutputTimeoutWaitsForCompleteSemanticEvent(t *testing.
 	suffix := `"}`
 	line := prefix + strings.Repeat("x", lineSize-len(prefix)-len(suffix)) + suffix
 	require.Len(t, line, lineSize)
-	assertOpenAINativeLargeOpenEventTimesOutWithoutLeak(t, line)
+	assertOpenAINativeLargeOpenEventTimesOutWithoutReplay(t, line)
 }
 
-func TestOpenAINativeFirstOutputTimeoutDoesNotLeakLargePreambleEvent(t *testing.T) {
+func TestOpenAINativeFirstOutputTimeoutDoesNotReplayLargePreambleEvent(t *testing.T) {
 	const lineSize = 68106
 	prefix := `data: {"type":"response.created","response":{"id":"resp_partial","padding":"`
 	suffix := `"}}`
 	line := prefix + strings.Repeat("x", lineSize-len(prefix)-len(suffix)) + suffix
 	require.Len(t, line, lineSize)
-	assertOpenAINativeLargeOpenEventTimesOutWithoutLeak(t, line)
+	assertOpenAINativeLargeOpenEventTimesOutWithoutReplay(t, line)
 }
 
-func assertOpenAINativeLargeOpenEventTimesOutWithoutLeak(t *testing.T, line string) {
+func assertOpenAINativeLargeOpenEventTimesOutWithoutReplay(t *testing.T, line string) {
 	t.Helper()
 	cfg := &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 1,
@@ -410,19 +409,10 @@ func assertOpenAINativeLargeOpenEventTimesOutWithoutLeak(t *testing.T, line stri
 	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
-	require.Contains(t, string(failoverErr.ResponseBody), "first_output_timeout")
-	require.True(t, failoverErr.SafeToFailoverAfterWrite)
-	require.NotContains(t, rec.Body.String(), "data:", "attempt JSON must remain private before the SSE boundary")
-	require.NotContains(t, rec.Body.String(), `"type"`, "attempt JSON must remain private before the SSE boundary")
-	for _, outputLine := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
-		if outputLine != "" {
-			require.True(t, strings.HasPrefix(outputLine, ":"), "only keepalive comments may precede failover: %q", outputLine)
-		}
-	}
-	require.Empty(t, rec.Header().Values("X-Request-Id"))
-	require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
+	require.False(t, errors.As(err, &failoverErr), "a partial write cannot be replayed")
+	require.Contains(t, rec.Body.String(), strings.Repeat("x", 1024))
+	require.Contains(t, rec.Body.String(), "upstream_first_output_timeout")
+	require.Equal(t, "request-partial", rec.Result().Header.Get("X-Request-Id"))
 	select {
 	case <-writerDone:
 	case <-time.After(time.Second):
@@ -475,7 +465,7 @@ func TestOpenAINativeFirstOutputEOFDispatchesTerminalEventWithoutBlankLine(t *te
 	require.Equal(t, "17", rec.Result().Header.Get("X-Ratelimit-Remaining-Requests"))
 }
 
-func TestOpenAINativeFirstOutputStageOverflowFailsOverWithoutAttemptBytes(t *testing.T) {
+func TestOpenAINativeFirstOutputManyNoticesAreForwardedWithoutStageLimit(t *testing.T) {
 	cfg := &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 30,
 		MaxLineSize:                     2 * 1024 * 1024,
@@ -503,13 +493,11 @@ func TestOpenAINativeFirstOutputStageOverflowFailsOverWithoutAttemptBytes(t *tes
 	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.True(t, failoverErr.SafeToFailoverAfterWrite)
-	require.Contains(t, string(failoverErr.ResponseBody), "staging limit exceeded")
-	require.Empty(t, rec.Body.String())
-	require.Empty(t, rec.Header().Values("X-Request-Id"))
-	require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
+	require.False(t, errors.As(err, &failoverErr))
+	require.ErrorContains(t, err, "missing terminal event")
+	require.Equal(t, 9, strings.Count(rec.Body.String(), `"type":"response.in_progress"`))
+	require.Contains(t, rec.Body.String(), "stream_disconnected")
+	require.Equal(t, "request-overflow", rec.Result().Header.Get("X-Request-Id"))
 }
 
 func TestOpenAINativeFirstOutputEventLimitFailsOverWithoutAttemptBytes(t *testing.T) {
@@ -545,16 +533,15 @@ func TestOpenAINativeFirstOutputEventLimitFailsOverWithoutAttemptBytes(t *testin
 			require.True(t, failoverErr.SafeToFailoverAfterWrite)
 			require.Contains(t, string(failoverErr.ResponseBody), "event exceeds first-output transport limit")
 			require.Empty(t, rec.Body.String())
-			require.Empty(t, rec.Header().Values("X-Request-Id"))
-			require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
+			require.False(t, c.Writer.Written(), "headers were only prepared; no response bytes were sent")
 		})
 	}
 }
 
-func TestOpenAINativeFirstOutputScannerRejectsOversizedLineWithoutLeak(t *testing.T) {
+func TestOpenAINativeFirstOutputScannerRejectsOversizedLineWithoutReplay(t *testing.T) {
 	cfg := &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 30,
-		MaxLineSize:                     defaultMaxLineSize,
+		MaxLineSize:                     1024 * 1024,
 	}}
 	svc := &OpenAIGatewayService{cfg: cfg, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
 	oversizedLine := "data: " + strings.Repeat("x", openAIFirstOutputStageMaxBytes+openAIFirstOutputScannerFramingAllowance+1024)
@@ -574,13 +561,11 @@ func TestOpenAINativeFirstOutputScannerRejectsOversizedLineWithoutLeak(t *testin
 	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.True(t, failoverErr.SafeToFailoverAfterWrite)
-	require.Contains(t, string(failoverErr.ResponseBody), "line exceeds guarded first-output limit")
-	require.Empty(t, rec.Body.String())
-	require.Empty(t, rec.Header().Values("X-Request-Id"))
-	require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
+	require.False(t, errors.As(err, &failoverErr))
+	require.Error(t, err)
+	require.Contains(t, rec.Body.String(), "response.created")
+	require.Contains(t, rec.Body.String(), "response_too_large")
+	require.Equal(t, "request-too-large", rec.Result().Header.Get("X-Request-Id"))
 }
 
 func TestOpenAINativeFirstOutputScannerAllowsLargeEventAfterSemanticBoundary(t *testing.T) {
@@ -621,7 +606,7 @@ func TestOpenAINativeFirstOutputScannerAllowsLargeEventAfterSemanticBoundary(t *
 	require.Equal(t, "request-large-image", rec.Result().Header.Get("X-Request-Id"))
 }
 
-func TestOpenAINativeFirstOutputTimeoutDisabledKeepsPreamblePrivateAcrossKeepalive(t *testing.T) {
+func TestOpenAINativeFirstOutputTimeoutDisabledForwardsNoticesAcrossKeepalive(t *testing.T) {
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		StreamKeepaliveInterval: 1,
 		MaxLineSize:             defaultMaxLineSize,
@@ -641,13 +626,13 @@ func TestOpenAINativeFirstOutputTimeoutDisabledKeepsPreamblePrivateAcrossKeepali
 	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
+	require.False(t, errors.As(err, &failoverErr))
 	require.Contains(t, rec.Body.String(), ":\n\n")
-	require.NotContains(t, rec.Body.String(), "response.created")
-	require.NotContains(t, rec.Body.String(), "response.in_progress")
+	require.Contains(t, rec.Body.String(), "response.created")
+	require.Contains(t, rec.Body.String(), "response.in_progress")
 }
 
-func TestOpenAINativeFirstOutputFailoverKeepsAttemptHeadersPrivateAfterKeepaliveCommit(t *testing.T) {
+func TestOpenAINativeFirstOutputTimeoutRetainsCommittedResponseIdentity(t *testing.T) {
 	cfg := &config.Config{Gateway: config.GatewayConfig{
 		OpenAIFirstOutputTimeoutSeconds: 2,
 		StreamKeepaliveInterval:         1,
@@ -684,34 +669,12 @@ func TestOpenAINativeFirstOutputFailoverKeepsAttemptHeadersPrivateAfterKeepalive
 
 	_, firstErr := svc.handleStreamingResponse(c.Request.Context(), firstResp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, firstErr, &failoverErr)
-	require.Contains(t, rec.Body.String(), ":\n\n", "first attempt should have committed only a stable keepalive")
-	require.NotContains(t, rec.Body.String(), "resp_first")
-
-	secondResp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header: http.Header{
-			"Content-Type":                   []string{"text/event-stream"},
-			"X-Request-Id":                   []string{"request-second"},
-			"X-Ratelimit-Remaining-Requests": []string{"99"},
-		},
-		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
-			`data: {"type":"response.output_text.delta","delta":"hello"}`,
-			"",
-			`data: {"type":"response.completed","response":{"id":"resp_second","usage":{"input_tokens":1,"output_tokens":1}}}`,
-			"",
-		}, "\n"))),
-	}
-	result, secondErr := svc.handleStreamingResponse(c.Request.Context(), secondResp, c, &Account{ID: 2, Platform: PlatformOpenAI}, time.Now(), "model", "model")
-
-	require.NoError(t, secondErr)
-	require.NotNil(t, result)
-	require.Contains(t, rec.Body.String(), "resp_second")
-	wireHeaders := rec.Result().Header
-	require.Empty(t, wireHeaders.Values("X-Request-Id"))
-	require.Empty(t, wireHeaders.Values("X-Ratelimit-Remaining-Requests"))
-	require.Empty(t, rec.Header().Values("X-Request-Id"))
-	require.Empty(t, rec.Header().Values("X-Ratelimit-Remaining-Requests"))
+	require.False(t, errors.As(firstErr, &failoverErr))
+	require.ErrorContains(t, firstErr, "timeout after response started")
+	require.Contains(t, rec.Body.String(), "resp_first")
+	require.Contains(t, rec.Body.String(), "upstream_first_output_timeout")
+	require.Equal(t, "request-first", rec.Result().Header.Get("X-Request-Id"))
+	require.Equal(t, "1", rec.Result().Header.Get("X-Ratelimit-Remaining-Requests"))
 	select {
 	case <-firstWriterDone:
 	case <-time.After(time.Second):

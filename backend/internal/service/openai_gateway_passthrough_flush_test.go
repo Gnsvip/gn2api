@@ -127,7 +127,7 @@ func TestOpenAIStreamingPassthroughFlushesAtCompleteEventBoundaries(t *testing.T
 	require.Equal(t, 2, result.usage.OutputTokens)
 }
 
-func TestOpenAIStreamingPassthroughKeepsPreamblePendingUntilFirstOutputBoundary(t *testing.T) {
+func TestOpenAIStreamingPassthroughFlushesPreambleAtEveryBoundary(t *testing.T) {
 	preamble := "event: response.created\n" +
 		`data: {"type":"response.created","response":{"id":"resp_pending"}}` + "\n\n" +
 		": waiting\n\n"
@@ -140,6 +140,8 @@ func TestOpenAIStreamingPassthroughKeepsPreamblePendingUntilFirstOutputBoundary(
 	require.NoError(t, err)
 	require.Equal(t, upstream, recorder.Body.String())
 	require.Equal(t, []int{
+		len(preamble) - len(": waiting\n\n"),
+		len(preamble),
 		len(preamble) + len(firstOutput),
 		len(upstream),
 	}, writer.flushBodyLengths)
@@ -160,7 +162,7 @@ func TestOpenAIStreamingPassthroughFlushesTerminalEventAtEOFWithoutBlankLine(t *
 	require.Equal(t, 2, result.usage.OutputTokens)
 }
 
-func TestOpenAIStreamingPassthroughFailedBeforeOutputCanStillFailOverWithoutFlush(t *testing.T) {
+func TestOpenAIStreamingPassthroughFailureAfterCreatedCannotReplay(t *testing.T) {
 	upstream := "event: response.created\n" +
 		`data: {"type":"response.created","response":{"id":"resp_failover"}}` + "\n\n" +
 		"event: response.failed\n" +
@@ -170,9 +172,9 @@ func TestOpenAIStreamingPassthroughFailedBeforeOutputCanStillFailOverWithoutFlus
 
 	require.Error(t, err)
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.Empty(t, recorder.Body.String())
-	require.Empty(t, writer.flushBodyLengths)
+	require.False(t, errors.As(err, &failoverErr))
+	require.Equal(t, upstream, recorder.Body.String())
+	require.Len(t, writer.flushBodyLengths, 2)
 }
 
 func TestOpenAIStreamingPassthroughNonRetryableFailedBeforeOutputFlushesAtBoundary(t *testing.T) {
@@ -203,11 +205,12 @@ func TestOpenAIStreamingPassthroughBareErrorTerminatesBeforeDone(t *testing.T) {
 	require.False(t, errors.As(err, &failoverErr))
 	require.NotNil(t, result)
 	body := recorder.Body.String()
-	require.NotContains(t, body, `"type":"error"`)
+	require.Contains(t, body, `"type":"error"`)
 	require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
 	require.Contains(t, body, `"status":"failed"`)
-	require.NotContains(t, body, "[DONE]")
-	require.Equal(t, []int{len(body)}, writer.flushBodyLengths)
+	require.Contains(t, body, "[DONE]")
+	require.Equal(t, len(errorEvent), writer.flushBodyLengths[0])
+	require.Equal(t, len(body), writer.flushBodyLengths[len(writer.flushBodyLengths)-1])
 	require.Equal(t, 6, result.usage.InputTokens)
 	require.Zero(t, result.usage.OutputTokens)
 }
@@ -224,11 +227,12 @@ func TestOpenAIStreamingPassthroughBareErrorDrainsAuthoritativeFailedUsage(t *te
 	require.Error(t, err)
 	require.NotNil(t, result)
 	body := recorder.Body.String()
-	require.NotContains(t, body, `"type":"error"`)
+	require.Contains(t, body, `"type":"error"`)
 	require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
 	require.Contains(t, body, `"id":"resp_failed"`)
 	require.NotContains(t, body, "[DONE]")
-	require.Equal(t, []int{len(body)}, writer.flushBodyLengths)
+	require.Equal(t, len(errorEvent), writer.flushBodyLengths[0])
+	require.Equal(t, len(body), writer.flushBodyLengths[len(writer.flushBodyLengths)-1])
 	require.Equal(t, 9, result.usage.InputTokens)
 	require.Equal(t, 2, result.usage.OutputTokens)
 }

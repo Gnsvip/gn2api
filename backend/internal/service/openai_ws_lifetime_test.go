@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func ageOpenAIWSPoolForLifetimeTest(pool *openAIWSConnPool, accountID int64, age time.Duration) {
@@ -238,6 +239,11 @@ func TestOpenAIWSIngressLifetimeRotation(t *testing.T) {
 				ageOpenAIWSPoolForLifetimeTest(pool, a.ID, 59*time.Minute)
 			}
 			write(`{"type":"response.create","model":"gpt-6-astra","store":false,"reasoning":{"effort":"xhigh"},"previous_response_id":"resp_one","input":[` + autoContinuationTool + `]}`)
+			if mode == "upstream_error" {
+				require.Equal(t, "websocket_connection_limit_reached", gjson.GetBytes(read(), "error.code").String())
+				require.Equal(t, 1, dialer.DialCount(), "the expired response cannot be replayed silently")
+				write(`{"type":"response.create","model":"gpt-6-astra","store":false,"reasoning":{"effort":"xhigh"},"previous_response_id":"resp_one","input":[` + autoContinuationTool + `]}`)
+			}
 			if mode == "after_output" {
 				require.Equal(t, "partial", gjson.GetBytes(read(), "delta").String())
 				require.Equal(t, "websocket_connection_limit_reached", gjson.GetBytes(read(), "error.code").String())
@@ -253,11 +259,7 @@ func TestOpenAIWSIngressLifetimeRotation(t *testing.T) {
 			}
 			select {
 			case err := <-done:
-				if mode == "after_output" {
-					require.Error(t, err)
-				} else {
-					require.NoError(t, err)
-				}
+				require.NoError(t, err)
 			case <-ctx.Done():
 				t.Fatal("ingress did not stop")
 			}
@@ -275,7 +277,11 @@ func TestOpenAIWSIngressLifetimeRotation(t *testing.T) {
 			require.Equal(t, "preserve this instruction", gjson.Get(raw, "instructions").String())
 			require.Equal(t, "lookup", gjson.Get(raw, "tools.0.name").String())
 			require.Len(t, gjson.Get(raw, "input").Array(), 5, "user + reasoning + assistant answer + tool call + tool result must survive")
-			require.JSONEq(t, reasoning, gjson.Get(raw, "input.1").Raw)
+			expectedReasoning := reasoning
+			if mode == "upstream_error" {
+				expectedReasoning, _ = sjson.Delete(reasoning, "id")
+			}
+			require.JSONEq(t, expectedReasoning, gjson.Get(raw, "input.1").Raw)
 			require.Equal(t, "assistant", gjson.Get(raw, "input.2.role").String())
 			require.Equal(t, "call_lookup", gjson.Get(raw, "input.3.call_id").String())
 			require.Equal(t, "call_lookup", gjson.Get(raw, "input.4.call_id").String())

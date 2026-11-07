@@ -4,7 +4,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -14,11 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestOpenAIResponsesEmptyCompletedFailsOver verifies that a Responses stream
-// ending with an empty response.completed (no output, no usage, no error) is
-// turned into a failover error instead of a successful empty reply (issue
-// #5009).
-func TestOpenAIResponsesEmptyCompletedFailsOver(t *testing.T) {
+// An empty terminal is still forwarded. The gateway must not hide and replay
+// an upstream response after its created event has reached the client.
+func TestOpenAIResponsesEmptyCompletedIsDelivered(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
@@ -41,11 +38,9 @@ func TestOpenAIResponsesEmptyCompletedFailsOver(t *testing.T) {
 	}`)
 
 	_, err := svc.Forward(context.Background(), c, account, body)
-	require.Error(t, err)
-	var failoverErr *UpstreamFailoverError
-	require.True(t, errors.As(err, &failoverErr), "empty completed must produce UpstreamFailoverError, got: %v", err)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.Empty(t, recorder.Body.String(), "no empty success stream may reach the client")
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), "response.created")
+	require.Contains(t, recorder.Body.String(), "response.completed", "forward the authoritative terminal without generating a second response")
 }
 
 // TestOpenAIResponsesEmptyCompletedWithOutputSucceeds ensures streams with real
@@ -167,11 +162,11 @@ func TestOpenAIResponsesCompletedEventIsEmpty(t *testing.T) {
 	}
 }
 
-// TestOpenAIResponsesEmptyCompletedFailsOverGrok verifies that Grok platform
+// TestOpenAIResponsesEmptyCompletedIsDeliveredGrok verifies that Grok platform
 // accounts — which reach the stream relay through forwardGrokResponses instead
 // of the passthrough path — get the same #5009 silent-refusal failover for an
 // empty response.completed (issue #7774).
-func TestOpenAIResponsesEmptyCompletedFailsOverGrok(t *testing.T) {
+func TestOpenAIResponsesEmptyCompletedIsDeliveredGrok(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
@@ -194,11 +189,9 @@ func TestOpenAIResponsesEmptyCompletedFailsOverGrok(t *testing.T) {
 	}`)
 
 	_, err := svc.Forward(context.Background(), c, account, body)
-	require.Error(t, err)
-	var failoverErr *UpstreamFailoverError
-	require.True(t, errors.As(err, &failoverErr), "empty completed must produce UpstreamFailoverError, got: %v", err)
-	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
-	require.Empty(t, recorder.Body.String(), "no empty success stream may reach the client")
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), "response.created")
+	require.Contains(t, recorder.Body.String(), "response.completed", "forward the authoritative terminal without generating a second response")
 }
 
 // TestOpenAIResponsesEmptyCompletedWithOutputSucceedsGrok ensures normal Grok

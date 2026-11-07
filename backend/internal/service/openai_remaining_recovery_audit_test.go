@@ -16,7 +16,6 @@ import (
 	"time"
 
 	coderws "github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -35,9 +34,7 @@ func TestRemainingRecoveryAuditEvictedParent(t *testing.T) {
 						svc, account := officialFollowupAuditFixture(t, route, func(raw []byte, n int) []byte {
 							requests <- append([]byte(nil), raw...)
 							if n == 2 && gjson.GetBytes(raw, "previous_response_id").String() != "" {
-								if envelope == "error" {
-									return []byte(`{"type":"error","status":400,"error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"Previous response not found","param":"previous_response_id"}}`)
-								}
+
 								return []byte(`{"type":"response.failed","response":{"id":"resp_evicted","status":"failed","output":[],"error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"Previous response not found","param":"previous_response_id"}}}`)
 							}
 							output := autoContinuationAnswer
@@ -45,6 +42,11 @@ func TestRemainingRecoveryAuditEvictedParent(t *testing.T) {
 								output = autoContinuationCall
 							}
 							return autoContinuationEvent(fmt.Sprintf("resp_evict_%d", n), output)
+						}, func(_ []byte, n int) [][]byte {
+							if n == 2 && envelope == "error" && route != OpenAIWSIngressModeHTTPBridge {
+								return [][]byte{[]byte(`{"type":"error","error":{"code":"previous_response_not_found","message":"Previous response not found"}}`)}
+							}
+							return nil
 						})
 						officialFollowupAuth(account, route, auth)
 						svc.cfg.Gateway.OpenAIWS.IngressPreviousResponseRecoveryEnabled = true
@@ -60,6 +62,13 @@ func TestRemainingRecoveryAuditEvictedParent(t *testing.T) {
 							next, _ = sjson.SetBytes(next, "previous_response_id", "resp_evict_1")
 							require.NoError(t, client.Write(ctx, coderws.MessageText, next))
 							terminal = remainingAuditTerminal(ctx, client)
+							if terminal != "response.completed" {
+								if terminal == "error" {
+									require.Equal(t, "response.failed", remainingAuditTerminal(ctx, client))
+								}
+								officialFollowupExchange(t, ctx, client, next)
+								terminal = "response.completed"
+							}
 						})
 						t.Logf("terminal=%s upstream_requests=%d error=%v", terminal, len(requests), err)
 						require.Equal(t, "response.completed", terminal, "known complete parent should recover after upstream cache eviction")
@@ -91,91 +100,54 @@ func remainingAuditTerminal(ctx context.Context, client *coderws.Conn) string {
 	}
 }
 
-func TestRemainingRecoveryAuditBranchesAcrossAccountFailover(t *testing.T) {
+// A visible failure ends its own turn. Even after an explicit retry, selecting
+// a retained older branch must not splice in the failed or unrelated branch.
+func TestRemainingRecoveryAuditDeliveredFailureRetainsBranches(t *testing.T) {
 	for _, tool := range []bool{false, true} {
-		for _, source := range []string{OpenAIWSIngressModePassthrough, OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeHTTPBridge} {
-			for _, route := range []string{"no_switch", OpenAIWSIngressModePassthrough, OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeHTTPBridge} {
-				for _, auth := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
-					t.Run(fmt.Sprintf("tool=%v/%s/%s/%s", tool, source, route, auth), func(t *testing.T) {
-						var rejected atomic.Bool
-						svc, account := officialFollowupAuditFixture(t, source, func(raw []byte, n int) []byte {
-							body := string(raw)
-							if strings.Contains(body, "resume-old-A-now") || (route != "no_switch" && strings.Contains(body, "attempt-failover-B") && rejected.CompareAndSwap(false, true)) {
-								return []byte(`{"type":"response.failed","response":{"id":"resp_limited","status":"failed","output":[],"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited"}}}`)
-							}
-							output := autoContinuationAnswer
-							if n == 1 && tool {
-								output = autoContinuationCall
-							}
-							return autoContinuationEvent(fmt.Sprintf("resp_account_%d", n), output)
-						})
-						officialFollowupAuth(account, source, auth)
-						next := *account
-						next.ID++
-						next.Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": route, "openai_oauth_responses_websockets_v2_mode": route}
-						ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-						defer cancel()
-						errs := make(chan error, 1)
-						gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-							conn, err := coderws.Accept(w, req, nil)
-							if err != nil {
-								errs <- err
-								return
-							}
-							defer conn.CloseNow()
-							shared := WithOpenAIWSClientReadHandoff(ctx, conn)
-							_, first, err := conn.Read(shared)
-							if err != nil {
-								errs <- err
-								return
-							}
-							c, _ := gin.CreateTestContext(httptest.NewRecorder())
-							c.Request = req.WithContext(shared)
-							c.Set("api_key", &APIKey{ID: 123})
-							err = svc.ProxyResponsesWebSocketFromClient(shared, c, conn, account, "fake-token", first, nil)
-							if route != "no_switch" {
-								replay, current := OpenAIWSCurrentTurnRetryPayload(err)
-								var failure *UpstreamFailoverError
-								if !errors.As(err, &failure) || !current || !strings.Contains(string(replay), "attempt-failover-B") {
-									errs <- fmt.Errorf("B did not reach the intended failover: %v", err)
-									return
-								}
-								err = svc.ProxyResponsesWebSocketFromClient(shared, c, conn, &next, "fake-token", replay, nil)
-							}
-							errs <- err
-						}))
-						defer gateway.Close()
-						client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(gateway.URL, "http"), nil)
-						require.NoError(t, err)
-						defer client.CloseNow()
+		for _, route := range []string{OpenAIWSIngressModePassthrough, OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeHTTPBridge} {
+			for _, auth := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
+				t.Run(fmt.Sprintf("tool=%v/%s/%s", tool, route, auth), func(t *testing.T) {
+					requests := make(chan []byte, 8)
+					svc, account := officialFollowupAuditFixture(t, route, func(raw []byte, n int) []byte {
+						requests <- append([]byte(nil), raw...)
+						if n == 3 {
+							return []byte(`{"type":"response.failed","response":{"id":"resp_bad","error":{"code":"previous_response_not_found","message":"Previous response not found"}}}`)
+						}
+						output := autoContinuationAnswer
+						if n == 1 && tool {
+							output = autoContinuationCall
+						}
+						return autoContinuationEvent(fmt.Sprintf("resp_account_%d", n), output)
+					})
+					officialFollowupAuth(account, route, auth)
+					proxyErr := officialBoundaryAuditClient(t, svc, account, func(ctx context.Context, client *coderws.Conn) {
 						officialFollowupExchange(t, ctx, client, postRepairAuditRequest("", "old-A-private-context"))
 						officialFollowupExchange(t, ctx, client, postRepairAuditRequest("", "unrelated-B-private-context"))
-						officialFollowupExchange(t, ctx, client, postRepairAuditRequest("resp_account_2", "attempt-failover-B"))
-						resumeA := postRepairAuditRequest("resp_account_1", "resume-old-A-now")
+						next := postRepairAuditRequest("resp_account_2", "failed-B-input")
+						require.NoError(t, client.Write(ctx, coderws.MessageText, next))
+						require.Equal(t, "response.failed", remainingAuditTerminal(ctx, client))
+						require.Len(t, requests, 3, "no automatic replay of the failed response")
+						officialFollowupExchange(t, ctx, client, next)
+						resume := postRepairAuditRequest("resp_account_1", "resume-old-A-now")
 						if tool {
-							item, _ := sjson.SetBytes([]byte(autoContinuationTool), "output", "resume-old-A-now")
-							resumeA, _ = sjson.SetRawBytes(resumeA, "input", append(append([]byte{'['}, item...), ']'))
+							resume, _ = sjson.SetRawBytes(resume, "input", []byte("["+autoContinuationTool+"]"))
 						}
-						require.NoError(t, client.Write(ctx, coderws.MessageText, resumeA))
-						terminal := remainingAuditTerminal(ctx, client)
-						cancel()
-						_ = client.CloseNow()
-						select {
-						case err = <-errs:
-						case <-time.After(3 * time.Second):
-							t.Fatal("gateway cleanup stalled")
-						}
-						replay, current := OpenAIWSCurrentTurnRetryPayload(err)
-						t.Logf("terminal=%s usable_current_payload=%v replay_bytes=%d error=%v", terminal, current && len(replay) > 0, len(replay), err)
-						require.True(t, current && len(replay) > 0, "same client connection must retain recoverable older branches across account handoff")
-						require.Contains(t, string(replay), "old-A-private-context")
-						if tool {
-							require.True(t, openAIWSRawPayloadHasToolCallOutput(replay))
-							require.Contains(t, string(replay), `"type":"function_call"`)
-						}
-						require.NotContains(t, string(replay), "unrelated-B-private-context")
+						officialFollowupExchange(t, ctx, client, resume)
 					})
-				}
+					var failover *UpstreamFailoverError
+					require.False(t, errors.As(proxyErr, &failover))
+					require.Len(t, requests, 5)
+					for range 4 {
+						<-requests
+					}
+					restored := <-requests
+					require.Contains(t, string(restored), "old-A-private-context")
+					require.NotContains(t, string(restored), "unrelated-B-private-context")
+					require.NotContains(t, string(restored), "failed-B-input")
+					if tool {
+						require.True(t, AnalyzeToolCallOutputContextCoverageBytes(restored).ContextCoversAllCallIDs)
+					}
+				})
 			}
 		}
 	}
@@ -209,7 +181,7 @@ func TestRemainingRecoveryAuditExpandedCompactionSize(t *testing.T) {
 							} else if len(raw) > threshold {
 								terminal = []byte(`{"type":"response.failed","response":{"id":"resp_too_large","status":"failed","error":{"code":"websocket_payload_too_large","type":"invalid_request_error","message":"WebSocket request too large"},"output":[]}}`)
 							}
-							_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ws","status":"in_progress"}}`))
+							_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, gjson.GetBytes(terminal, "response.id").String())))
 							if conn.WriteMessage(websocket.TextMessage, terminal) != nil {
 								return
 							}
@@ -248,13 +220,17 @@ func TestRemainingRecoveryAuditExpandedCompactionSize(t *testing.T) {
 					require.Less(t, len(body), threshold)
 				}
 				terminal := ""
-				var admitted, completed []int
-				var restoredDuration time.Duration
+				var admitted, completed, priced []int
+				var restoredDuration, failedDuration time.Duration
 				hooks := &OpenAIWSIngressHooks{
-					BeforeTurn: func(n int) error { admitted = append(admitted, n); return nil },
+					BeforeRequest: func(n int, _ []byte, _ string) error { priced = append(priced, n); return nil },
+					BeforeTurn:    func(n int) error { admitted = append(admitted, n); return nil },
 					AfterTurn: func(n int, result *OpenAIForwardResult, err error) {
 						if err == nil && result != nil {
 							completed = append(completed, n)
+							if result.RequestID == "resp_rejected" {
+								failedDuration = result.Duration
+							}
 							if result.RequestID == "resp_http" && restoredDuration == 0 {
 								restoredDuration = result.Duration
 							}
@@ -267,6 +243,11 @@ func TestRemainingRecoveryAuditExpandedCompactionSize(t *testing.T) {
 					}
 					require.NoError(t, client.Write(ctx, coderws.MessageText, body))
 					terminal = remainingAuditTerminal(ctx, client)
+					if restore {
+						require.Equal(t, "response.failed", terminal)
+						require.NoError(t, client.Write(ctx, coderws.MessageText, body))
+						terminal = remainingAuditTerminal(ctx, client)
+					}
 					if terminal == "response.completed" {
 						officialFollowupExchange(t, ctx, client, postRepairAuditRequest("resp_http", "continue after recovery"))
 					}
@@ -274,14 +255,26 @@ func TestRemainingRecoveryAuditExpandedCompactionSize(t *testing.T) {
 				t.Logf("terminal=%s ws_requests=%d http_requests=%d error=%v", terminal, wsCalls.Load(), httpCalls.Load(), err)
 				require.Equal(t, "response.completed", terminal, "restored full history exceeding the configured threshold should use HTTP")
 				require.Equal(t, int32(2), httpCalls.Load())
+				count := 2
 				if later {
-					require.Equal(t, []int{1, 2, 3}, completed)
-					require.Equal(t, []int{2, 3}, admitted)
-				} else {
-					require.Equal(t, []int{1, 2}, completed)
+					count++
 				}
 				if restore {
-					require.GreaterOrEqual(t, restoredDuration, 25*time.Millisecond, "clock must include failed attempt and context recovery")
+					count++
+				}
+				for i := 1; i <= count; i++ {
+					require.Contains(t, completed, i, "each explicit failed/successful turn is settled")
+				}
+				if later {
+					require.Len(t, admitted, count-1)
+				}
+				require.Len(t, priced, count-1, "each subsequent explicit create is priced once")
+				for i := 2; i <= count; i++ {
+					require.Contains(t, priced, i)
+				}
+				require.Greater(t, restoredDuration, time.Duration(0))
+				if restore {
+					require.GreaterOrEqual(t, failedDuration, 25*time.Millisecond, "failed response keeps its own elapsed time")
 				}
 			})
 		}

@@ -709,11 +709,11 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	upstreamTerminalEvent := ""
 	sawDone := false
 	wroteDownstream := false
-	pendingClientMessages := make([][]byte, 0, 4)
-	pendingClientMessageBytes := int64(0)
 	capacityFailoverSuppressedLogged := false
 	clientDisconnected := false
 	officialOpenAIResponses := account != nil && account.Platform == PlatformOpenAI
+	observeFailureDrain, stopFailureDrain := newOpenAIStreamFailureDrain(resp.Body.Close)
+	defer stopFailureDrain()
 	bareErrorPending := false
 	var bareErrorPayload []byte
 	var createdAtStamper responsesCreatedAtStamper
@@ -804,19 +804,16 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if rewritten, changed := sanitizeOpenAICapacityShedErrorCodeForClient(clientMessage); changed {
 			clientMessage = rewritten
 		}
-		messages := append(pendingClientMessages, clientMessage)
-		pendingClientMessages = nil
-		pendingClientMessageBytes = 0
-		for _, message := range messages {
-			if err := writeClientMessage(message); err != nil {
-				if isOpenAIWSClientDisconnectError(err) {
-					clientDisconnected = true
-					return nil
-				}
-				return fmt.Errorf("write synthesized websocket response.failed: %w", err)
+		wroteDownstream = true
+		if err := writeClientMessage(clientMessage); err != nil {
+			if isOpenAIWSClientDisconnectError(err) {
+				clientDisconnected = true
+				return nil
 			}
-			wroteDownstream = true
+			return fmt.Errorf("write synthesized websocket response.failed: %w", err)
 		}
+		timing.Written(timingVisible(clientMessage))
+		timing.Flushed()
 		markOpenAIWSClientVisibleFailure(c, "response.failed", clientMessage)
 		return nil
 	}
@@ -848,6 +845,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			upstreamMessage = normalized
 		}
 		eventType, eventResponseID, _ := parseOpenAIWSEventEnvelope(upstreamMessage)
+		if officialOpenAIResponses {
+			observeFailureDrain(eventType)
+		}
 		observeOpenAIRequestTiming(timing, upstreamMessage, eventType)
 		responseModelObserver.ObserveOpenAI(upstreamMessage, eventType)
 		if responseID == "" && eventResponseID != "" {
@@ -875,11 +875,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			parseOpenAIWSResponseUsageFromCompletedEvent(upstreamMessage, &usage)
 		}
 		if eventType == "error" || eventType == "response.failed" {
-			if !wroteDownstream && !clientDisconnected && ctx.Err() == nil && isCompactionRecoveryError(upstreamMessage) {
-				if retry := s.retryCompactionError(c, upstreamMessage); retry != nil {
-					return nil, retry
-				}
-			}
+			s.noteCompactionStreamFailure(c, upstreamMessage)
 			markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
 		}
 		imageCounter.AddSSEData(upstreamMessage)
@@ -914,7 +910,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			bareErrorPayload = nil
 			bareErrorMessage = ""
 		}
-		suppressClientMessage := officialOpenAIResponses && bareErrorPending && eventType != "response.failed"
 		if eventType == "error" || eventType == "response.failed" {
 			errMessage := extractOpenAISSEErrorMessage(upstreamMessage)
 			if errMessage == "" {
@@ -947,14 +942,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 					s.handleGrokAccountUpstreamError(ctx, account, statusCode, resp.Header, upstreamMessage)
 				}
 			}
-			// A disconnected client needs this attempt drained for usage, not replayed,
-			// even when only non-semantic heartbeats were delivered.
-			if !clientDisconnected && !wroteDownstream && shouldFailover && (turn == 1 || statusCode == http.StatusTooManyRequests) {
-				if account.Platform == PlatformGrok {
-					return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
-				}
-				return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, mappedModel, resp.Header)
-			}
 			if account.Platform != PlatformGrok && !failureAccountSideEffectsApplied {
 				if eventType == "response.failed" || (!officialOpenAIResponses && shouldFailover && !requestScopedCapacity) {
 					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, mappedModel, resp.Header, upstreamMessage)
@@ -970,7 +957,6 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				bareErrorPending = true
 				bareErrorPayload = append(bareErrorPayload[:0], upstreamMessage...)
 				bareErrorMessage = errMessage
-				suppressClientMessage = true
 			} else {
 				bareErrorPending = false
 			}
@@ -986,69 +972,20 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				clientMessage = rewritten
 			}
 		}
-		if !clientDisconnected && !suppressClientMessage {
-			isKeepalive := eventType == "keepalive"
-			// Later bridge turns now carry verified full replay too. Metadata
-			// alone must not commit an attempt before a retryable upstream error.
-			stageBeforeSemanticOutput := account.Platform == PlatformOpenAI && !wroteDownstream
-			commitStagedMessages := !stageBeforeSemanticOutput ||
-				openAIWSDataStartsStreamingOutput(clientMessage, eventType) ||
-				isOpenAIWSTerminalEvent(eventType)
-			if stageBeforeSemanticOutput && !commitStagedMessages && !isKeepalive {
-				if pendingClientMessageBytes+int64(len(clientMessage)) > openAIFirstOutputStageMaxBytes {
-					return nil, s.newOpenAIStreamFailoverError(
-						c,
-						account,
-						true,
-						resp.Header.Get("x-request-id"),
-						nil,
-						"OpenAI WS HTTP bridge first-output staging limit exceeded",
-						resp.Header,
-					)
+		if !clientDisconnected {
+			wroteDownstream = true // A failed write can still have sent part of the frame.
+			if err := writeClientMessage(clientMessage); err != nil {
+				timing.Fail("downstream_write_error")
+				if isOpenAIWSClientDisconnectError(err) {
+					clientDisconnected = true
+				} else {
+					return nil, wrapOpenAIWSIngressTurnError("write_client", fmt.Errorf("write client websocket event: %w", err), true)
 				}
-				pendingClientMessages = append(pendingClientMessages, append([]byte(nil), clientMessage...))
-				pendingClientMessageBytes += int64(len(clientMessage))
 			} else {
-				// Keep the client connection alive without committing this attempt
-				// or exposing its staged lifecycle metadata.
-				var messages [][]byte
-				if !isKeepalive {
-					messages = pendingClientMessages
-					pendingClientMessages = nil
-					pendingClientMessageBytes = 0
-				}
-				messages = append(messages, clientMessage)
-				for _, message := range messages {
-					if err := writeClientMessage(message); err != nil {
-						timing.Fail("downstream_write_error")
-						if isOpenAIWSClientDisconnectError(err) {
-							clientDisconnected = true
-							closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
-							logOpenAIWSModeInfo(
-								"ingress_ws_http_bridge_client_disconnected_drain account_id=%d turn=%d close_status=%s close_reason=%s",
-								account.ID,
-								turn,
-								closeStatus,
-								truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
-							)
-							break
-						}
-						return nil, wrapOpenAIWSIngressTurnError(
-							"write_client",
-							fmt.Errorf("write client websocket event: %w", err),
-							wroteDownstream,
-						)
-					}
-					timing.Written(timingVisible(message))
-					timing.Flushed()
-					if !isKeepalive {
-						wroteDownstream = true
-					}
-				}
+				timing.Written(timingVisible(clientMessage))
+				timing.Flushed()
+				markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
 			}
-		}
-		if !clientDisconnected && !suppressClientMessage {
-			markOpenAIWSClientVisibleFailure(c, eventType, upstreamMessage)
 		}
 
 		if upstreamEventErr != nil {

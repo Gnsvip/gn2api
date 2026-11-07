@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -537,16 +538,15 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	if needModelReplace && mappedModel != "" {
 		mappedModelBytes = []byte(mappedModel)
 	}
-	bufferedStreamEvents := make([][]byte, 0, 4)
-	bufferedStreamBytes := 0
 	eventCount := 0
 	tokenEventCount := 0
 	terminalEventCount := 0
-	bufferedEventCount := 0
-	flushedBufferedEventCount := 0
 	firstEventType := ""
 	lastEventType := ""
 	upstreamTerminalEvent := ""
+	var bareErrorPayload []byte
+	var failureDrainUntil time.Time
+	bareErrorMessage := ""
 	clientDisconnected := false
 	defer func() {
 		if clientDisconnected {
@@ -565,7 +565,6 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return
 		}
 		clientDisconnected = true
-		bufferedStreamEvents, bufferedStreamBytes = nil, 0
 		clientDisconnectDrainStartedAt = time.Now()
 		if !upstreamReadDetached {
 			upstreamReadCtx = context.WithoutCancel(ctx)
@@ -624,25 +623,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		flusher = f
 	}
 
-	flushBatchSize := s.openAIWSEventFlushBatchSize()
-	flushInterval := s.openAIWSEventFlushInterval()
-	pendingFlushEvents := 0
-	lastFlushAt := time.Now()
-	flushStreamWriter := func(force bool) {
-		if clientDisconnected || flusher == nil || pendingFlushEvents <= 0 {
-			return
-		}
-		if !force && flushBatchSize > 1 && pendingFlushEvents < flushBatchSize {
-			if flushInterval <= 0 || time.Since(lastFlushAt) < flushInterval {
-				return
-			}
-		}
-		flusher.Flush()
-		timing.Flushed()
-		pendingFlushEvents = 0
-		lastFlushAt = time.Now()
-	}
-	emitStreamMessage := func(message []byte, forceFlush bool) {
+	emitStreamMessage := func(message []byte) {
 		if clientDisconnected {
 			return
 		}
@@ -655,38 +636,22 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		_, wErr := c.Writer.Write(frame)
 		if wErr == nil {
 			timing.Written(timingVisible(message))
-			pendingFlushEvents++
-			flushStreamWriter(forceFlush)
+			flusher.Flush()
+			timing.Flushed()
 			return
 		}
 		timing.Fail("downstream_write_error")
 		markClientDisconnected("downstream_write_error")
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI WS Mode] client disconnected, continue draining upstream: account=%d", account.ID)
 	}
-	flushBufferedStreamEvents := func(reason string) {
-		if len(bufferedStreamEvents) == 0 {
+
+	failStream := func(code, message string) {
+		if !reqStream || !wroteDownstream || clientDisconnected {
 			return
 		}
-		flushed := len(bufferedStreamEvents)
-		pending := bufferedStreamEvents
-		bufferedStreamEvents, bufferedStreamBytes = nil, 0
-		for i, buffered := range pending {
-			pending[i] = nil
-			emitStreamMessage(buffered, false)
-		}
-		flushStreamWriter(true)
-		flushedBufferedEventCount += flushed
-		if debugEnabled {
-			logOpenAIWSModeDebug(
-				"buffer_flush account_id=%d conn_id=%s reason=%s flushed=%d total_flushed=%d client_disconnected=%v",
-				account.ID,
-				connID,
-				truncateOpenAIWSLogValue(reason, openAIWSLogValueMaxLen),
-				flushed,
-				flushedBufferedEventCount,
-				clientDisconnected,
-			)
-		}
+		payload := []byte(`{"error":{"code":` + strconv.Quote(code) + `,"message":` + strconv.Quote(message) + `}}`)
+		emitStreamMessage(buildOpenAIWSHTTPBridgeFailedEvent(responseID, originalModel, 0, payload, message))
+		MarkResponseCommitted(c)
 	}
 
 	// Keep per-read timeouts unchanged for connected clients. Once a client
@@ -704,6 +669,12 @@ readLoop:
 			pendingJSONDocuments = pendingJSONDocuments[1:]
 		} else {
 			currentReadTimeout := readTimeout
+			if !failureDrainUntil.IsZero() {
+				currentReadTimeout = min(currentReadTimeout, time.Until(failureDrainUntil))
+				if currentReadTimeout <= 0 {
+					currentReadTimeout = time.Nanosecond
+				}
+			}
 			if clientDisconnected && !clientDisconnectDrainStartedAt.IsZero() {
 				remaining := readTimeout - time.Since(clientDisconnectDrainStartedAt)
 				if remaining <= 0 {
@@ -747,14 +718,15 @@ readLoop:
 			if !wroteDownstream {
 				return nil, wrapOpenAIWSFallback("invalid_event_json", errors.New("upstream websocket returned malformed Responses event JSON"))
 			}
-			return nil, errors.New("upstream websocket returned malformed Responses event JSON after downstream output")
+			failStream("upstream_protocol_error", "Upstream returned malformed event JSON")
+			return resultWithUsage(), errors.New("upstream websocket returned malformed Responses event JSON after downstream output")
 		}
 		if readErr != nil {
 			lease.MarkBroken()
 			opaquePolicyClose := !clientDisconnected && ctx.Err() == nil && s.recordOpenAIWSOpaquePolicyClose(c, readErr)
 			closeStatus, closeReason := summarizeOpenAIWSReadCloseError(readErr)
 			logOpenAIWSModeInfo(
-				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s",
+				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d first_event=%s last_event=%s",
 				account.ID,
 				connID,
 				wroteDownstream,
@@ -764,8 +736,6 @@ readLoop:
 				eventCount,
 				tokenEventCount,
 				terminalEventCount,
-				len(bufferedStreamEvents),
-				flushedBufferedEventCount,
 				truncateOpenAIWSLogValue(firstEventType, openAIWSLogValueMaxLen),
 				truncateOpenAIWSLogValue(lastEventType, openAIWSLogValueMaxLen),
 			)
@@ -781,8 +751,16 @@ readLoop:
 				}
 				return nil, wrapOpenAIWSFallback(classifyOpenAIWSReadFallbackReason(readErr), readErr)
 			}
+			if len(bareErrorPayload) > 0 {
+				failure := buildOpenAIWSHTTPBridgeFailedEvent(responseID, originalModel, 0, bareErrorPayload, bareErrorMessage)
+				emitStreamMessage(failure)
+				markOpenAIWSClientVisibleFailure(c, "response.failed", failure)
+				MarkResponseCommitted(c)
+				return resultWithUsage(), fmt.Errorf("openai ws error event: %s", bareErrorMessage)
+			}
 			setOpsUpstreamError(c, 0, sanitizeUpstreamErrorMessage(readErr.Error()), "")
-			return nil, fmt.Errorf("openai ws read event: %w", readErr)
+			failStream("stream_disconnected", "Upstream disconnected before response completion; reconnect with complete context")
+			return resultWithUsage(), fmt.Errorf("openai ws read event: %w", readErr)
 		}
 		if normalized, changed := normalizeCompletedImageGenerationStatus(message); changed {
 			message = normalized
@@ -792,7 +770,7 @@ readLoop:
 		if eventType == "" {
 			continue
 		}
-		if !wroteDownstream && !clientDisconnected && ctx.Err() == nil && isCompactionRecoveryError(message) {
+		if !reqStream && !wroteDownstream && !clientDisconnected && ctx.Err() == nil && isCompactionRecoveryError(message) {
 			if retry := s.retryCompactionError(c, message); retry != nil {
 				lease.MarkBroken()
 				return nil, retry
@@ -841,7 +819,7 @@ readLoop:
 		}
 		if debugEnabled && shouldLogOpenAIWSEvent(eventCount, eventType) {
 			logOpenAIWSModeDebug(
-				"event_received account_id=%d conn_id=%s idx=%d type=%s bytes=%d token=%v terminal=%v buffered_pending=%d",
+				"event_received account_id=%d conn_id=%s idx=%d type=%s bytes=%d token=%v terminal=%v",
 				account.ID,
 				connID,
 				eventCount,
@@ -849,11 +827,10 @@ readLoop:
 				len(message),
 				isTokenEvent,
 				isTerminalEvent,
-				len(bufferedStreamEvents),
 			)
 		}
 
-		if autoContinuation && !wroteDownstream && !clientDisconnected && ctx.Err() == nil && (eventType == "response.failed" || eventType == "error") {
+		if !reqStream && autoContinuation && !wroteDownstream && !clientDisconnected && ctx.Err() == nil && (eventType == "response.failed" || eventType == "error") {
 			path := "response.error"
 			if eventType == "error" {
 				path = "error"
@@ -886,6 +863,21 @@ readLoop:
 		imageCounter.AddSSEData(message)
 
 		if eventType == "error" || eventType == "response.failed" {
+			s.noteCompactionStreamFailure(c, message)
+			failure := gjson.GetBytes(message, "error")
+			if !failure.IsObject() {
+				failure = gjson.ParseBytes(message)
+			}
+			if eventType == "response.failed" {
+				failure = gjson.GetBytes(message, "response.error")
+			}
+			reason, _ := classifyOpenAIWSErrorEventFromRaw(failure.Get("code").String(), failure.Get("type").String(), failure.Get("message").String())
+			if reason == "previous_response_not_found" || openAIWSIsPersistedContextRejection(failure) || openAIWSCanReplayMissingToolOutput(failure, reqBody) {
+				// Keep this failed response visible; retire its checkpoint for the next create.
+				lease.conn.invalidateCheckpoint("continuation_rejected")
+				defer lease.MarkBroken()
+			}
+
 			markOpenAICyberPolicyEvent(c, message, http.StatusOK, usage)
 		}
 
@@ -936,9 +928,13 @@ readLoop:
 					errMessage,
 				)
 			}
-			// error 事件后连接不再可复用，避免回池后污染下一请求。
-			lease.MarkBroken()
-			if !wroteDownstream && canFallback {
+			// Do not reuse this connection, but drain its terminal/usage before closing it.
+			if reqStream {
+				defer lease.MarkBroken()
+			} else {
+				lease.MarkBroken()
+			}
+			if !reqStream && !wroteDownstream && canFallback {
 				return nil, wrapOpenAIWSFallback(fallbackReason, errors.New(errMsg))
 			}
 			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
@@ -953,18 +949,18 @@ readLoop:
 			if param := gjson.GetBytes(message, "error.param"); param.Exists() {
 				upstreamError["param"] = json.RawMessage(param.Raw)
 			}
-			if reqStream && !clientDisconnected {
-				// HTTP Responses clients need a terminal response.failed, not
-				// a bare WS error followed by the handler's generic 502 fallback.
-				failure, _ := json.Marshal(gin.H{"type": "response.failed", "response": gin.H{
-					"id": responseID, "status": "failed", "error": upstreamError,
-				}})
-				flushBufferedStreamEvents("error_event")
-				emitStreamMessage(failure, true)
-				if !clientDisconnected {
-					markOpenAIWSClientVisibleFailure(c, "response.failed", failure)
-					MarkResponseCommitted(c)
+			if reqStream {
+				// Deliver the error now; do not replace or hide its authoritative
+				// terminal/usage if the upstream sends response.failed next.
+				emitStreamMessage(message)
+				if failureDrainUntil.IsZero() {
+					failureDrainUntil = time.Now().Add(openAIStreamFailureDrainTimeout)
 				}
+				bareErrorPayload = bytes.Clone(message)
+				bareErrorMessage = errMsg
+				markOpenAIWSClientVisibleFailure(c, eventType, message)
+				MarkResponseCommitted(c)
+				continue
 			}
 			if !reqStream {
 				c.JSON(statusCode, gin.H{"error": upstreamError})
@@ -974,37 +970,8 @@ readLoop:
 		}
 
 		if reqStream {
-			// Only retain a bounded preamble for early recovery. Typed progress,
-			// tool completions and deltas must leave before the next read.
-			// Non-Responses vendor notices retain their existing preamble role.
-			startsOutput := isTokenEvent || (strings.HasPrefix(eventType, "response.") && openAIWSDataStartsStreamingOutput(message, eventType))
-			shouldBuffer := !wroteDownstream && !startsOutput && !isTerminalEvent &&
-				len(bufferedStreamEvents) < openAIWSPreambleMaxEvents &&
-				len(message) <= openAIWSPreambleMaxBytes-bufferedStreamBytes
-			if clientDisconnected {
-				// Drain usage without retaining more client frames.
-			} else if shouldBuffer {
-				buffered := make([]byte, len(message))
-				copy(buffered, message)
-				bufferedStreamEvents = append(bufferedStreamEvents, buffered)
-				bufferedStreamBytes += len(buffered)
-				bufferedEventCount++
-				if debugEnabled && shouldLogOpenAIWSBufferedEvent(bufferedEventCount) {
-					logOpenAIWSModeDebug(
-						"buffer_enqueue account_id=%d conn_id=%s idx=%d event_idx=%d event_type=%s buffer_size=%d",
-						account.ID,
-						connID,
-						bufferedEventCount,
-						eventCount,
-						truncateOpenAIWSLogValue(eventType, openAIWSLogValueMaxLen),
-						len(bufferedStreamEvents),
-					)
-				}
-			} else {
-				firstWrite := !wroteDownstream
-				flushBufferedStreamEvents(eventType)
-				emitStreamMessage(message, firstWrite || startsOutput || isTerminalEvent)
-			}
+			// Forward every event before reading the next one, including lifecycle notices.
+			emitStreamMessage(message)
 		} else {
 			if responseField.Exists() && responseField.Type == gjson.JSON {
 				finalResponse = []byte(responseField.Raw)
@@ -1012,6 +979,7 @@ readLoop:
 		}
 
 		if isTerminalEvent {
+			bareErrorPayload = nil
 			if !clientDisconnected {
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
@@ -1057,8 +1025,6 @@ readLoop:
 		}
 
 		c.Data(http.StatusOK, "application/json", finalResponse)
-	} else {
-		flushStreamWriter(true)
 	}
 
 	if responseID != "" && stateStore != nil {
@@ -1096,7 +1062,7 @@ readLoop:
 		firstTokenMsValue = *firstTokenMs
 	}
 	logOpenAIWSModeDebug(
-		"completed account_id=%d conn_id=%s response_id=%s stream=%v duration_ms=%d events=%d token_events=%d terminal_events=%d buffered_events=%d buffered_flushed=%d first_event=%s last_event=%s first_token_ms=%d wrote_downstream=%v client_disconnected=%v",
+		"completed account_id=%d conn_id=%s response_id=%s stream=%v duration_ms=%d events=%d token_events=%d terminal_events=%d first_event=%s last_event=%s first_token_ms=%d wrote_downstream=%v client_disconnected=%v",
 		account.ID,
 		connID,
 		truncateOpenAIWSLogValue(strings.TrimSpace(responseID), openAIWSIDValueMaxLen),
@@ -1105,8 +1071,6 @@ readLoop:
 		eventCount,
 		tokenEventCount,
 		terminalEventCount,
-		bufferedEventCount,
-		flushedBufferedEventCount,
 		truncateOpenAIWSLogValue(firstEventType, openAIWSLogValueMaxLen),
 		truncateOpenAIWSLogValue(lastEventType, openAIWSLogValueMaxLen),
 		firstTokenMsValue,

@@ -223,9 +223,9 @@ func TestOpenAIResponseFlush_BurstDoesNotIncreaseFlushes(t *testing.T) {
 	require.NotNil(t, <-resultCh)
 	gotBody, flushes := recorder.snapshot()
 	require.Equal(t, first+burst, gotBody)
-	require.Len(t, flushes, 2, "queued burst must remain batched until its drained event boundary")
+	require.Len(t, flushes, 4, "each complete event must flush even when another is queued")
 	require.Equal(t, first, flushes[0])
-	require.Equal(t, first+burst, flushes[1])
+	require.Equal(t, first+burst, flushes[3])
 }
 
 func TestOpenAIResponseFlush_CommentAndEOFOnlyFlushCompleteResidual(t *testing.T) {
@@ -270,8 +270,9 @@ func TestOpenAIResponseFlush_OutputWithoutTerminalFlushesResidualWithoutFailover
 	require.False(t, errors.As(err, &failoverErr))
 	require.NotNil(t, result)
 	gotBody, flushes := recorder.snapshot()
-	require.Equal(t, body, gotBody)
-	require.Equal(t, []string{body}, flushes)
+	require.Contains(t, gotBody, body)
+	require.Contains(t, gotBody, "stream_disconnected")
+	require.NotEmpty(t, flushes)
 }
 
 func TestOpenAIResponseFlush_PreambleWithoutTerminalRemainsBufferedForFailover(t *testing.T) {
@@ -281,11 +282,13 @@ func TestOpenAIResponseFlush_PreambleWithoutTerminalRemainsBufferedForFailover(t
 	result, err := runOpenAIResponseFlushTest(recorder, io.NopCloser(strings.NewReader(body)), config.GatewayConfig{})
 
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
+	require.Error(t, err)
+	require.False(t, errors.As(err, &failoverErr))
 	require.NotNil(t, result)
 	gotBody, flushes := recorder.snapshot()
-	require.Empty(t, gotBody)
-	require.Empty(t, flushes)
+	require.Contains(t, gotBody, "response.created")
+	require.Contains(t, gotBody, "stream_disconnected")
+	require.NotEmpty(t, flushes)
 }
 
 func TestOpenAIResponseFlush_CanceledAfterOutputFlushesResidualWithoutErrorEvent(t *testing.T) {
@@ -397,11 +400,11 @@ func TestOpenAIResponseFlush_FailedAndErrorEventsFlushAtBoundaries(t *testing.T)
 		require.Error(t, err)
 		require.NotNil(t, result)
 		gotBody, flushes := recorder.snapshot()
-		require.NotContains(t, gotBody, `"type":"error"`)
+		require.Contains(t, gotBody, `"type":"error"`)
 		require.Equal(t, 1, strings.Count(gotBody, `"type":"response.failed"`))
 		require.Contains(t, gotBody, `"status":"failed"`)
 		require.NotContains(t, gotBody, "[DONE]")
-		require.Len(t, flushes, 1)
+		require.Len(t, flushes, 2)
 	})
 
 	t.Run("bare error forwards following failed and drains terminal usage", func(t *testing.T) {
@@ -418,11 +421,11 @@ func TestOpenAIResponseFlush_FailedAndErrorEventsFlushAtBoundaries(t *testing.T)
 		require.Equal(t, 9, result.usage.InputTokens)
 		require.Equal(t, 2, result.usage.OutputTokens)
 		gotBody, flushes := recorder.snapshot()
-		require.NotContains(t, gotBody, `"type":"error"`)
+		require.Contains(t, gotBody, `"type":"error"`)
 		require.Equal(t, 1, strings.Count(gotBody, `"type":"response.failed"`))
 		require.Contains(t, gotBody, `"id":"resp_failed"`)
 		require.NotContains(t, gotBody, "[DONE]")
-		require.Len(t, flushes, 1)
+		require.Len(t, flushes, 2)
 	})
 
 	t.Run("non-retryable error event flushes at boundary", func(t *testing.T) {
@@ -435,9 +438,9 @@ func TestOpenAIResponseFlush_FailedAndErrorEventsFlushAtBoundaries(t *testing.T)
 		require.Error(t, err)
 		require.NotNil(t, result)
 		gotBody, flushes := recorder.snapshot()
-		require.NotContains(t, gotBody, `"type":"error"`)
+		require.Contains(t, gotBody, `"type":"error"`)
 		require.Equal(t, 1, strings.Count(gotBody, `"type":"response.failed"`))
-		require.Len(t, flushes, 1)
+		require.Len(t, flushes, 2)
 	})
 }
 
@@ -453,7 +456,7 @@ func TestOpenAIResponseFlush_BareErrorFollowedByCompletedUsesCompletedTerminal(t
 	require.Equal(t, 7, result.usage.InputTokens)
 	require.Equal(t, 3, result.usage.OutputTokens)
 	gotBody, _ := recorder.snapshot()
-	require.NotContains(t, gotBody, `"type":"error"`)
+	require.Contains(t, gotBody, `"type":"error"`)
 	require.NotContains(t, gotBody, `"type":"response.failed"`)
 	require.Contains(t, gotBody, `"type":"response.completed"`)
 }
@@ -531,9 +534,9 @@ func TestOpenAIResponseFlush_BareErrorTimeoutSynthesizesFailed(t *testing.T) {
 			}
 			require.NotNil(t, <-resultCh)
 			body, flushes := recorder.snapshot()
-			require.NotContains(t, body, `"type":"error"`)
+			require.Contains(t, body, `"type":"error"`)
 			require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
-			require.Len(t, flushes, 1)
+			require.Len(t, flushes, 2)
 		})
 	}
 }

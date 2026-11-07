@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -140,24 +139,6 @@ func TestCompactionPassthroughRecoveryBoundaries(t *testing.T) {
 			defer client.CloseNow()
 			body, _ = sjson.SetBytes(body, "type", "response.create")
 			require.NoError(t, client.Write(ctx, coderws.MessageText, body))
-			if mode == "redial_401" {
-				select {
-				case err := <-errs:
-					var failover *UpstreamFailoverError
-					require.True(t, errors.As(err, &failover), err)
-					require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
-					payload, current := OpenAIWSCurrentTurnRetryPayload(err)
-					require.True(t, current, "carry the failed current turn to scheduler failover")
-					require.Contains(t, string(payload), "7391")
-					require.NotContains(t, string(payload), "recovery-test-cipher")
-					require.Empty(t, gjson.GetBytes(payload, "previous_response_id").String())
-				case <-ctx.Done():
-					t.Fatal("recovery dial did not finish")
-				}
-				require.Equal(t, int32(2), dials.Load())
-				require.Equal(t, int32(1), calls.Load())
-				return
-			}
 			if mode == "cancel" {
 				select {
 				case <-arrived:
@@ -175,11 +156,7 @@ func TestCompactionPassthroughRecoveryBoundaries(t *testing.T) {
 					created++
 				}
 				if kind == "response.completed" || kind == "response.failed" {
-					if mode == "recover" {
-						require.Equal(t, "response.completed", kind)
-					} else {
-						require.Equal(t, "response.failed", kind)
-					}
+					require.Equal(t, "response.failed", kind)
 					break
 				}
 			}
@@ -189,19 +166,12 @@ func TestCompactionPassthroughRecoveryBoundaries(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("relay did not finish")
 			}
-			want := int32(1)
-			if mode == "recover" || mode == "full_rejected" || mode == "compact_failed" {
-				want = 2
-			}
-			require.Equal(t, want, calls.Load())
-			require.Equal(t, int32(1), settled.Load(), "settle only one admitted turn")
-			if mode == "compact_failed" {
-				require.Equal(t, int32(1), compacts.Load())
-				require.Zero(t, created)
-			} else {
-				require.Zero(t, compacts.Load())
-				require.Equal(t, 1, created, "discard the rejected attempt's preamble")
-			}
+			require.EqualValues(t, 1, calls.Load(), "delivered rejection is terminal for this create")
+			require.EqualValues(t, 1, dials.Load(), "no hidden redial, including a potential 401")
+			require.EqualValues(t, 1, settled.Load())
+			require.Zero(t, compacts.Load(), "no hidden maintenance after a delivered failure")
+			require.Equal(t, 1, created)
+
 			if mode == "recover" {
 				require.GreaterOrEqual(t, duration, 30*time.Millisecond, "recovery must not reset the user's clock")
 			}

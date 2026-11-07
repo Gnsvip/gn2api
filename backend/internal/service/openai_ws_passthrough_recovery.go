@@ -35,8 +35,6 @@ type openAIWSPassthroughRecovery struct {
 	retainedBytes   int64
 	outputs         openAIWSToolCallReplayCollector
 	outputShape     openAIWSContinuationOutputCollector
-	preamble        [][]byte
-	preambleBytes   int
 }
 
 func (r *openAIWSPassthroughRecovery) begin(payload []byte, model string) {
@@ -52,7 +50,6 @@ func (r *openAIWSPassthroughRecovery) begin(payload []byte, model string) {
 	r.active, r.committed, r.contentObserved = true, false, false
 	r.compaction = HasCompactionTriggerInInput(payload)
 	r.outputs, r.outputShape = openAIWSToolCallReplayCollector{}, openAIWSContinuationOutputCollector{}
-	r.preamble, r.preambleBytes = nil, 0
 	r.retainedBytes = int64(len(r.metadata))
 	for _, item := range input {
 		r.retainedBytes += int64(len(item))
@@ -132,8 +129,8 @@ func (r *openAIWSPassthroughRecovery) failover(cause error) error {
 	return newOpenAIWSCurrentTurnFailoverError(cause, payload)
 }
 
-// Buffer only the pre-output envelope. Exceeding either bound flushes it and
-// commits this attempt, so a noisy upstream cannot grow the buffer indefinitely.
+// Forward every frame immediately. Once a write is attempted this response
+// cannot be replayed, even if the write fails after sending only part of it.
 func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface {
 	Write(context.Context, coderws.MessageType, []byte) error
 }, typ coderws.MessageType, payload []byte) (bool, error) {
@@ -141,8 +138,20 @@ func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface 
 	defer r.mu.Unlock()
 	event := gjson.GetBytes(payload, "type").String()
 	terminal := openAIStreamEventTypeIsTerminal(event) || event == "error"
-	startsOutput := typ != coderws.MessageText || openAIWSDataStartsStreamingOutput(payload, event)
-	// Observe even buffered empty output-item envelopes: their indices are
+	if event == "error" || event == "response.failed" {
+		failure := gjson.GetBytes(payload, "error")
+		if !failure.IsObject() {
+			failure = gjson.ParseBytes(payload)
+		}
+		if event == "response.failed" {
+			failure = gjson.GetBytes(payload, "response.error")
+		}
+		if failure.Get("code").String() == "previous_response_not_found" || openAIWSIsPersistedContextRejection(failure) {
+			r.parents.detach()
+			r.historyDetached = true
+		}
+	}
+	// Observe empty output-item envelopes: their indices are
 	// needed to prove that the completed transcript has no missing items.
 	if r.active && typ == coderws.MessageText {
 		if !terminal && openAIWSDataStartsTTFT(payload, event) {
@@ -161,20 +170,7 @@ func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface 
 			}
 		}
 	}
-	if r.active && r.complete && !r.committed && !terminal && !startsOutput && len(r.preamble) < openAIWSPreambleMaxEvents && len(payload) <= openAIWSPreambleMaxBytes-r.preambleBytes {
-		r.preamble = append(r.preamble, bytes.Clone(payload))
-		r.preambleBytes += len(payload)
-		return false, nil
-	}
 	r.committed = true // A failed write may have partially reached the client.
-	pending := r.preamble
-	r.preamble, r.preambleBytes = nil, 0
-	for i, frame := range pending {
-		pending[i] = nil
-		if err := conn.Write(ctx, coderws.MessageText, frame); err != nil {
-			return false, err
-		}
-	}
 	if err := conn.Write(ctx, typ, payload); err != nil {
 		return false, err
 	}

@@ -54,9 +54,7 @@ func TestRemainingRecoveryRepairParentRetryGuards(t *testing.T) {
 				})
 				require.Equal(t, envelope, terminal)
 				want := int32(2)
-				if scenario == "repeated_error" {
-					want = 3
-				}
+
 				require.Equal(t, want, calls.Load(), "replay is bounded and must not duplicate committed output")
 			})
 		}

@@ -323,6 +323,36 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 	return next, true
 }
 
+// Remember rejected summaries for the client's next request, without replaying
+// an event that has already been delivered. Restoration still verifies the
+// complete compacted window and preserves every new input item.
+func (s *OpenAIGatewayService) noteCompactionStreamFailure(c *gin.Context, data []byte) {
+	if isInternalRecoveryCompact(c) {
+		s.retryCompactionError(c, data) // record the internal maintenance failure only
+		return
+	}
+	t := compactionRecoveryTurn(c)
+	if t == nil || t.scope == "" || !isCompactionCipherError(data) {
+		return
+	}
+	store := s.compactionRecoveryStore()
+	for _, item := range gjson.GetBytes(t.body, "input").Array() {
+		if !isOpenAICompactionType(item.Get("type").String()) {
+			continue
+		}
+		cipher := item.Get("encrypted_content").String()
+		if cipher == "" {
+			continue
+		}
+		key := t.scope + ":" + openAIEncryptedContentDigest(cipher)
+		store.mu.Lock()
+		if entry := store.entries[key]; entry != nil {
+			entry.invalid = true
+		}
+		store.mu.Unlock()
+	}
+}
+
 type openAICompactionRecoveryTurn struct {
 	maintenanceModel     string // effective channel model for internal compaction
 	maintenanceReasoning []byte // effective outbound settings, separate from replay's client settings

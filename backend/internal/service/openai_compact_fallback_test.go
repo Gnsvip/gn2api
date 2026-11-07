@@ -413,12 +413,12 @@ func TestOpenAIGatewayForwardRetriesStreamingCompactFailureBeforeOutput(t *testi
 
 	result, err := svc.Forward(context.Background(), c, account, body)
 
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Len(t, upstream.bodies, 2)
-	require.Equal(t, "gpt-5.4", gjson.GetBytes(upstream.bodies[1], "model").String())
-	require.NotContains(t, recorder.Body.String(), "context_length_exceeded")
-	require.Contains(t, recorder.Body.String(), "response.completed")
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Len(t, upstream.bodies, 1)
+	require.Equal(t, "gpt-5.5", gjson.GetBytes(upstream.bodies[0], "model").String())
+	require.Contains(t, recorder.Body.String(), "context_length_exceeded")
+	require.Contains(t, recorder.Body.String(), "response.failed")
 }
 
 func TestOpenAIGatewayForwardDoesNotRecurseWhenCompactFallbackAlsoFails(t *testing.T) {
@@ -502,20 +502,17 @@ func TestOpenAIPassthroughCompactFallbackSecondStreamFailureUsesStandardErrorPat
 
 	require.Error(t, err)
 	require.Nil(t, result)
-	require.Len(t, upstream.bodies, 2)
+	require.Len(t, upstream.bodies, 1)
 	var compactSignal *openAICompactFallbackSignal
 	require.False(t, errors.As(err, &compactSignal))
-	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "context window exceeded")
 	rawEvents, ok := c.Get(OpsUpstreamErrorsKey)
 	require.True(t, ok)
 	events, ok := rawEvents.([]*OpsUpstreamErrorEvent)
 	require.True(t, ok)
-	require.Len(t, events, 2)
-	require.Equal(t, "retry", events[0].Kind)
-	require.Equal(t, "compact_model_fallback", events[0].Reason)
-	require.Equal(t, "http_error", events[1].Kind)
-	require.True(t, events[1].Passthrough)
+	require.Len(t, events, 1)
+	require.Equal(t, "stream_failed", events[0].Kind)
 	require.Equal(t, proxy.URL(), upstream.lastProxyURL)
 	requireCompactEventsAttributedTo(t, events, proxy)
 }

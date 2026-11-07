@@ -43,11 +43,14 @@ func TestCompactionCrossRouteAudit(t *testing.T) {
 					if effort := gjson.GetBytes(raw, "reasoning.effort").String(); effort != "high" {
 						t.Errorf("generation effort = %q, want high", effort)
 					}
-					switch generations.Add(1) {
+					n := generations.Add(1)
+					switch n {
 					case 1:
-						return []byte(recoveryCipherError)
+						failed, _ := sjson.SetBytes([]byte(recoveryCipherError), "response.id", fmt.Sprintf("resp_rejected_%d", n))
+						return failed
 					case 2:
-						return []byte(recompactLimit)
+						failed, _ := sjson.SetBytes([]byte(recompactLimit), "response.id", fmt.Sprintf("resp_rejected_%d", n))
+						return failed
 					default:
 						return autoContinuationEvent("resp_final", autoContinuationAnswer)
 					}
@@ -168,108 +171,52 @@ func TestCompactionCrossRouteAudit(t *testing.T) {
 				defer client.CloseNow()
 				body, _ = sjson.SetBytes(body, "type", "response.create")
 				require.NoError(t, client.Write(ctx, coderws.MessageText, body))
-				if interruptRedial || scenario == "cancel_before_replay" {
-					select {
-					case <-ready:
-					case <-ctx.Done():
-						t.Fatal("replay did not reach the cancellation gate")
-					}
-					require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.cancel"}`)))
-					reader := <-readers
-					require.Eventually(t, func() bool {
-						reader.mu.Lock()
-						defer reader.mu.Unlock()
-						return reader.pending != nil && len(reader.pending) > 0
-					}, time.Second, time.Millisecond)
-					resume <- struct{}{}
+				// These gates belonged to hidden current-response recovery. None may
+				// execute after the rejected response has been sent to the client.
+				_, failed, readErr := client.Read(ctx)
+				require.NoError(t, readErr)
+				require.Equal(t, "response.failed", gjson.GetBytes(failed, "type").String())
+				require.EqualValues(t, 1, generations.Load())
+				require.Zero(t, maintenance.Load())
+				wantTurns := int32(1)
+				if scenario == "next_turn" || scenario == "reasoning_policy" {
+					require.NoError(t, client.Write(ctx, coderws.MessageText, body))
+					_, failed, readErr = client.Read(ctx)
+					require.NoError(t, readErr)
+					require.Equal(t, "context_length_exceeded", gjson.GetBytes(failed, "response.error.code").String())
+					wantTurns++
+					require.Zero(t, maintenance.Load(), "a delivered context error cannot trigger private generation")
 				}
-				canceledDuringMaintenance := false
-				if interruptMaintenance {
-					select {
-					case <-started:
-					case <-ctx.Done():
-						t.Fatal("maintenance did not start")
-					}
-					if scenario == "queued_cancel" || scenario == "queued_disconnect" {
-						for range 3 {
-							require.NoError(t, client.Write(ctx, coderws.MessageText, body))
-						}
-					}
-					if scenario == "disconnect" || scenario == "queued_disconnect" {
-						_ = client.CloseNow()
-					} else {
-						control := `{"type":"response.cancel"}`
-						if scenario == "control" {
-							control = `{"type":"session.update","session":{"instructions":"changed context"}}`
-						}
-						require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(control)))
-					}
-					select {
-					case <-stopped:
-						canceledDuringMaintenance = true
-					case <-time.After(2 * time.Second):
-						release <- struct{}{}
-					}
+				if scenario == "next_turn" {
+					// A client compact result is the entire new input window.
+					next := compactionTestBody(recompactSummary+","+recoveryRetained+","+recoveryUser, true)
+					next, _ = sjson.SetBytes(next, "type", "response.create")
+					require.NoError(t, client.Write(ctx, coderws.MessageText, next))
+					_, frame, readErr := client.Read(ctx)
+					require.NoError(t, readErr)
+					require.Equal(t, "response.completed", gjson.GetBytes(frame, "type").String())
+					wantTurns++
 				}
-				interrupted := interruptMaintenance || interruptRedial || scenario == "cancel_before_replay"
-				completed := 0
-				if scenario != "disconnect" && scenario != "queued_disconnect" {
-					for {
-						_, frame, err := client.Read(ctx)
-						if interrupted {
-							require.Error(t, err, "canceled recovery must not emit a failure or replay response")
-							wantClose := coderws.StatusNormalClosure
-							if scenario == "control" {
-								wantClose = coderws.StatusPolicyViolation
-							}
-							require.Equal(t, wantClose, coderws.CloseStatus(err))
-							break
-						}
-						require.NoError(t, err)
-						if gjson.GetBytes(frame, "type").String() == "response.completed" {
-							completed++
-							if scenario == "next_turn" && completed == 1 {
-								// Keep the restored compact window for a real follow-up.
-								next := compactionTestBody(recompactSummary+","+recoveryRetained+","+recoveryUser+","+autoContinuationAnswer+","+recoveryUser, true)
-								next, _ = sjson.SetBytes(next, "type", "response.create")
-								require.NoError(t, client.Write(ctx, coderws.MessageText, next))
-								continue
-							}
-							break
-						}
-					}
-					_ = client.Close(coderws.StatusNormalClosure, "done")
-				}
+				_ = client.Close(coderws.StatusNormalClosure, "done")
 				select {
-				case proxyErr := <-errs:
-					if strings.HasPrefix(scenario, "cancel") || scenario == "queued_cancel" {
-						require.ErrorIs(t, proxyErr, context.Canceled)
-					}
+				case <-errs:
 				case <-ctx.Done():
 					t.Fatal("gateway did not finish")
 				}
-				wantGenerations, wantMaintenance, wantTurns := int32(3), int32(1), int32(1)
-				if interruptMaintenance || scenario == "cancel_before_replay" {
-					wantGenerations = 2
-				} else if interruptRedial {
-					wantGenerations, wantMaintenance = 1, 0
-					require.Equal(t, int32(2), dials.Load(), "no new upstream attempt after cancellation")
-				} else if scenario == "next_turn" {
-					wantGenerations, wantTurns = 4, 2
-				}
-				require.Equal(t, wantGenerations, generations.Load())
-				require.Equal(t, wantMaintenance, maintenance.Load())
-				require.Equal(t, wantTurns, settled.Load(), "finish each admitted turn exactly once")
+				require.Equal(t, wantTurns, generations.Load(), "one generation per explicit create")
+				require.Zero(t, maintenance.Load())
+				require.Equal(t, wantTurns, settled.Load())
 				if route == OpenAIWSIngressModePassthrough {
-					wantTurns-- // Initial passthrough admission belongs to the handler.
+					wantTurns--
 				}
-				require.Equal(t, wantTurns, admitted.Load(), "do not readmit recovery attempts")
-				if wantMaintenance > 0 {
-					require.Equal(t, "high", <-efforts, "internal compaction must preserve the effective reasoning policy")
-				}
-				if interruptMaintenance {
-					require.True(t, canceledDuringMaintenance, "client interruption must cancel maintenance")
-				}
+				require.Equal(t, wantTurns, admitted.Load())
+				require.EqualValues(t, 1, dials.Load()+func() int32 {
+					if route == OpenAIWSIngressModeHTTPBridge {
+						return 1
+					}
+					return 0
+				}(), "no hidden redial")
+
 			})
 		}
 	}

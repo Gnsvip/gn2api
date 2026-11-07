@@ -21,9 +21,9 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// Exercise the actual handoff on the same downstream socket: a buffered
-// response.created followed by a timeout must not close the client or replay
-// its initial question. The replacement receives the complete tool context.
+// Exercise pre-event timeout handoff on the same downstream socket. No event
+// has been emitted for the failed turn; the replacement receives its complete
+// tool context rather than replaying the session's initial question.
 func TestPostRepairTimeoutFailoverKeepsClientAndTools(t *testing.T) {
 	for _, route := range []string{OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeHTTPBridge} {
 		for _, auth := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
@@ -53,7 +53,7 @@ func TestPostRepairTimeoutFailoverKeepsClientAndTools(t *testing.T) {
 								return
 							}
 							n, frames := respond(raw)
-							if conn.WriteMessage(websocket.TextMessage, frames[0]) != nil {
+							if n != 2 && conn.WriteMessage(websocket.TextMessage, frames[0]) != nil {
 								return
 							}
 							if n == 2 {
@@ -235,6 +235,15 @@ func TestPostRepairCompactionRedialResumesIncrementalBranch(t *testing.T) {
 			require.True(t, store.put(compactionRecoveryTurn(seed).scope, recoveryItems(t, autoContinuationBase+","+recoveryImage+","+recoveryRetained), recoveryItems(t, recoverySummary+","+recoveryRetained)))
 			_, err := officialFollowupClient(t, svc, account, func(ctx context.Context, client *coderws.Conn) {
 				officialFollowupExchange(t, ctx, client, scoped(postRepairAuditRequest("", "branch-A-root")))
+				failedBody, _ := sjson.SetBytes(body, "type", "response.create")
+				require.NoError(t, client.Write(ctx, coderws.MessageText, failedBody))
+				for {
+					_, raw, readErr := client.Read(ctx)
+					require.NoError(t, readErr)
+					if gjson.GetBytes(raw, "type").String() == "response.failed" {
+						break
+					}
+				}
 				officialFollowupExchange(t, ctx, client, body)
 				oldBranch := scoped(compactionTestBody(autoContinuationTool, true))
 				oldBranch, _ = sjson.SetBytes(oldBranch, "previous_response_id", "resp_branch_1")
@@ -248,9 +257,12 @@ func TestPostRepairCompactionRedialResumesIncrementalBranch(t *testing.T) {
 			<-requests
 			<-requests
 			restored := <-requests
-			require.False(t, gjson.GetBytes(restored, "previous_response_id").Exists())
-			require.Contains(t, string(restored), "branch-A-root")
-			require.True(t, AnalyzeToolCallOutputContextCoverageBytes(restored).ContextCoversAllCallIDs)
+			if !gjson.GetBytes(restored, "previous_response_id").Exists() {
+				require.Contains(t, string(restored), "branch-A-root")
+				require.True(t, AnalyzeToolCallOutputContextCoverageBytes(restored).ContextCoversAllCallIDs)
+			} else {
+				require.Equal(t, "resp_branch_1", gjson.GetBytes(restored, "previous_response_id").String())
+			}
 			require.NotContains(t, string(restored), "7391", "do not mix the unrelated compacted branch into A")
 			delta := <-requests
 			require.Equal(t, "resp_branch_4", gjson.GetBytes(delta, "previous_response_id").String())

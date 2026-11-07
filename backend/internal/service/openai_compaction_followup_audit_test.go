@@ -189,45 +189,6 @@ func TestCompactionFollowupAudit(t *testing.T) {
 			defer client.CloseNow()
 			body, _ = sjson.SetBytes(body, "type", "response.create")
 			require.NoError(t, client.Write(ctx, coderws.MessageText, body))
-			if interruptRedial {
-				select {
-				case <-dialReady:
-				case <-ctx.Done():
-					t.Fatal("recovery handshake not started")
-				}
-				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.cancel"}`)))
-				reader := <-readers
-				require.Eventually(t, func() bool {
-					reader.mu.Lock()
-					defer reader.mu.Unlock()
-					return reader.pending != nil && len(reader.pending) > 0
-				}, time.Second, time.Millisecond)
-				dialRelease <- struct{}{}
-			}
-			if interruptMaintenance {
-				select {
-				case <-compactStarted:
-				case <-ctx.Done():
-					t.Fatal("compaction did not start")
-				}
-				if mode == "disconnect_during_compact" {
-					_ = client.CloseNow()
-				} else {
-					control := `{"type":"response.cancel"}`
-					if mode == "control_during_compact" {
-						control = `{"type":"session.update","session":{"instructions":"changed context"}}`
-					}
-					require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(control)))
-				}
-				// Do not release a successful compact response: cancellation must
-				// actively stop the HTTP request, not just suppress a later replay.
-				select {
-				case <-compactCanceled:
-				case <-time.After(2 * time.Second):
-					compactRelease <- struct{}{}
-					t.Fatal("maintenance upstream was not canceled")
-				}
-			}
 			if mode == "edited_compact_snapshot" {
 				select {
 				case <-editReady:
@@ -236,69 +197,49 @@ func TestCompactionFollowupAudit(t *testing.T) {
 				}
 				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"context added during compaction"}]}}`)))
 			}
-			completed := 0
 			for {
-				_, frame, err := client.Read(ctx)
-				if err != nil {
-					if !interruptMaintenance && !interruptRedial {
-						require.NoError(t, err)
-					} else if mode == "cancel_during_compact" || interruptRedial {
-						require.Equal(t, coderws.StatusNormalClosure, coderws.CloseStatus(err))
-					}
-					break
-				}
+				_, frame, readErr := client.Read(ctx)
+				require.NoError(t, readErr)
 				kind := gjson.GetBytes(frame, "type").String()
-				if kind == "response.completed" || kind == "response.failed" || kind == "response.cancelled" {
-					completed++
-					if mode == "policy_next_turn" && completed == 1 {
-						require.Equal(t, "response.completed", kind)
-						require.NoError(t, client.Write(ctx, coderws.MessageText, body))
-						continue
+				if kind == "response.failed" || kind == "response.completed" {
+					if mode != "edited_compact_snapshot" {
+						require.Equal(t, "response.failed", kind)
 					}
 					break
 				}
+			}
+			require.EqualValues(t, 1, calls.Load(), "failure must be delivered without hidden retry")
+			require.Zero(t, maintenance.Load())
+			if mode == "policy_next_turn" {
+				require.NoError(t, client.Write(ctx, coderws.MessageText, body))
+				_, frame, readErr := client.Read(ctx)
+				require.NoError(t, readErr)
+				require.Equal(t, "response.completed", gjson.GetBytes(frame, "type").String())
 			}
 			_ = client.Close(coderws.StatusNormalClosure, "done")
 			select {
-			case proxyErr := <-errs:
-				if mode == "cancel_during_compact" || interruptRedial {
-					require.ErrorIs(t, proxyErr, context.Canceled)
-				}
+			case <-errs:
 			case <-ctx.Done():
 				t.Fatal("gateway did not exit")
 			}
-			switch mode {
-			case "policy_once", "policy_deny_after_map":
-				require.Equal(t, int32(2), calls.Load())
-				first, replay := <-requests, <-requests
-				require.Equal(t, "high", gjson.GetBytes(first, "reasoning.effort").String())
-				require.Equal(t, "high", gjson.GetBytes(replay, "reasoning.effort").String(), "a retry of the same turn must not apply the reasoning mapping twice")
-			case "policy_next_turn", "policy_recompact":
-				require.Equal(t, int32(3), calls.Load())
-				for range 3 {
-					require.Equal(t, "high", gjson.GetBytes(<-requests, "reasoning.effort").String(), "each new turn still applies policy once")
-				}
-				if mode == "policy_recompact" {
-					require.Equal(t, int32(1), maintenance.Load())
-				}
-			case "cancel_during_redial", "cancel_during_redial_401":
-				require.Equal(t, int32(2), dials.Load())
-				require.Equal(t, int32(1), calls.Load(), "no replay or account failover after cancellation during handshake")
-			case "cancel_during_compact", "disconnect_during_compact", "control_during_compact":
-				require.Equal(t, int32(1), maintenance.Load())
-				require.Equal(t, int32(2), calls.Load(), "after receiving cancel during maintenance, do not restart generation")
-			case "edited_compact_snapshot":
-				restored, ok := store.restore(scope, compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true), true)
-				if ok {
-					t.Logf("restored history contains client context edit: %v", strings.Contains(string(restored), "context added during compaction"))
-				}
-				require.False(t, ok, "do not claim a verified undo history after an untracked conversation edit")
-			}
-			wantSettled := int32(1)
+			wantTurns := int32(1)
 			if mode == "policy_next_turn" {
-				wantSettled = 2
+				wantTurns = 2
 			}
-			require.Equal(t, wantSettled, settled.Load(), "finish each admitted turn exactly once")
+			require.Equal(t, wantTurns, calls.Load())
+			require.Equal(t, wantTurns, settled.Load(), "settle each explicit response once")
+			require.EqualValues(t, 1, dials.Load(), "no private reconnect after a delivered failure")
+			require.Zero(t, maintenance.Load())
+			if strings.HasPrefix(mode, "policy_") {
+				for range wantTurns {
+					require.Equal(t, "high", gjson.GetBytes(<-requests, "reasoning.effort").String(), "map each explicit request once")
+				}
+			}
+			if mode == "edited_compact_snapshot" {
+				_, ok := store.restore(scope, compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true), true)
+				require.False(t, ok, "untracked client edits cannot produce a verified snapshot")
+			}
+
 		})
 	}
 }

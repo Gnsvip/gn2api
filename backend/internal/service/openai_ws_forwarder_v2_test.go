@@ -41,7 +41,7 @@ func TestForwardOpenAIWSV2_PreservesInvalidHistoryError(t *testing.T) {
 			require.NotContains(t, body, "Upstream request failed")
 			if stream {
 				require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
-				require.NotContains(t, body, `"type":"error"`)
+				require.Contains(t, body, `"type":"error"`)
 				failure, marked := GetOpsStreamError(c)
 				require.True(t, marked)
 				require.Equal(t, http.StatusBadRequest, failure.IntendedStatus)

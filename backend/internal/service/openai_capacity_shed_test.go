@@ -236,13 +236,9 @@ func TestOpenAIStreamMetadataAndKeepaliveBeforeOverloadFailOver(t *testing.T) {
 			err := tt.run(svc, c, resp, account)
 			require.Error(t, err)
 			var failoverErr *UpstreamFailoverError
-			require.ErrorAs(t, err, &failoverErr)
-			require.True(t, failoverErr.RetryableOnSameAccount)
-			require.True(t, failoverErr.RequestScopedTransient)
-			require.Equal(t, http.StatusServiceUnavailable, failoverErr.ClientStatusCode)
-			require.Contains(t, failoverErr.ClientMessage, "servers are currently overloaded")
-			require.False(t, c.Writer.Written())
-			require.Empty(t, rec.Body.String())
+			require.False(t, errors.As(err, &failoverErr))
+			require.True(t, c.Writer.Written())
+			require.Contains(t, rec.Body.String(), "response.failed")
 		})
 	}
 }
@@ -283,9 +279,8 @@ func TestOpenAIStreamEmptyContentBeforeFailureCanFailOver(t *testing.T) {
 					_, err = svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
 				}
 				var failoverErr *UpstreamFailoverError
-				require.ErrorAs(t, err, &failoverErr)
-				require.True(t, failoverErr.RequestScopedTransient)
-				require.Empty(t, rec.Body.String())
+				require.False(t, errors.As(err, &failoverErr))
+				require.Contains(t, rec.Body.String(), "response.failed")
 			})
 		}
 	}
@@ -351,10 +346,8 @@ func TestOpenAIStreamKeepaliveOnlyFailureDoesNotRecordFirstToken(t *testing.T) {
 				require.Nil(t, result.firstTokenMs)
 			}
 			var failoverErr *UpstreamFailoverError
-			require.ErrorAs(t, err, &failoverErr)
-			require.True(t, failoverErr.RetryableOnSameAccount)
-			require.True(t, failoverErr.RequestScopedTransient)
-			require.Empty(t, rec.Body.String())
+			require.False(t, errors.As(err, &failoverErr))
+			require.Contains(t, rec.Body.String(), "response.failed")
 		})
 	}
 }
@@ -394,11 +387,9 @@ func TestOpenAIStreamCapacityShedErrorFramePrecedingFailedStillFailsOver(t *test
 	_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Name: "acc"}, time.Now(), "model", "model")
 	require.Error(t, err)
 	var failoverErr *UpstreamFailoverError
-	require.ErrorAs(t, err, &failoverErr)
-	require.True(t, failoverErr.RetryableOnSameAccount)
-	require.True(t, failoverErr.RequestScopedTransient)
-	require.False(t, c.Writer.Written())
-	require.Empty(t, rec.Body.String())
+	require.False(t, errors.As(err, &failoverErr))
+	require.True(t, c.Writer.Written())
+	require.Contains(t, rec.Body.String(), "response.failed")
 }
 
 // 流中途（已有真实输出）降载时无法再 failover，此时必须把降载码改写为客户端
@@ -443,9 +434,9 @@ func TestOpenAIStreamCapacityShedAfterOutputRewritesCodeForClient(t *testing.T) 
 
 	body := rec.Body.String()
 	require.Contains(t, body, "partial")
-	require.NotContains(t, body, "event: error")
+	require.Contains(t, body, "event: error")
 	require.Equal(t, 1, strings.Count(body, "event: response.failed"))
-	require.Equal(t, 1, strings.Count(body, `"code":"server_error"`))
+	require.Equal(t, 2, strings.Count(body, `"code":"server_error"`))
 	require.Contains(t, body, `"code":"server_error"`)
 	require.NotContains(t, body, "server_is_overloaded")
 	require.Contains(t, body, "Our servers are currently overloaded")

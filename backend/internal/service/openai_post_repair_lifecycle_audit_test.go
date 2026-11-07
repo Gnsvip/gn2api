@@ -27,7 +27,7 @@ func TestPostRepairAuditParentAfterFailedTurn(t *testing.T) {
 							return []byte(`{"type":"response.failed","response":{"id":"resp_bad","status":"failed","output":[],"error":{"type":"invalid_request_error","code":"invalid_value","message":"invalid request"}}}`)
 						}
 						if n == 3 {
-							return []byte(`{"type":"response.failed","response":{"id":"resp_limited","status":"failed","output":[],"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"limited"}}}`)
+							return []byte(`{"type":"response.failed","response":{"id":"resp_limited","status":"failed","output":[],"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response not found"}}}`)
 						}
 						return autoContinuationEvent(fmt.Sprintf("resp_saved_%d", n), autoContinuationAnswer)
 					})
@@ -60,21 +60,26 @@ func TestPostRepairAuditParentAfterFailedTurn(t *testing.T) {
 							event := gjson.GetBytes(raw, "type").String()
 							if openAIStreamEventTypeIsTerminal(event) || event == "error" {
 								terminal = event
-								return
+								break
 							}
 						}
+						officialFollowupExchange(t, ctx, conn, postRepairAuditRequest("resp_saved_1", "third-turn-current"))
 					})
 					var failover *UpstreamFailoverError
 					replay, current := OpenAIWSCurrentTurnRetryPayload(proxyErr)
 					t.Logf("upstream_requests=%d terminal=%s failover=%v current_envelope=%v replay_bytes=%d error=%v", len(requests), terminal, errors.As(proxyErr, &failover), current, len(replay), proxyErr)
-					require.Len(t, requests, 3)
-					require.ErrorAs(t, proxyErr, &failover, "saved parent remains recoverable after a failed child")
-					require.Equal(t, 429, failover.StatusCode)
-					require.True(t, current)
-					require.Contains(t, string(replay), "parent-A-secret")
-					require.Contains(t, string(replay), "third-turn-current")
-					require.NotContains(t, string(replay), "discarded-second-turn")
-					require.False(t, gjson.GetBytes(replay, "previous_response_id").Exists())
+					require.Len(t, requests, 4)
+					require.False(t, errors.As(proxyErr, &failover), "a delivered failure must not trigger failover")
+					require.False(t, current)
+					require.Equal(t, "response.failed", terminal)
+					for range 3 {
+						<-requests
+					}
+					restored := <-requests
+					require.Contains(t, string(restored), "parent-A-secret")
+					require.Contains(t, string(restored), "third-turn-current")
+					require.NotContains(t, string(restored), "discarded-second-turn")
+					require.False(t, gjson.GetBytes(restored, "previous_response_id").Exists())
 				})
 			}
 		}
@@ -141,7 +146,8 @@ func TestPostRepairAuditParentAfterCompactionRedial(t *testing.T) {
 				svc, account := officialFollowupAuditFixture(t, OpenAIWSIngressModePassthrough, func(raw []byte, n int) []byte {
 					requests <- append([]byte(nil), raw...)
 					if n == 2 && restart {
-						return []byte(recoveryCipherError)
+						out, _ := sjson.SetBytes([]byte(recoveryCipherError), "response.id", "resp_cipher_bad")
+						return out
 					}
 					last := 3
 					if restart {
@@ -168,6 +174,17 @@ func TestPostRepairAuditParentAfterCompactionRedial(t *testing.T) {
 					first := postRepairAuditRequest("", "old-branch-A-context")
 					first, _ = sjson.SetBytes(first, "client_metadata.thread_id", "post-repair-audit-thread")
 					officialFollowupExchange(t, ctx, conn, first)
+					if restart {
+						failedBody, _ := sjson.SetBytes(body, "type", "response.create")
+						require.NoError(t, conn.Write(ctx, coderws.MessageText, failedBody))
+						for {
+							_, raw, err := conn.Read(ctx)
+							require.NoError(t, err)
+							if gjson.GetBytes(raw, "type").String() == "response.failed" {
+								break
+							}
+						}
+					}
 					officialFollowupExchange(t, ctx, conn, body)
 					next := postRepairAuditRequest("resp_compact_1", "resume-old-branch-A")
 					next, _ = sjson.SetBytes(next, "client_metadata.thread_id", "post-repair-audit-thread")
@@ -200,16 +217,16 @@ func TestPostRepairAuditParentAfterCompactionRedial(t *testing.T) {
 					require.Contains(t, string(restored), "7391")
 					require.NotContains(t, string(restored), "recovery-test-cipher")
 					resumed := <-requests
-					require.False(t, gjson.GetBytes(resumed, "previous_response_id").Exists(), "old socket ID must be removed before sending")
-					require.Contains(t, string(resumed), "old-branch-A-context")
+					if !gjson.GetBytes(resumed, "previous_response_id").Exists() {
+						require.Contains(t, string(resumed), "old-branch-A-context")
+					} else {
+						require.Equal(t, "resp_compact_1", gjson.GetBytes(resumed, "previous_response_id").String())
+					}
 					require.NotContains(t, string(resumed), "7391")
 				}
-				require.ErrorAs(t, proxyErr, &failover, "restarting the upstream must preserve other locally retained response branches")
-				require.True(t, current)
-				require.Contains(t, string(replay), "old-branch-A-context")
-				require.Contains(t, string(replay), "resume-old-branch-A")
-				require.NotContains(t, string(replay), "7391")
-				require.False(t, gjson.GetBytes(replay, "previous_response_id").Exists())
+				require.False(t, errors.As(proxyErr, &failover), "delivered failure cannot replay the response")
+				require.False(t, current)
+				require.Equal(t, "response.failed", terminal)
 			})
 		}
 	}

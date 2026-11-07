@@ -41,10 +41,13 @@ func TestOfficialProtocolAuditQueuedCreate(t *testing.T) {
 					n := generations.Add(1)
 					if recovery {
 						if n == 1 {
-							return []byte(recoveryCipherError)
-						}
-						if n == 2 {
-							return []byte(recompactLimit)
+							ready <- struct{}{}
+							<-release
+							out, _ := sjson.SetBytes([]byte(recoveryCipherError), "response.id", "resp_rejected")
+							if lane := gjson.GetBytes(raw, "stream_id").String(); lane != "" {
+								out, _ = sjson.SetBytes(out, "stream_id", lane)
+							}
+							return out
 						}
 					} else if n == 1 {
 						ready <- struct{}{}
@@ -163,20 +166,24 @@ func TestOfficialProtocolAuditQueuedCreate(t *testing.T) {
 					next, _ = sjson.SetBytes(next, "stream_id", lane)
 				}
 				require.NoError(t, client.Write(ctx, coderws.MessageText, next))
-				// Hold maintenance long enough to observe the existing rejection,
-				// then permit a correct implementation to finish both responses.
+				// Queue the second explicit create while the first is still running.
+				// Its failure must be visible, without replaying it or dropping the queue.
 				timer := time.AfterFunc(100*time.Millisecond, unblock)
 				defer timer.Stop()
-				completed := 0
+				completed, failed := 0, 0
 				var readErr error
-				for completed < 2 {
+				for completed+failed < 2 {
 					_, frame, err := client.Read(ctx)
 					if err != nil {
 						readErr = err
 						break
 					}
-					if gjson.GetBytes(frame, "type").String() == "response.completed" {
+					switch gjson.GetBytes(frame, "type").String() {
+					case "response.completed":
 						completed++
+					case "response.failed":
+						failed++
+						require.Contains(t, string(frame), "invalid_encrypted_content")
 					}
 				}
 				_ = client.Close(coderws.StatusNormalClosure, "done")
@@ -188,7 +195,13 @@ func TestOfficialProtocolAuditQueuedCreate(t *testing.T) {
 				}
 				t.Logf("completed=%d generations=%d close=%v gateway_error=%v", completed, generations.Load(), coderws.CloseStatus(readErr), proxyErr)
 				require.NoError(t, readErr, "an accepted queued create must not close the session as a context edit")
-				require.Equal(t, 2, completed)
+				if recovery {
+					require.Equal(t, 1, failed)
+					require.Equal(t, 1, completed)
+				} else {
+					require.Equal(t, 2, completed)
+				}
+				require.EqualValues(t, 2, generations.Load(), "one upstream create per explicit client request")
 			})
 		}
 	}

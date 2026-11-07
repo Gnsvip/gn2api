@@ -46,16 +46,15 @@ func TestOpenAIWSPassthroughRecoverySparseOutputAndCurrentTurn(t *testing.T) {
 		`{"type":"response.created","response":{"id":"resp_first"}}`,
 		`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_first","type":"message","role":"assistant","content":[]}}`,
 	} {
-		require.False(t, recoveryTestWrite(t, r, w, event))
+		require.True(t, recoveryTestWrite(t, r, w, event))
 	}
-	require.Empty(t, w.frames)
+	require.Len(t, w.frames, 2)
 	require.True(t, recoveryTestWrite(t, r, w, `{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_first","type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}`))
 	recoveryTestWrite(t, r, w, `{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_first","type":"function_call","call_id":"call_first","name":"inspect","arguments":"{}"}}`)
 	recoveryTestWrite(t, r, w, `{"type":"response.completed","response":{"id":"resp_first","status":"completed","output":[]}}`)
 	require.True(t, r.historyComplete)
 	require.Len(t, w.frames, 5, "successful preamble must be delivered in order")
 	r.begin([]byte(`{"type":"response.create","model":"changed-model","reasoning":{"effort":"xhigh"},"instructions":"current instructions","tools":[{"type":"function","name":"inspect"}],"previous_response_id":"resp_first","input":[{"type":"function_call_output","call_id":"call_first","output":"tool result"}]}`), "changed-model")
-	recoveryTestWrite(t, r, w, `{"type":"response.created","response":{"id":"resp_failed_attempt"}}`)
 	payload := recoveryTestRetry(t, r)
 	require.NotEmpty(t, payload)
 	root := gjson.ParseBytes(payload)
@@ -68,7 +67,7 @@ func TestOpenAIWSPassthroughRecoverySparseOutputAndCurrentTurn(t *testing.T) {
 	require.Contains(t, root.Get("input").Raw, "original question")
 	require.Contains(t, root.Get("input").Raw, "first answer")
 	require.Contains(t, root.Get("input").Raw, "tool result")
-	require.Len(t, w.frames, 5, "failed-attempt metadata must not leak to the client")
+	require.Len(t, w.frames, 5, "pre-event reconnect must not emit any extra frames")
 }
 
 func TestOpenAIWSPassthroughRecoveryRejectsIncompleteHistory(t *testing.T) {
@@ -114,6 +113,8 @@ func TestOpenAIWSPassthroughRecoveryRejectsIncompleteHistory(t *testing.T) {
 
 func TestOpenAIWSPassthroughRecoveryDoesNotReplayDeliveredContent(t *testing.T) {
 	for name, event := range map[string]string{
+		"created":               `{"type":"response.created","response":{"id":"resp_test"}}`,
+		"error":                 `{"type":"error","error":{"code":"previous_response_not_found","message":"expired"}}`,
 		"text":                  `{"type":"response.output_text.delta","delta":"hello"}`,
 		"reasoning":             `{"type":"response.reasoning_text.delta","delta":"thinking"}`,
 		"reasoning progress":    `{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
@@ -130,7 +131,7 @@ func TestOpenAIWSPassthroughRecoveryDoesNotReplayDeliveredContent(t *testing.T) 
 			w := &passthroughRecoveryWriter{}
 			r.begin([]byte(passthroughRecoveryRoot), "client-model")
 			preamble := `{"type":"response.created","response":{"id":"resp_first"}}`
-			require.False(t, recoveryTestWrite(t, r, w, preamble))
+			require.True(t, recoveryTestWrite(t, r, w, preamble))
 			require.True(t, recoveryTestWrite(t, r, w, event))
 			require.Equal(t, []string{preamble, event}, w.frames)
 			require.False(t, r.canRetry())
@@ -139,19 +140,19 @@ func TestOpenAIWSPassthroughRecoveryDoesNotReplayDeliveredContent(t *testing.T) 
 	}
 }
 
-func TestOpenAIWSPassthroughRecoveryBoundsPreambleAndCommitsFailedWrites(t *testing.T) {
-	for _, scenario := range []string{"frame limit", "byte limit", "write error", "preamble write error", "binary"} {
+func TestOpenAIWSPassthroughRecoveryForwardsNoticesAndCommitsFailedWrites(t *testing.T) {
+	for _, scenario := range []string{"many notices", "large notice", "write error", "preamble write error", "binary"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := &openAIWSPassthroughRecovery{limit: 1 << 20}
 			w := &passthroughRecoveryWriter{}
 			r.begin([]byte(passthroughRecoveryRoot), "client-model")
 			switch scenario {
-			case "frame limit":
+			case "many notices":
 				for i := 0; i < 65; i++ {
 					recoveryTestWrite(t, r, w, `{"type":"codex.rate_limits","rate_limits":{}}`)
 				}
 				require.Len(t, w.frames, 65)
-			case "byte limit":
+			case "large notice":
 				event := `{"type":"response.created","response":{"id":"` + strings.Repeat("x", 256*1024) + `"}}`
 				require.True(t, recoveryTestWrite(t, r, w, event))
 				require.Equal(t, []string{event}, w.frames)
@@ -160,18 +161,34 @@ func TestOpenAIWSPassthroughRecoveryBoundsPreambleAndCommitsFailedWrites(t *test
 				_, err := r.write(context.Background(), w, coderws.MessageText, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
 				require.ErrorIs(t, err, w.err)
 			case "preamble write error":
-				require.False(t, recoveryTestWrite(t, r, w, `{"type":"response.created"}`))
+				require.True(t, recoveryTestWrite(t, r, w, `{"type":"response.created"}`))
 				w.err = errors.New("partial preamble write")
 				_, err := r.write(context.Background(), w, coderws.MessageText, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
 				require.ErrorIs(t, err, w.err)
-				require.Zero(t, r.preambleBytes, "release retained frames even when flushing fails")
 			case "binary":
 				_, err := r.write(context.Background(), w, coderws.MessageBinary, []byte{1, 2, 3})
 				require.NoError(t, err)
 			}
-			require.Empty(t, r.preamble)
 			require.False(t, r.canRetry())
 			require.Empty(t, recoveryTestRetry(t, r))
 		})
 	}
+}
+
+func TestOpenAIWSPassthroughRecoveryTopLevelErrorDetachesAnchor(t *testing.T) {
+	r := &openAIWSPassthroughRecovery{limit: 1 << 20}
+	w := &passthroughRecoveryWriter{}
+	r.begin([]byte(passthroughRecoveryRoot), "client-model")
+	recoveryTestWrite(t, r, w, string(autoContinuationEvent("resp_top_level_parent", autoContinuationAnswer)))
+	r.begin(postRepairAuditRequest("resp_top_level_parent", "current input"), "client-model")
+	failure := `{"type":"error","code":"previous_response_not_found","message":"Previous response not found","param":"previous_response_id"}`
+	require.True(t, recoveryTestWrite(t, r, w, failure))
+	require.False(t, r.canRetry(), "the emitted error cannot be replayed")
+	parent, ok := r.parents.parent("resp_top_level_parent")
+	require.True(t, ok)
+	require.True(t, parent.upstreamDetached)
+	code, kind, message := parseOpenAIWSErrorEventFields([]byte(failure))
+	require.Equal(t, "previous_response_not_found", code)
+	require.Empty(t, kind)
+	require.Equal(t, "Previous response not found", message)
 }

@@ -3,6 +3,7 @@ package openai_ws_v2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -1556,5 +1557,33 @@ func TestRelay_OnTurnComplete_FirstTokenMsRecordedForEveryTurn(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("relay did not stop after cancellation")
+	}
+}
+
+// A provider may omit the ID on a failed terminal. It must settle exactly the
+// active turn, and must never borrow a previous completed response's identity.
+func TestRelay_OnTurnComplete_FailedWithoutID(t *testing.T) {
+	for _, created := range []bool{false, true} {
+		t.Run(fmt.Sprint(created), func(t *testing.T) {
+			frames := []passthroughTestFrame{{msgType: coderws.MessageText, payload: []byte(`{"type":"response.completed","response":{"id":"resp_previous","usage":{"input_tokens":2}}}`)}}
+			if created {
+				frames = append(frames, passthroughTestFrame{msgType: coderws.MessageText, payload: []byte(`{"type":"response.created","response":{"id":"resp_active"}}`)})
+			}
+			frames = append(frames, passthroughTestFrame{msgType: coderws.MessageText, payload: []byte(`{"type":"response.failed","response":{"status":"failed","usage":{"input_tokens":7,"output_tokens":2},"error":{"code":"server_error"}}}`)})
+			client, upstream := newPassthroughTestFrameConn(nil, false), newPassthroughTestFrameConn(frames, true)
+			var turns []RelayTurnResult
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, exit := Relay(ctx, client, upstream, []byte(`{"type":"response.create","model":"gpt-5.1","input":[]}`), RelayOptions{OnTurnComplete: func(turn RelayTurnResult) { turns = append(turns, turn) }})
+			require.Nil(t, exit)
+			require.Len(t, turns, 2)
+			require.Equal(t, "response.failed", turns[1].TerminalEventType)
+			require.Equal(t, Usage{InputTokens: 7, OutputTokens: 2}, turns[1].Usage)
+			if created {
+				require.Equal(t, "resp_active", turns[1].RequestID)
+			} else {
+				require.Empty(t, turns[1].RequestID)
+			}
+		})
 	}
 }

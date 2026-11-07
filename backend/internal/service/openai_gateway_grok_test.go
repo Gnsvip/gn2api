@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -3652,11 +3653,15 @@ func TestOpenAIWSHTTPBridgeSSEErrorSideEffectsRunOncePerPlatform(t *testing.T) {
 				},
 			)
 
-			require.Nil(t, result)
+			require.NotNil(t, result)
+			require.Error(t, err)
 			var failoverErr *UpstreamFailoverError
-			require.ErrorAs(t, err, &failoverErr)
-			require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
-			require.Zero(t, writes)
+			require.False(t, errors.As(err, &failoverErr), "delivered error cannot be replayed")
+			if platform == PlatformOpenAI {
+				require.Equal(t, 2, writes, "bare error and synthesized failed terminal")
+			} else {
+				require.Equal(t, 1, writes)
+			}
 			require.Equal(t, 1, repo.rateLimitedCalls)
 		})
 	}

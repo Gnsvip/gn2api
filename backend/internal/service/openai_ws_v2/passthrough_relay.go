@@ -651,6 +651,11 @@ func runUpstreamToClient(
 		if beforeClientWrite != nil {
 			beforeClientWrite(msgType, payload)
 		}
+		// Even a failed frame write can be partially visible to the client.
+		wroteDownstream = true
+		if state != nil {
+			state.turnWroteDownstream.Store(true)
+		}
 		writeErr := writeClient(msgType, payload)
 		if afterClientWrite != nil {
 			afterClientWrite(msgType, payload, writeErr)
@@ -780,6 +785,9 @@ func observeUpstreamMessage(
 	if responseID == "" && isTerminalEvent(eventType) {
 		responseID = strings.TrimSpace(values[3].String())
 	}
+	if responseID == "" && isTerminalEvent(eventType) {
+		responseID = openAIWSRelayActiveTurnID(state)
+	}
 	now := nowFn()
 
 	startsTTFT := openai.ResponseStartsSemanticOutput(message, eventType)
@@ -903,9 +911,6 @@ func emitTurnComplete(
 		return
 	}
 	responseID := strings.TrimSpace(observed.responseID)
-	if responseID == "" && strings.TrimSpace(observed.eventType) != "error" {
-		return
-	}
 	requestModel := ""
 	if state != nil {
 		requestModel = state.currentRequestModel()
