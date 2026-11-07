@@ -22,6 +22,20 @@ const (
 	openAIRecoveryCompactTimeout     = 2 * time.Minute
 )
 
+// The last response's error was already delivered. Its next explicit create
+// can repair the verified history before any generation event is committed.
+func pendingCompactionMaintenance(c *gin.Context) *openAICompactionReplayRetry {
+	t := compactionRecoveryTurn(c)
+	if isInternalRecoveryCompact(c) || t == nil || !t.restored || !t.needsCompact || t.recompacted {
+		return nil
+	}
+	if t.started.IsZero() {
+		t.started = time.Now()
+	}
+	t.recompacted = true
+	return &openAICompactionReplayRetry{body: t.body, recompact: true}
+}
+
 // All error paths call this before committing downstream content. Recovery is
 // only eligible after verified restoration, never for arbitrary oversized input.
 func (s *OpenAIGatewayService) retryCompactionError(c *gin.Context, data []byte) *openAICompactionReplayRetry {
@@ -125,7 +139,7 @@ func compactionReplacementCondition(body []byte) ([sha256.Size]byte, bool) {
 	return sha256.Sum256(raw), err == nil
 }
 
-func (s *openAICompactionRecoveryStore) putReplacement(scope string, accountID int64, body []byte, prefix, output []json.RawMessage) bool {
+func (s *openAICompactionRecoveryStore) putReplacement(scope string, accountID int64, body []byte, prefix, output []json.RawMessage, owners ...string) bool {
 	condition, ok := compactionReplacementCondition(body)
 	if !ok || scope == "" || accountID <= 0 || len(prefix) == 0 || len(prefix) > openAIWSContinuationHistoryLimit || !compactionRecoveryHasSummary(output) ||
 		!compactionRecoveryItemsFit(output, openAICompactionRecoveryMaxRaw) {
@@ -154,7 +168,7 @@ func (s *openAICompactionRecoveryStore) putReplacement(scope string, accountID i
 	key := fmt.Sprintf("%s:replacement:%d:%x:%x", scope, accountID, condition, h.Sum(nil))
 	// Keep an undo record for the new ciphertext before making it reusable.
 	// A provider reusing a cipher for a different source is not a valid binding.
-	if !s.put(scope, prefix, output) {
+	if !s.put(scope, prefix, output, owners...) {
 		return false
 	}
 	return s.insert(&openAICompactionRecoveryEntry{scope: scope, key: key, input: bytes.Clone(b.Bytes()),
@@ -379,7 +393,7 @@ func (s *OpenAIGatewayService) prepareCompactionRetry(ctx context.Context, c *gi
 	}
 	if t := compactionRecoveryTurn(c); t != nil {
 		store := s.compactionRecoveryStore()
-		store.putReplacement(t.scope, account.ID, retry.body, items[:prefixEnd], window)
+		store.putReplacement(t.scope, account.ID, retry.body, items[:prefixEnd], window, t.owner)
 	}
 	logOpenAIWSModeInfo("compaction_context_recompacted account_id=%d calls=%d input_items=%d compacted_items=%d output_items=%d", account.ID, calls, len(items), prefixEnd, len(nextItems))
 	return next, nil

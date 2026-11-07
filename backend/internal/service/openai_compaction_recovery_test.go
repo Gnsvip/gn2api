@@ -382,17 +382,19 @@ func TestCompactionRecoveryScopeAndRetryBudget(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	closeRecoveryStore(t, svc.compactionRecoveryStore())
 	c, _ := httpBridgeContext("thread-one")
+	c.Request.Header.Set("thread-id", "thread-one")
 	c.Set("api_key", &APIKey{ID: 123, GroupID: new(int64)})
 	svc.beginCompactionRecoveryTurn(c, compactionTestBody(recoveryImage+","+recoveryTrigger, true), false)
 	svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 	body := compactionTestBody(recoverySummary+","+recoveryUser, true)
 	for _, scenario := range []string{"thread", "key", "group", "cancelled", "same"} {
 		next, _ := httpBridgeContext("thread-one")
+		next.Request.Header.Set("thread-id", "thread-one")
 		group := int64(0)
 		key := &APIKey{ID: 123, GroupID: &group}
 		switch scenario {
 		case "thread":
-			next.Request.Header.Set("session-id", "thread-two")
+			next.Request.Header.Set("thread-id", "thread-two")
 		case "key":
 			key.ID++
 		case "group":
@@ -441,6 +443,105 @@ func TestCompactionRecoveryNestedWindowAndActiveExpiry(t *testing.T) {
 		require.JSONEq(t, "["+recoveryImage+","+recoveryRetained+","+recoveryUser+"]", gjson.GetBytes(restored, "input").Raw)
 	}
 	require.False(t, store.entries["scope:"+openAIEncryptedContentDigest("recovery-test-cipher")].invalid, "expanding an ancestor does not label that cipher invalid")
+}
+
+// Recovery must find verified history after a reconnect, without borrowing
+// another key's history or accepting an edited compact window.
+func TestCompactionRecoveryReconnectLookup(t *testing.T) {
+	for _, scenario := range []string{"session_changed", "restart", "other_key", "other_group", "other_thread", "other_lane", "other_stream", "changed_cipher", "changed_tail", "legacy_owner", "ambiguous"} {
+		t.Run(scenario, func(t *testing.T) {
+			svc := &OpenAIGatewayService{}
+			store := svc.compactionRecoveryStore()
+			dir := t.TempDir()
+			require.NoError(t, store.startPersistence(dir, "reconnect-test-secret"))
+			t.Cleanup(store.closePersistence)
+			account := &Account{ID: 42}
+			seed, _ := httpBridgeContext("before-reconnect")
+			svc.beginCompactionRecoveryTurn(seed, compactionTestBody(recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained+","+recoveryTrigger, true), false, account)
+			svc.observeCompactionRecovery(seed, autoContinuationEvent("resp_compact", recoverySummary+","+recoveryRetained), "response.completed")
+			body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
+			svc.beginCompactionRecoveryTurn(seed, body, false, account)
+			svc.noteCompactionStreamFailure(seed, []byte(recoveryCipherError))
+			if scenario == "legacy_owner" {
+				store.mu.Lock()
+				for _, entry := range store.entries {
+					entry.owner = "" // Old-format records cannot prove cross-session ownership.
+				}
+				store.mu.Unlock()
+			}
+			if scenario == "ambiguous" {
+				require.True(t, store.put("conflicting-scope", recoveryItems(t, recoveryUser+","+recoveryRetained), recoveryItems(t, recoverySummary+","+recoveryRetained), compactionRecoveryTurn(seed).owner))
+			}
+			if scenario == "restart" {
+				store.closePersistence()
+				svc = &OpenAIGatewayService{}
+				require.NoError(t, svc.compactionRecoveryStore().startPersistence(dir, "reconnect-test-secret"))
+				t.Cleanup(svc.compactionRecoveryStore().closePersistence)
+			}
+			c, _ := httpBridgeContext("after-reconnect")
+			switch scenario {
+			case "other_key":
+				c.Set("api_key", &APIKey{ID: 999})
+			case "other_group":
+				group := int64(99)
+				c.Set("api_key", &APIKey{ID: 123, GroupID: &group})
+			case "other_lane":
+				c.Request.Header.Set(openAIWSTurnMetadataHeader, `{"request_kind":"memory"}`)
+			case "other_thread":
+				c.Request.Header.Set("thread-id", "unrelated-thread")
+			case "other_stream":
+				body, _ = sjson.SetBytes(body, "stream_id", "other-lane")
+			case "changed_cipher":
+				body = []byte(strings.ReplaceAll(string(body), "recovery-test-cipher", "unknown-cipher"))
+			case "changed_tail":
+				body = []byte(strings.ReplaceAll(string(body), "retained-tail", "edited-tail"))
+			}
+			restored := svc.beginCompactionRecoveryTurn(c, body, false, account)
+			if scenario != "session_changed" && scenario != "restart" {
+				require.Equal(t, body, restored)
+				require.Nil(t, svc.retryCompactionHistory(c))
+				return
+			}
+			require.True(t, compactionRecoveryTurn(c).restored)
+			require.NotContains(t, string(restored), "recovery-test-cipher")
+			require.JSONEq(t, "["+recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained+","+recoveryUser+"]", gjson.GetBytes(restored, "input").Raw)
+			require.Equal(t, "xhigh", gjson.GetBytes(restored, "reasoning.effort").String())
+		})
+	}
+}
+
+func TestCompactionRecoveryNestedSnapshotSurvivesAncestorEviction(t *testing.T) {
+	store := (&OpenAIGatewayService{}).compactionRecoveryStore()
+	dir := t.TempDir()
+	require.NoError(t, store.startPersistence(dir, "nested-test-secret"))
+	t.Cleanup(store.closePersistence)
+	input := recoveryImage + "," + autoContinuationCall + "," + autoContinuationTool
+	var summary string
+	for i := range openAICompactionRecoveryPerScope + 3 {
+		summary = strings.ReplaceAll(recoverySummary, "recovery-test-cipher", fmt.Sprintf("nested-%d", i))
+		require.True(t, store.put("scope", recoveryItems(t, input), recoveryItems(t, summary)))
+		input = summary + "," + recoveryRetained
+	}
+	store.mu.Lock()
+	for _, entry := range store.entries {
+		require.False(t, entry.invalid, "flattening a backup must not invalidate live ciphertext")
+		if entry.key != "scope:"+openAIEncryptedContentDigest(fmt.Sprintf("nested-%d", openAICompactionRecoveryPerScope+2)) {
+			store.remove(entry)
+		}
+	}
+	store.mu.Unlock()
+	store.closePersistence()
+	loaded := (&OpenAIGatewayService{}).compactionRecoveryStore()
+	require.NoError(t, loaded.startPersistence(dir, "nested-test-secret"))
+	t.Cleanup(loaded.closePersistence)
+	require.Len(t, loaded.entries, 1)
+	restored, ok := loaded.restore("scope", compactionTestBody(summary+","+recoveryUser, true), true)
+	require.True(t, ok)
+	require.Contains(t, string(restored), "7391")
+	require.Contains(t, string(restored), "data:image/png;base64,AAA=")
+	require.Contains(t, string(restored), "lookup result")
+	require.NotContains(t, gjson.GetBytes(restored, "input").Raw, "encrypted_content")
+	require.Equal(t, openAICompactionRecoveryPerScope+2, strings.Count(string(restored), "retained-tail"))
 }
 
 func TestCompactionRecoveryDoesNotReplayAfterClientOutput(t *testing.T) {
@@ -791,6 +892,11 @@ func runCompactionRecoveryNativeClient(t *testing.T, svc *OpenAIGatewayService, 
 
 func runCompactionRecoveryNativeClientFailures(t *testing.T, svc *OpenAIGatewayService, account *Account, bodies [][]byte, failures map[int]bool, customize ...func(*OpenAIWSIngressHooks)) {
 	t.Helper()
+	runCompactionRecoveryClientSession(t, svc, account, "recovery-e2e", bodies, failures, customize...)
+}
+
+func runCompactionRecoveryClientSession(t *testing.T, svc *OpenAIGatewayService, account *Account, session string, bodies [][]byte, failures map[int]bool, customize ...func(*OpenAIWSIngressHooks)) {
+	t.Helper()
 	errs := make(chan error, 1)
 	var before, after atomic.Int32
 	var beforeTurns, afterTurns []int
@@ -826,7 +932,7 @@ func runCompactionRecoveryNativeClientFailures(t *testing.T, svc *OpenAIGatewayS
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{HTTPHeader: http.Header{"Session-Id": {"recovery-e2e"}}})
+	conn, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &coderws.DialOptions{HTTPHeader: http.Header{"Session-Id": {session}}})
 	require.NoError(t, err)
 	defer conn.CloseNow()
 	for i, body := range bodies {

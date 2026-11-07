@@ -874,6 +874,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 	if turn := compactionRecoveryTurn(c); turn != nil {
 		turn.maintenanceReasoning = []byte(gjson.GetBytes(firstClientMessage, "reasoning").Raw)
 	}
+	if retry := pendingCompactionMaintenance(c); retry != nil {
+		return &openAIPassthroughCompactionRetry{retry: retry, model: initialRequestModel, recorder: timingRecorder}
+	}
 
 	// 在 policy filter 之后再提取 service_tier / reasoning_effort 用于
 	// usage 上报：filter 命中时 service_tier 已经从 firstClientMessage 中删除，
@@ -1274,6 +1277,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
 				timingFrames.nextStart.Store(&responseCreateAtCopy)
 				acceptedTurn = true
+				if retry := pendingCompactionMaintenance(c); retry != nil {
+					return out, nil, &openAIPassthroughCompactionRetry{retry: retry}
+				}
 			}
 			return out, blocked, policyErr
 		},

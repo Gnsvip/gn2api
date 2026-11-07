@@ -937,6 +937,11 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 		imageSizeTier = imageCfg.SizeTier
 		imageInputSize = imageCfg.InputSize
 	}
+	// Admission/policy checks must also pass before internal maintenance spends
+	// tokens. Keep the canonical restored body for the actual compact/replay.
+	if retry := pendingCompactionMaintenance(c); retry != nil {
+		return nil, retry
+	}
 	// Get access token
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {

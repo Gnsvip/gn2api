@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ const (
 // Input uses the client's canonical names, before account-specific transforms.
 type openAICompactionRecoveryEntry struct {
 	scope, key      string
+	owner           string // key + group + thread + lane; exact-cipher lookup after reconnect
 	input           []byte // gzip; immutable after insertion
 	output          [][sha256.Size]byte
 	compactionIndex int
@@ -40,12 +42,14 @@ type openAICompactionRecoveryEntry struct {
 	// A replacement entry maps a verified original prefix to a new compact
 	// window. It shares the undo store's TTL/LRU/byte budget, and is scoped to
 	// the account and request settings that produced the new ciphertext.
-	replacement bool
-	accountID   int64
-	condition   [sha256.Size]byte
-	expires     time.Time
-	timer       *time.Timer
-	element     *list.Element
+	replacement    bool
+	accountID      int64
+	condition      [sha256.Size]byte
+	limitAccount   int64
+	limitCondition [sha256.Size]byte
+	expires        time.Time
+	timer          *time.Timer
+	element        *list.Element
 }
 
 type openAICompactionRecoveryStore struct {
@@ -114,7 +118,7 @@ func compactionRecoveryItemsFit(items []json.RawMessage, budget int) bool {
 	return true
 }
 
-func (s *openAICompactionRecoveryStore) put(scope string, source, output []json.RawMessage) bool {
+func (s *openAICompactionRecoveryStore) put(scope string, source, output []json.RawMessage, owners ...string) bool {
 	if scope == "" || len(source) == 0 || len(output) == 0 || len(output) > openAIWSContinuationOutputLimit {
 		return false
 	}
@@ -144,6 +148,19 @@ func (s *openAICompactionRecoveryStore) put(scope string, source, output []json.
 	if err != nil || len(raw) > openAICompactionRecoveryMaxRaw {
 		return false
 	}
+	owner := ""
+	if len(owners) > 0 {
+		owner = owners[0]
+	}
+	// A newer backup must not depend on an older snapshot surviving TTL/LRU.
+	// Expand verified ancestors in the backup only, leaving the live compact
+	// window and every ancestor's validity unchanged.
+	if compactionRecoveryHasSummary(source) {
+		wrapped := append(append([]byte(`{"input":`), raw...), '}')
+		if expanded, ok := s.restoreWindow(scope, owner, wrapped, true, false); ok {
+			raw = []byte(gjson.GetBytes(expanded, "input").Raw)
+		}
+	}
 	var compressed bytes.Buffer
 	w, _ := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
 	_, err = w.Write(raw)
@@ -151,7 +168,7 @@ func (s *openAICompactionRecoveryStore) put(scope string, source, output []json.
 	if err != nil || closeErr != nil || compressed.Len() > openAICompactionRecoveryMaxEntry {
 		return false
 	}
-	e := &openAICompactionRecoveryEntry{scope: scope, key: scope + ":" + openAIEncryptedContentDigest(cipher),
+	e := &openAICompactionRecoveryEntry{scope: scope, owner: owner, key: scope + ":" + openAIEncryptedContentDigest(cipher),
 		input: bytes.Clone(compressed.Bytes()), output: fingerprints, compactionIndex: index, expires: time.Now().Add(openAICompactionRecoveryTTL)}
 	return s.insert(e)
 }
@@ -202,7 +219,45 @@ func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry)
 	return true
 }
 
-func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force bool) ([]byte, bool) {
+func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force bool, owners ...string) ([]byte, bool) {
+	owner := ""
+	if len(owners) > 0 {
+		owner = owners[0]
+	}
+	return s.restoreWindow(scope, owner, body, force, true)
+}
+
+// Caller holds mu. Never select "the latest" history. A reconnect must carry
+// the exact ciphertext, belong to the same authenticated owner, and subsequently
+// pass the entire output-window comparison. Ambiguous bindings are not usable.
+func (s *openAICompactionRecoveryStore) lookup(scope, owner, digest string) *openAICompactionRecoveryEntry {
+	key := scope + ":" + digest
+	if e := s.entries[key]; e != nil {
+		if !time.Now().Before(e.expires) {
+			s.remove(e)
+		} else if !e.replacement && (owner == "" || e.owner == "" || e.owner == owner) {
+			return e
+		}
+	}
+	if owner == "" {
+		return nil
+	}
+	var match *openAICompactionRecoveryEntry
+	for _, e := range s.entries {
+		if e.replacement || e.owner != owner || !time.Now().Before(e.expires) || !strings.HasSuffix(e.key, ":"+digest) {
+			continue
+		}
+		if match != nil && (match.compactionIndex != e.compactionIndex || !slices.Equal(match.output, e.output) || !bytes.Equal(match.input, e.input)) {
+			return nil
+		}
+		if match == nil || e.invalid {
+			match = e
+		}
+	}
+	return match
+}
+
+func (s *openAICompactionRecoveryStore) restoreWindow(scope, owner string, body []byte, force, markInvalid bool) ([]byte, bool) {
 	if scope == "" || len(body) > openAICompactionRecoveryMaxRaw {
 		return body, false
 	}
@@ -225,13 +280,8 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 				continue
 			}
 			cipher := gjson.GetBytes(item, "encrypted_content").String()
-			key := scope + ":" + openAIEncryptedContentDigest(cipher)
 			s.mu.Lock()
-			e := s.entries[key]
-			if e != nil && !time.Now().Before(e.expires) {
-				s.remove(e)
-				e = nil
-			}
+			e := s.lookup(scope, owner, openAIEncryptedContentDigest(cipher))
 			if e == nil {
 				s.mu.Unlock()
 				continue
@@ -255,7 +305,7 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 				continue
 			}
 			s.mu.Lock()
-			if s.entries[key] == e {
+			if s.entries[e.key] == e {
 				e.expires = time.Now().Add(openAICompactionRecoveryTTL)
 				s.lru.MoveToFront(e.element)
 				s.notifyPersistence()
@@ -327,7 +377,7 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 	s.mu.Lock()
 	for i, e := range restoredEntries {
 		if s.entries[e.key] == e {
-			if i == 0 {
+			if i == 0 && markInvalid {
 				e.invalid = true
 			}
 			e.expires = time.Now().Add(openAICompactionRecoveryTTL)
@@ -348,7 +398,23 @@ func (s *OpenAIGatewayService) noteCompactionStreamFailure(c *gin.Context, data 
 		return
 	}
 	t := compactionRecoveryTurn(c)
-	if t == nil || !isCompactionCipherError(data) {
+	if t == nil {
+		return
+	}
+	if t.restored && t.accountID > 0 && isOpenAIContextWindowError(extractOpenAISSEErrorMessage(data), data) {
+		if condition, ok := compactionReplacementCondition(t.body); ok {
+			store := s.compactionRecoveryStore()
+			store.mu.Lock()
+			for _, digest := range t.anchors {
+				if e := store.lookup(t.scope, t.owner, digest); e != nil {
+					e.limitAccount, e.limitCondition = t.accountID, condition
+					store.notifyPersistence()
+				}
+			}
+			store.mu.Unlock()
+		}
+	}
+	if !isCompactionCipherError(data) {
 		return
 	}
 	// Streaming failures may already be visible, so recovery belongs to the
@@ -369,9 +435,8 @@ func (s *OpenAIGatewayService) noteCompactionStreamFailure(c *gin.Context, data 
 		if cipher == "" {
 			continue
 		}
-		key := t.scope + ":" + openAIEncryptedContentDigest(cipher)
 		store.mu.Lock()
-		if entry := store.entries[key]; entry != nil {
+		if entry := store.lookup(t.scope, t.owner, openAIEncryptedContentDigest(cipher)); entry != nil {
 			entry.invalid = true
 			store.notifyPersistence()
 		}
@@ -384,6 +449,9 @@ type openAICompactionRecoveryTurn struct {
 	maintenanceModel     string // effective channel model for internal compaction
 	maintenanceReasoning []byte // effective outbound settings, separate from replay's client settings
 	scope                string
+	owner                string
+	anchors              []string // summary fingerprints only, never another plaintext copy
+	needsCompact         bool
 	body                 []byte
 	source               []json.RawMessage
 	output               map[int]json.RawMessage
@@ -435,14 +503,33 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 	}
 	t.body = body
 	t.scope = fmt.Sprintf("%d:%s", getOpenAIGroupIDFromContext(c), scope)
-	if restored, ok := s.compactionRecoveryStore().restore(t.scope, body, s.knownInvalidCompaction(c, t.accountID, body)); ok {
+	ownerSeed := fmt.Sprintf("compaction-owner:%d:%d:%q:%q:%q", keyID, getOpenAIGroupIDFromContext(c),
+		resolveOpenAIWSClientThreadID(c, body), resolveOpenAIWSExecutionLane(c, body), gjson.GetBytes(body, "stream_id").String())
+	t.owner = fmt.Sprintf("%x", sha256.Sum256([]byte(ownerSeed)))
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if isOpenAICompactionType(item.Get("type").String()) {
+			t.anchors = append(t.anchors, openAIEncryptedContentDigest(item.Get("encrypted_content").String()))
+		}
+	}
+	if restored, ok := s.compactionRecoveryStore().restore(t.scope, body, s.knownInvalidCompaction(c, t.accountID, body), t.owner); ok {
 		t.body, body = restored, restored
 		t.restored = true
+		if condition, valid := compactionReplacementCondition(body); valid && t.accountID > 0 {
+			store := s.compactionRecoveryStore()
+			store.mu.Lock()
+			for _, digest := range t.anchors {
+				if e := store.lookup(t.scope, t.owner, digest); e != nil && e.limitAccount == t.accountID && e.limitCondition == condition {
+					t.needsCompact = true
+				}
+			}
+			store.mu.Unlock()
+		}
 		logOpenAIWSModeInfo("compaction_context_restored phase=ingress scope=%s bytes=%d", t.scope, len(body))
 	}
 	if len(accounts) > 0 && accounts[0] != nil {
 		if replaced, ok := s.compactionRecoveryStore().replace(t.scope, accounts[0].ID, body); ok {
 			t.body, body, t.restored = replaced, replaced, true
+			t.needsCompact = false
 		}
 	}
 	if (!legacy && !HasCompactionTriggerInInput(body)) || gjson.GetBytes(body, "previous_response_id").String() != "" || len(body) > openAICompactionRecoveryMaxRaw {
@@ -481,7 +568,7 @@ func (s *OpenAIGatewayService) retryCompactionHistory(c *gin.Context) *openAICom
 		return nil
 	}
 	t.retried = true
-	if next, ok := s.compactionRecoveryStore().restore(t.scope, t.body, true); ok {
+	if next, ok := s.compactionRecoveryStore().restore(t.scope, t.body, true, t.owner); ok {
 		t.restored = true
 		logOpenAIWSModeInfo("compaction_context_restored phase=retry scope=%s bytes=%d", t.scope, len(next))
 		return &openAICompactionReplayRetry{body: next}
@@ -560,7 +647,7 @@ func (s *OpenAIGatewayService) observeCompactionRecovery(c *gin.Context, data []
 			output = append(output, item)
 		}
 	}
-	stored := s.compactionRecoveryStore().put(t.scope, t.source, output)
+	stored := s.compactionRecoveryStore().put(t.scope, t.source, output, t.owner)
 	logOpenAIWSModeInfo("compaction_recovery_snapshot stored=%v scope=%s input_items=%d output_items=%d", stored, t.scope, len(t.source), len(output))
 	t.source, t.output = nil, nil
 }
@@ -585,6 +672,9 @@ func resumeCompactionRecoveryTurn(c *gin.Context, previous *openAICompactionReco
 		next.recompacted = previous.recompacted
 		next.maintenance = previous.maintenance
 		next.started = previous.started
+		if len(next.anchors) == 0 {
+			next.anchors = previous.anchors
+		}
 	}
 }
 
@@ -592,6 +682,7 @@ func finishCompactionRecoveryTurn(c *gin.Context) {
 	if t := compactionRecoveryTurn(c); t != nil {
 		t.body, t.source, t.output = nil, nil, nil
 		t.maintenanceReasoning = nil
+		t.anchors = nil
 	}
 }
 

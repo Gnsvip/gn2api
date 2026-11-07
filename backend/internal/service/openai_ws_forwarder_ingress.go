@@ -789,6 +789,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				c.Set(openAIWSIngressSessionHashContextKey, sessionHash)
 			}
 			toolOutputCoverage := AnalyzeToolCallOutputContextCoverageBytes(currentBridgePayload.payloadRaw)
+			if retry := pendingCompactionMaintenance(c); retry != nil {
+				if err := recoverBridgeCompaction(turn, retry); err != nil {
+					return err
+				}
+				turn--
+				continue
+			}
 			if s.knownInvalidCompaction(c, account.ID, currentBridgePayload.payloadRaw) {
 				return finishRecoveryError(turn, errOpenAIEncryptedCompactionContext)
 			}
@@ -1811,6 +1818,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 		}
 		skipBeforeTurn = false
+		if retry := pendingCompactionMaintenance(c); retry != nil {
+			if err := recoverIngressCompaction(retry); err != nil {
+				return err
+			}
+			continue
+		}
 		if s.knownInvalidCompaction(c, account.ID, currentPayload) {
 			return finishRecoveryError(turn, errOpenAIEncryptedCompactionContext)
 		}

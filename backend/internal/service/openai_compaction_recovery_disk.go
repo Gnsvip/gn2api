@@ -38,13 +38,16 @@ type openAICompactionRecoveryDisk struct {
 }
 
 type compactionDiskStamp struct {
-	expires time.Time
-	invalid bool
+	expires        time.Time
+	invalid        bool
+	limitAccount   int64
+	limitCondition [32]byte
 }
 
 type compactionDiskRecord struct {
 	Version         int       `json:"version"`
 	Scope           string    `json:"scope"`
+	Owner           string    `json:"owner,omitempty"`
 	Key             string    `json:"key"`
 	Input           []byte    `json:"input"` // already gzip compressed
 	Fingerprints    []byte    `json:"fingerprints"`
@@ -54,6 +57,8 @@ type compactionDiskRecord struct {
 	AccountID       int64     `json:"account_id"`
 	Condition       [32]byte  `json:"condition"`
 	Expires         time.Time `json:"expires"`
+	LimitAccount    int64     `json:"limit_account,omitempty"`
+	LimitCondition  [32]byte  `json:"limit_condition,omitempty"`
 }
 
 func compactionDiskName(key string) string {
@@ -233,13 +238,14 @@ func (d *openAICompactionRecoveryDisk) load(s *openAICompactionRecoveryStore) er
 		if r.Replacement {
 			limit = openAIWSContinuationHistoryLimit
 		}
-		valid = valid && r.Version == 1 && r.Scope != "" && strings.HasPrefix(r.Key, r.Scope+":") && compactionDiskName(r.Key) == name &&
+		valid = valid && (r.Version == 1 || r.Version == 2) && (r.Version != 1 || r.Owner == "") && r.Scope != "" && strings.HasPrefix(r.Key, r.Scope+":") && compactionDiskName(r.Key) == name &&
 			len(r.Input) > 0 && len(r.Input) <= openAICompactionRecoveryMaxEntry && len(r.Fingerprints) > 0 && len(r.Fingerprints)%32 == 0 && len(r.Fingerprints)/32 <= limit &&
 			time.Now().Before(r.Expires) && !r.Expires.After(time.Now().Add(openAICompactionRecoveryTTL)) &&
 			((r.Replacement && r.AccountID > 0) || (!r.Replacement && r.CompactionIndex >= 0 && r.CompactionIndex < len(r.Fingerprints)/32))
 		if valid {
-			e := &openAICompactionRecoveryEntry{scope: r.Scope, key: r.Key, input: r.Input, compactionIndex: r.CompactionIndex,
-				invalid: r.Invalid, replacement: r.Replacement, accountID: r.AccountID, condition: r.Condition, expires: r.Expires}
+			e := &openAICompactionRecoveryEntry{scope: r.Scope, owner: r.Owner, key: r.Key, input: r.Input, compactionIndex: r.CompactionIndex,
+				invalid: r.Invalid, replacement: r.Replacement, accountID: r.AccountID, condition: r.Condition, expires: r.Expires,
+				limitAccount: r.LimitAccount, limitCondition: r.LimitCondition}
 			e.output = make([][32]byte, len(r.Fingerprints)/32)
 			for i := range e.output {
 				copy(e.output[i][:], r.Fingerprints[i*32:(i+1)*32])
@@ -252,7 +258,7 @@ func (d *openAICompactionRecoveryDisk) load(s *openAICompactionRecoveryStore) er
 			}
 			continue
 		}
-		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid}
+		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
 	}
 	return d.flush(s, false)
 }
@@ -289,14 +295,16 @@ func (d *openAICompactionRecoveryDisk) flush(s *openAICompactionRecoveryStore, f
 		old, exists := d.written[name]
 		// Refresh expiry at most every five minutes while a snapshot is used.
 		// Rejections and new snapshots are written immediately; shutdown flushes all.
-		if exists && sizes[name] > 0 && old.invalid == e.invalid && (old.expires.Equal(e.expires) || (!force && e.expires.Sub(old.expires) < 5*time.Minute)) {
+		if exists && sizes[name] > 0 && old.invalid == e.invalid && old.limitAccount == e.limitAccount && old.limitCondition == e.limitCondition && (old.expires.Equal(e.expires) || (!force && e.expires.Sub(old.expires) < 5*time.Minute)) {
 			continue
 		}
 		fingerprints := make([]byte, 0, len(e.output)*32)
 		for _, hash := range e.output {
 			fingerprints = append(fingerprints, hash[:]...)
 		}
-		r := compactionDiskRecord{1, e.scope, e.key, e.input, fingerprints, e.compactionIndex, e.invalid, e.replacement, e.accountID, e.condition, e.expires}
+		r := compactionDiskRecord{Version: 2, Scope: e.scope, Owner: e.owner, Key: e.key, Input: e.input, Fingerprints: fingerprints,
+			CompactionIndex: e.compactionIndex, Invalid: e.invalid, Replacement: e.replacement, AccountID: e.accountID, Condition: e.condition, Expires: e.expires,
+			LimitAccount: e.limitAccount, LimitCondition: e.limitCondition}
 		raw, err := json.Marshal(r)
 		if err != nil {
 			return err
@@ -313,7 +321,7 @@ func (d *openAICompactionRecoveryDisk) flush(s *openAICompactionRecoveryStore, f
 			return err
 		}
 		total += int64(len(sealed)) - sizes[name]
-		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid}
+		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
 	}
 	return nil
 }
