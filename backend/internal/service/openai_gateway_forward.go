@@ -887,7 +887,7 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 	lineageSessionHash := ""
 	if stateStore := s.getOpenAIWSStateStore(); stateStore != nil && stateStore.HasAnySessionInvalidEncryptedContent() {
 		lineageSessionHash = s.GenerateSessionHash(c, body)
-		if invalidDigests := stateStore.GetSessionInvalidEncryptedContentDigests(lineageGroupID, lineageSessionHash); len(invalidDigests) > 0 {
+		if invalidDigests := s.sessionInvalidEncryptedContentDigests(lineageGroupID, lineageSessionHash, account.ID); len(invalidDigests) > 0 {
 			strippedBody, strippedCount, stripErr := s.stripSessionInvalidEncryptedContentLogged(
 				body, invalidDigests, "invalid_encrypted_lineage_strip", account.ID, 0, lineageGroupID, lineageSessionHash,
 			)
@@ -1008,7 +1008,7 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 				if lineageSessionHash == "" {
 					lineageSessionHash = s.GenerateSessionHash(c, lineageEntryBody)
 				}
-				s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests)
+				s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests, account.ID)
 			}
 			previousResponseID := openAIWSPayloadString(wsReqBody, "previous_response_id")
 			hasFunctionCallOutput := HasFunctionCallOutput(wsReqBody)
@@ -1205,7 +1205,9 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 		}
 		requestView = newOpenAIRequestView(body)
 		reqBody = httpFallbackBody
-		if action.markDisable {
+		// Opaque close frames are recorded at the reader even after output.
+		// Do not count that same failure twice when this turn can fall back.
+		if action.markDisable && action.reason != "upstream_policy_close" {
 			s.markOpenAIWSSessionDisabled(wsSessionScope, action.reason)
 		}
 		wsDecision = openAIWSHTTPDecision("ws_session_fallback:" + action.reason)
@@ -1347,7 +1349,7 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 						if lineageSessionHash == "" {
 							lineageSessionHash = s.GenerateSessionHash(c, lineageEntryBody)
 						}
-						s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests)
+						s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests, account.ID)
 					}
 					httpInvalidEncryptedContentRetryTried = true
 					rejectedFieldRetryState.remember(body)

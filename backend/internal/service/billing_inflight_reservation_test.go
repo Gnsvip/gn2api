@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -14,7 +17,9 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/sjson"
 )
 
 func TestEstimateInflightReservationCost(t *testing.T) {
@@ -622,4 +627,80 @@ func TestInflightEstimate_AccountMappingNoNegativeCaching(t *testing.T) {
 	est, priced := svc.EstimateInflightReservation(ctx, apiKey, req)
 	require.True(t, priced, "new mapping (incl. wildcard) visible on next request")
 	require.Greater(t, est, 0.0)
+}
+
+func TestCompactionRecompactBillsEachCallAndStopsOnBalance(t *testing.T) {
+	for _, failSecond := range []bool{false, true} {
+		t.Run(fmt.Sprint(failSecond), func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				if failSecond && calls == 2 {
+					w.WriteHeader(400)
+					_, _ = fmt.Fprint(w, `{"error":{"code":"context_length_exceeded","message":"maximum context length"},"usage":{"input_tokens":70,"output_tokens":3}}`)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"id":"cmp_same","output":[%s],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"output_tokens":5}}`, recompactSummary)
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			account.Type = AccountTypeAPIKey
+			account.Credentials = map[string]any{"api_key": "test"}
+			base, _ := url.Parse(upstream.URL)
+			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+			usageRepo := &recoveryBillingLogRepo{}
+			userRepo := &openAIRecordUsageUserRepoStub{}
+			billingRepo := &openAIRecordUsageBillingRepoStub{}
+			billingFixture := newOpenAIRecordUsageServiceWithBillingRepoForTest(usageRepo, billingRepo, userRepo, &openAIRecordUsageSubRepoStub{}, nil)
+			svc.billingService = billingFixture.billingService
+			svc.usageLogRepo = usageRepo
+			svc.usageBillingRepo = billingRepo
+			svc.userRepo = userRepo
+			svc.deferredService = &DeferredService{}
+			svc.cfg.Default.RateMultiplier = 1.1
+			cache := newMemInflightCache(10)
+			svc.billingCacheService = newInflightSvc(t, cache, 60)
+			c, _ := httpBridgeContext("billing")
+			key := &APIKey{ID: 123, User: &User{ID: 7}}
+			c.Set("api_key", key)
+			SetOpenAICompactionBilling(c, &OpenAIRecordUsageInput{APIKey: key, User: key.User, Account: account, SessionID: "billing", PricingAt: time.Now()})
+			ctx := context.WithValue(context.Background(), ctxkey.ClientRequestID, "same-parent")
+			body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+			body = ReplaceModelInBody(body, "gpt-5.1")
+			body, _ = sjson.SetBytes(body, "service_tier", "flex")
+			for n := 1; n <= 2; n++ {
+				_, err := svc.runRecoveryCompact(ctx, c, account, body, recoveryItems(t, recoveryImage), n)
+				if failSecond && n == 2 {
+					var limit *openAIRecoveryCompactLimitError
+					require.ErrorAs(t, err, &limit)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			require.Equal(t, 2, billingRepo.calls)
+			require.Len(t, usageRepo.rows, 2)
+			require.NotEqual(t, usageRepo.rows[0].RequestID, usageRepo.rows[1].RequestID)
+			for _, row := range usageRepo.rows {
+				require.Contains(t, row.RequestID, "recovery_compact:client:same-parent:")
+				require.Greater(t, row.ActualCost, 0.0)
+				require.Nil(t, row.FirstTokenMs)
+				require.NotNil(t, row.ServiceTier)
+				require.Equal(t, "flex", *row.ServiceTier)
+				require.Nil(t, row.ReasoningEffort, "public compact has no reasoning-effort parameter")
+			}
+			require.Equal(t, 80, usageRepo.rows[0].InputTokens)
+			require.Equal(t, 20, usageRepo.rows[0].CacheReadTokens)
+			if failSecond {
+				require.Equal(t, 70, usageRepo.rows[1].InputTokens)
+			}
+			require.Zero(t, cache.count(), "release reservations after synchronous settlement")
+			cache.mu.Lock()
+			cache.balance = 0
+			cache.mu.Unlock()
+			_, err := svc.runRecoveryCompact(ctx, c, account, body, recoveryItems(t, recoveryImage), 3)
+			require.True(t, errors.Is(err, ErrInsufficientBalance), err)
+			require.Equal(t, 2, calls, "no upstream call after funds exhausted")
+		})
+	}
 }

@@ -99,6 +99,7 @@ func writeOpenAIRecompactionError(c *gin.Context, cause error) error {
 			}
 		}
 		c.Data(status, "application/json", []byte(`{"error":`+gjson.GetBytes(data, "response.error").Raw+`}`))
+		MarkResponseCommitted(c)
 	}
 	// A terminal recovery failure must not retain an inner account-failover
 	// error after its response has already been committed.

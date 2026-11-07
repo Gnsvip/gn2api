@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -326,6 +327,89 @@ func TestNativeWSRecoveryKeepsToolContinuation(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
+		})
+	}
+}
+
+func TestOpaquePolicyCloseIsSessionScopedAndPreservesExplicitPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		fallback bool
+	}{
+		{"empty1008", coderws.CloseError{Code: coderws.StatusPolicyViolation}, true},
+		{"explicitPolicy", coderws.CloseError{Code: coderws.StatusPolicyViolation, Reason: "policy denied"}, false},
+		{"normal", coderws.CloseError{Code: coderws.StatusNormalClosure}, false},
+		{"cancel", context.Canceled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &OpenAIGatewayService{}
+			a := &Account{ID: 23}
+			c, _ := httpBridgeContext("closed-session")
+			scope := resolveOpenAIWSSessionScope(c, a, []byte(`{"input":"hello"}`))
+			require.Equal(t, tc.fallback, s.recordOpenAIWSOpaquePolicyClose(c, tc.err))
+			if tc.fallback {
+				require.Equal(t, "upstream_policy_close", s.openAIWSSessionDisabledReason(scope))
+				other := scope
+				other.AccountID++
+				require.Empty(t, s.openAIWSSessionDisabledReason(other))
+				other = scope
+				other.Session = "other"
+				require.Empty(t, s.openAIWSSessionDisabledReason(other))
+			} else {
+				require.Empty(t, s.openAIWSSessionDisabledReason(scope))
+			}
+		})
+	}
+}
+
+func TestHTTPBridgeOpaquePolicyCloseDoesNotReplayWrittenTurn(t *testing.T) {
+	for _, wrote := range []bool{false, true} {
+		t.Run(fmt.Sprint(wrote), func(t *testing.T) {
+			var dials atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				dials.Add(1)
+				if _, _, err = conn.ReadMessage(); err != nil {
+					return
+				}
+				if wrote {
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"visible partial answer"}`))
+				}
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, ""), time.Now().Add(time.Second))
+			}))
+			defer server.Close()
+			s, a, u := httpBridgeFixture(t, server.URL)
+			body := []byte(`{"model":"gpt-6-astra","input":"hello","stream":true}`)
+			for _, response := range u.responses {
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Body = io.NopCloser(strings.NewReader("data: " + string(autoContinuationEvent("resp_http", autoContinuationAnswer)) + "\n\n"))
+			}
+			c, rec := httpBridgeContext("opaque-policy")
+			result, err := s.Forward(c.Request.Context(), c, a, body)
+			if wrote {
+				require.Error(t, err)
+				require.Nil(t, result)
+				require.Zero(t, u.callCount, "must not rerun a turn after visible output")
+				require.Contains(t, rec.Body.String(), "visible partial answer")
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.False(t, result.OpenAIWSMode)
+				require.Equal(t, 1, u.callCount)
+			}
+			scope := resolveOpenAIWSSessionScope(c, a, body)
+			require.Equal(t, "upstream_policy_close", s.openAIWSSessionDisabledReason(scope))
+			require.Equal(t, 1, s.openAIWSSessionStateLocked(scope).failures, "one close must count as one failure")
+			c, _ = httpBridgeContext("opaque-policy")
+			next, err := s.Forward(c.Request.Context(), c, a, body)
+			require.NoError(t, err)
+			require.False(t, next.OpenAIWSMode)
+			require.Equal(t, int32(1), dials.Load(), "next request must use HTTP, not repeat the broken WS route")
 		})
 	}
 }

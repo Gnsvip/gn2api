@@ -1620,6 +1620,10 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ModeOffReturnsPo
 			return
 		}
 
+		// A transport cooldown cannot override an explicit account mode off.
+		scope := resolveOpenAIWSSessionScope(ginCtx, account, firstMessage)
+		svc.markOpenAIWSSessionDisabled(scope, "upstream_policy_close")
+
 		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()

@@ -711,6 +711,7 @@ readLoop:
 		}
 		if readErr != nil {
 			lease.MarkBroken()
+			opaquePolicyClose := !clientDisconnected && ctx.Err() == nil && s.recordOpenAIWSOpaquePolicyClose(c, readErr)
 			closeStatus, closeReason := summarizeOpenAIWSReadCloseError(readErr)
 			logOpenAIWSModeInfo(
 				"read_fail account_id=%d conn_id=%s wrote_downstream=%v close_status=%s close_reason=%s cause=%s events=%d token_events=%d terminal_events=%d buffered_pending=%d buffered_flushed=%d first_event=%s last_event=%s",
@@ -735,6 +736,9 @@ readLoop:
 				break
 			}
 			if !wroteDownstream {
+				if opaquePolicyClose {
+					return nil, wrapOpenAIWSFallback("upstream_policy_close", readErr)
+				}
 				return nil, wrapOpenAIWSFallback(classifyOpenAIWSReadFallbackReason(readErr), readErr)
 			}
 			setOpsUpstreamError(c, 0, sanitizeUpstreamErrorMessage(readErr.Error()), "")

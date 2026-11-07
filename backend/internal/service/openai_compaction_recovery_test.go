@@ -311,6 +311,82 @@ func TestCompactionRecoveryLegacyHTTPAndAccountSwitch(t *testing.T) {
 	require.Equal(t, 1, strings.Count(string(upstream.bodies[2]), "retained-tail"))
 }
 
+func TestCompactionAccountSwitchCanRevalidateCipherWithoutUndoRecord(t *testing.T) {
+	svc, account, upstream := httpBridgeFixture(t, "http://unused.invalid")
+	account.Type = AccountTypeAPIKey
+	account.Credentials = map[string]any{"api_key": "test-key"}
+	body := compactionTestBody(recoverySummary+","+recoveryUser, false)
+	c, _ := httpBridgeContext("cipher-account-switch")
+	session := svc.GenerateSessionHash(c, body)
+	svc.markOpenAIWSInvalidEncryptedContentLineage(0, session, collectOpenAIEncryptedContentDigestsRaw(body), account.ID+1)
+	result, err := svc.Forward(c.Request.Context(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 1, upstream.callCount)
+	require.Contains(t, string(upstream.bodies[0]), "recovery-test-cipher", "keep the complete summary when revalidating with another account")
+}
+
+func TestCompactionErrorsCommitExactlyOneJSONResponse(t *testing.T) {
+	for _, recompact := range []bool{false, true} {
+		c, rec := httpBridgeContext("terminal-error")
+		if recompact {
+			require.Error(t, writeOpenAIRecompactionError(c, fmt.Errorf("cannot recover history")))
+		} else {
+			require.ErrorIs(t, writeOpenAIEncryptedCompactionError(c), errOpenAIEncryptedCompactionContext)
+		}
+		require.True(t, IsResponseCommitted(c), "handler must not append response.failed after this terminal JSON")
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		require.True(t, json.Valid(rec.Body.Bytes()))
+		require.NotEmpty(t, gjson.GetBytes(rec.Body.Bytes(), "error.code").String())
+	}
+}
+
+func TestNativeWSCooldownUsesHTTPAndKeepsToolHistory(t *testing.T) {
+	for _, mode := range []string{OpenAIWSIngressModeCtxPool, OpenAIWSIngressModePassthrough} {
+		t.Run(mode, func(t *testing.T) {
+			requests := make(chan []byte, 2)
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if websocket.IsWebSocketUpgrade(r) {
+					http.Error(w, "WS must stay in cooldown", http.StatusBadRequest)
+					return
+				}
+				raw, _ := io.ReadAll(r.Body)
+				requests <- raw
+				n := calls.Add(1)
+				id := fmt.Sprintf("resp_http_%d", n)
+				output := autoContinuationCall
+				if n == 2 {
+					output = autoContinuationAnswer
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":%q,\"status\":\"in_progress\"}}\n\n", id)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", autoContinuationEvent(id, output))
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			base, _ := url.Parse(upstream.URL)
+			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+			svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+			account.Extra = map[string]any{"openai_oauth_responses_websockets_v2_mode": mode}
+			first := autoContinuationBody(true)
+			c, _ := httpBridgeContext("recovery-e2e")
+			scope := resolveOpenAIWSSessionScope(c, account, first)
+			svc.markOpenAIWSSessionDisabled(scope, "upstream_policy_close")
+			second := []byte(`{"model":"gpt-6-astra","store":false,"stream":true,"previous_response_id":"resp_http_1","input":[` + autoContinuationTool + `]}`)
+			runCompactionRecoveryNativeClient(t, svc, account, [][]byte{first, second})
+			require.Equal(t, int32(2), calls.Load())
+			<-requests
+			followup := <-requests
+			require.Empty(t, gjson.GetBytes(followup, "previous_response_id").String())
+			require.Contains(t, string(followup), "function_call_output")
+			require.True(t, AnalyzeToolCallOutputContextCoverageBytes(followup).ContextCoversAllCallIDs)
+			require.Equal(t, "upstream_policy_close", svc.openAIWSSessionDisabledReason(scope))
+
+		})
+	}
+}
+
 // Replace only the network destination, preserving the production request and
 // streaming implementation. Tests never reach an external upstream.
 type compactionRecoveryLocalHTTP struct{ base *url.URL }
@@ -504,7 +580,8 @@ func runCompactionRecoveryNativeClient(t *testing.T, svc *OpenAIGatewayService, 
 			BeforeTurn: func(n int) error { before.Add(1); beforeTurns = append(beforeTurns, n); return nil },
 			AfterTurn:  func(n int, _ *OpenAIForwardResult, _ error) { after.Add(1); afterTurns = append(afterTurns, n) },
 		}
-		if account.ResolveOpenAIResponsesWebSocketV2Mode(svc.cfg.Gateway.OpenAIWS.IngressModeDefault) == OpenAIWSIngressModePassthrough {
+		if account.ResolveOpenAIResponsesWebSocketV2Mode(svc.cfg.Gateway.OpenAIWS.IngressModeDefault) == OpenAIWSIngressModePassthrough &&
+			svc.openAIWSSessionDisabledReason(resolveOpenAIWSSessionScope(c, account, first)) == "" {
 			before.Add(1) // First passthrough turn is admitted by the handshake.
 			beforeTurns = append(beforeTurns, 1)
 		}
@@ -608,7 +685,7 @@ func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
 			svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 			body := compactionTestBody(recoverySummary+","+recoveryUser, true)
 			scope, _ := resolveOpenAIWSExecutionScope(c, body, 123)
-			svc.markOpenAIWSInvalidEncryptedContentLineage(0, scope, []string{openAIEncryptedContentDigest("recovery-test-cipher")})
+			svc.markOpenAIWSInvalidEncryptedContentLineage(0, scope, []string{openAIEncryptedContentDigest("recovery-test-cipher")}, account.ID)
 			runCompactionRecoveryNativeClient(t, svc, account, [][]byte{body})
 			require.Len(t, requests, 1, "known-invalid summary should be restored before any upstream attempt")
 			sent := <-requests

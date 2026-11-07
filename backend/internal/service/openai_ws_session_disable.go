@@ -1,11 +1,13 @@
 package service
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -69,6 +71,26 @@ type openAIWSSessionDisableState struct {
 const openAIWSSessionRegistryLimit = 8192
 const openAIWSSessionIdleLifetime = 24 * time.Hour
 const openAIWSSessionRecoveryContextKey = "openai_ws_session_recovery"
+
+// A peer can close an otherwise productive socket with 1008 and no reason.
+// Remember the transport failure for the next request, including when this
+// turn already wrote content and must not be replayed. Explicit policy reasons
+// and auth errors keep their existing non-fallback behavior.
+func (s *OpenAIGatewayService) recordOpenAIWSOpaquePolicyClose(c *gin.Context, err error) bool {
+	var closeErr coderws.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != coderws.StatusPolicyViolation || strings.TrimSpace(closeErr.Reason) != "" {
+		return false
+	}
+	if c == nil || c.Request == nil || c.Request.Context().Err() != nil {
+		return false
+	}
+	if value, ok := c.Get("openai_ws_session_scope"); ok {
+		if scope, ok := value.(openAIWSSessionScope); ok {
+			s.markOpenAIWSSessionDisabled(scope, "upstream_policy_close")
+		}
+	}
+	return true
+}
 
 type openAIWSSessionRecovery struct {
 	service  *OpenAIGatewayService
@@ -248,6 +270,7 @@ func openAIWSSessionFallbackActionFor(reason string) openAIWSSessionFallbackActi
 		// 避免一次边缘抖动把整段会话钉在 HTTP 上。
 		return openAIWSSessionFallbackAction{fallbackHTTP: true, reason: reason}
 	case "dial_failed",
+		"upstream_policy_close",
 		"upstream_5xx",
 		"read_event",
 		"write_request",

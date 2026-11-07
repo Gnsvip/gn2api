@@ -67,31 +67,31 @@ func TestInvalidEncryptedLineageRenewsOnlyWhenUsed(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	store := svc.getOpenAIWSStateStore().(*defaultOpenAIWSStateStore)
 	digest := openAIEncryptedContentDigest("stale")
-	store.MarkSessionInvalidEncryptedContent(1, "session", []string{digest}, time.Minute)
+	store.MarkSessionInvalidEncryptedContent(1, openAIEncryptedLineageAccountKey("session", 1), []string{digest}, time.Minute)
 	deadline := func() time.Time {
 		store.sessionInvalidEncryptedMu.RLock()
 		defer store.sessionInvalidEncryptedMu.RUnlock()
-		return store.sessionInvalidEncrypted["1:session"].expiresAt
+		return store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)].expiresAt
 	}
 	before := deadline()
-	invalid := svc.sessionInvalidEncryptedContentDigests(1, "session")
+	invalid := svc.sessionInvalidEncryptedContentDigests(1, "session", 1)
 	require.Equal(t, before, deadline(), "lookup alone must not extend lifetime")
 	_, count, err := svc.stripSessionInvalidEncryptedContentLogged([]byte(`{"input":[{"type":"reasoning","encrypted_content":"fresh"}]}`), invalid, "test", 1, 1, 1, "session")
 	require.NoError(t, err)
 	require.Zero(t, count)
 	require.Equal(t, before, deadline(), "unrelated requests must not keep old records alive")
-	require.Empty(t, svc.sessionInvalidEncryptedContentDigests(2, "session"))
+	require.Empty(t, svc.sessionInvalidEncryptedContentDigests(2, "session", 1))
 	_, count, err = svc.stripSessionInvalidEncryptedContentLogged([]byte(`{"input":[{"type":"reasoning","encrypted_content":"stale"}]}`), invalid, "test", 1, 1, 1, "session")
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	require.True(t, deadline().After(before.Add(time.Minute)))
 	// Replay-only continuations also keep actively used records alive.
 	store.sessionInvalidEncryptedMu.Lock()
-	binding := store.sessionInvalidEncrypted["1:session"]
+	binding := store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)]
 	binding.expiresAt = before
-	store.sessionInvalidEncrypted["1:session"] = binding
+	store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)] = binding
 	store.sessionInvalidEncryptedMu.Unlock()
-	_, err = svc.stripSessionInvalidEncryptedContentReplay([]json.RawMessage{json.RawMessage(`{"type":"reasoning","encrypted_content":"stale"}`)}, invalid, 1, "session")
+	_, err = svc.stripSessionInvalidEncryptedContentReplay([]json.RawMessage{json.RawMessage(`{"type":"reasoning","encrypted_content":"stale"}`)}, invalid, 1, "session", 1)
 	require.NoError(t, err)
 	require.True(t, deadline().After(before))
 	// Concurrent requests merge records instead of losing another turn's mark.
@@ -100,19 +100,19 @@ func TestInvalidEncryptedLineageRenewsOnlyWhenUsed(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			store.MarkSessionInvalidEncryptedContent(1, "session", []string{fmt.Sprint(i)}, time.Hour)
-			svc.touchSessionInvalidEncryptedContent(1, "session", invalid)
+			store.MarkSessionInvalidEncryptedContent(1, openAIEncryptedLineageAccountKey("session", 1), []string{fmt.Sprint(i)}, time.Hour)
+			svc.touchSessionInvalidEncryptedContent(1, "session", invalid, 1)
 		}(i)
 	}
 	wg.Wait()
-	require.Len(t, store.GetSessionInvalidEncryptedContentDigests(1, "session"), 17)
+	require.Len(t, store.GetSessionInvalidEncryptedContentDigests(1, openAIEncryptedLineageAccountKey("session", 1)), 17)
 	store.sessionInvalidEncryptedMu.Lock()
-	binding = store.sessionInvalidEncrypted["1:session"]
+	binding = store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)]
 	binding.expiresAt = time.Now().Add(-time.Second)
-	store.sessionInvalidEncrypted["1:session"] = binding
+	store.sessionInvalidEncrypted["1:"+openAIEncryptedLineageAccountKey("session", 1)] = binding
 	store.sessionInvalidEncryptedMu.Unlock()
 	store.lastCleanupUnixNano.Store(0)
-	require.Empty(t, svc.sessionInvalidEncryptedContentDigests(1, "session"))
+	require.Empty(t, svc.sessionInvalidEncryptedContentDigests(1, "session", 1))
 	require.False(t, store.HasAnySessionInvalidEncryptedContent(), "idle sessions must still be reclaimed")
 }
 
@@ -275,7 +275,7 @@ func TestWSIngressKnownInvalidCompactionAndReplacementHistory(t *testing.T) {
 					}
 					c, _ := gin.CreateTestContext(httptest.NewRecorder())
 					c.Request = r
-					svc.markOpenAIWSInvalidEncryptedContentLineage(getOpenAIGroupIDFromContext(c), svc.GenerateSessionHash(c, first), []string{openAIEncryptedContentDigest("stale")})
+					svc.markOpenAIWSInvalidEncryptedContentLineage(getOpenAIGroupIDFromContext(c), svc.GenerateSessionHash(c, first), []string{openAIEncryptedContentDigest("stale")}, account.ID)
 					err = svc.ProxyResponsesWebSocketFromClient(r.Context(), c, conn, account, "sk-test", first, nil)
 					errCh <- err
 					var closeErr *OpenAIWSClientCloseError

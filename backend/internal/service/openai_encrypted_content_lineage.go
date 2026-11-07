@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -72,6 +73,7 @@ func writeOpenAIEncryptedCompactionError(c *gin.Context) error {
 		"type": "invalid_request_error", "code": openAIWSFallbackReasonInvalidEncryptedContent,
 		"message": errOpenAIEncryptedCompactionContext.Error(),
 	}})
+	MarkResponseCommitted(c)
 	return errOpenAIEncryptedCompactionContext
 }
 
@@ -326,7 +328,17 @@ func stripOpenAIInvalidEncryptedContentRaw(payload []byte, invalid map[string]st
 
 // markOpenAIWSInvalidEncryptedContentLineage 把本次被上游拒绝的密文摘要写入
 // 会话 lineage。digests 须在剥离前收集。
-func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineage(groupID int64, sessionHash string, digests []string) {
+func openAIEncryptedLineageAccountKey(sessionHash string, accountID int64) string {
+	if accountID <= 0 || strings.TrimSpace(sessionHash) == "" {
+		return ""
+	}
+	// An account's rejection does not prove the same cipher is invalid for
+	// another credential owner. Never reuse the old, account-free blacklist.
+	return fmt.Sprintf("account:%d:%s", accountID, sessionHash)
+}
+
+func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineage(groupID int64, sessionHash string, digests []string, accountID int64) {
+	sessionHash = openAIEncryptedLineageAccountKey(sessionHash, accountID)
 	if s == nil || len(digests) == 0 || strings.TrimSpace(sessionHash) == "" {
 		return
 	}
@@ -339,7 +351,8 @@ func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineage(groupI
 
 // sessionInvalidEncryptedContentDigests 返回会话已知失效密文摘要；全局无记录
 // 时（常态）零成本返回 nil。
-func (s *OpenAIGatewayService) sessionInvalidEncryptedContentDigests(groupID int64, sessionHash string) map[string]struct{} {
+func (s *OpenAIGatewayService) sessionInvalidEncryptedContentDigests(groupID int64, sessionHash string, accountID int64) map[string]struct{} {
+	sessionHash = openAIEncryptedLineageAccountKey(sessionHash, accountID)
 	if s == nil || strings.TrimSpace(sessionHash) == "" {
 		return nil
 	}
@@ -352,18 +365,18 @@ func (s *OpenAIGatewayService) sessionInvalidEncryptedContentDigests(groupID int
 
 // Renew only when a request/replay actually uses a known invalid item, not on
 // lookups. Mark merges under the store lock and preserves capacity/idle expiry.
-func (s *OpenAIGatewayService) touchSessionInvalidEncryptedContent(groupID int64, sessionHash string, invalid map[string]struct{}) {
+func (s *OpenAIGatewayService) touchSessionInvalidEncryptedContent(groupID int64, sessionHash string, invalid map[string]struct{}, accountID int64) {
 	digests := make([]string, 0, len(invalid))
 	for digest := range invalid {
 		digests = append(digests, digest)
 	}
-	s.markOpenAIWSInvalidEncryptedContentLineage(groupID, sessionHash, digests)
+	s.markOpenAIWSInvalidEncryptedContentLineage(groupID, sessionHash, digests, accountID)
 }
 
-func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentReplay(items []json.RawMessage, invalid map[string]struct{}, groupID int64, sessionHash string) ([]json.RawMessage, error) {
+func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentReplay(items []json.RawMessage, invalid map[string]struct{}, groupID int64, sessionHash string, accountID int64) ([]json.RawMessage, error) {
 	next, count, err := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
 	if count > 0 || errors.Is(err, errOpenAIEncryptedCompactionContext) {
-		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid)
+		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid, accountID)
 	}
 	return next, err
 }
@@ -396,6 +409,7 @@ func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineageFromPay
 		getOpenAIGroupIDFromContext(c),
 		s.openAIWSLineageSessionHashFromContext(c, payload),
 		digests,
+		accountID,
 	)
 	logOpenAIWSModeInfo("%s account_id=%d turn=%d digests=%d", logKey, accountID, turn, len(digests))
 }
@@ -414,7 +428,7 @@ func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 ) ([]byte, int, error) {
 	strippedPayload, strippedCount, stripErr := stripOpenAIInvalidEncryptedContentRaw(payload, invalid)
 	if strippedCount > 0 || errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
-		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid)
+		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid, accountID)
 	}
 	if errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
 		logOpenAIWSModeInfo("%s_blocked account_id=%d turn=%d reason=unrecoverable_compaction_context", logKey, accountID, turn)

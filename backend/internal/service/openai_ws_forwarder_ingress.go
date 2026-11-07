@@ -114,9 +114,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
 		disabledReason, wsRecovery = s.beginOpenAIWSSessionRecovery(wsSessionScope, firstClientMessage)
 	}
-	if disabledReason != "" {
-		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "websocket is unavailable for this session; use HTTP", nil)
-	}
 	c.Set(openAIWSSessionRecoveryContextKey, wsRecovery)
 	defer wsRecovery.finish(false)
 	if wsRecovery != nil {
@@ -176,6 +173,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		switch ingressMode {
 		case OpenAIWSIngressModePassthrough:
+			if disabledReason != "" {
+				forceHTTPBridge = true
+				break
+			}
 			if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 				return fmt.Errorf("websocket ingress requires ws_v2 transport, got=%s", wsDecision.Transport)
 			}
@@ -208,6 +209,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 	}
+	// A transport cooldown may bridge an admitted session, but must not
+	// override the account's explicit ingress-off setting checked above.
+	forceHTTPBridge = forceHTTPBridge || disabledReason != ""
 	if !forceHTTPBridge && wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 		return fmt.Errorf("websocket ingress requires ws_v2 transport, got=%s", wsDecision.Transport)
 	}
@@ -789,7 +793,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				(toolOutputCoverage.HasFunctionCallOutput && !toolOutputCoverage.ContextCoversAllCallIDs)
 			// 剥离本会话已知失效的加密项，阻断同一失效密文随历史反复触发上游拒绝。
 			// 历史序列须同步剥离，否则与已剥离的当前 input 项错位，prefix 复用失配。
-			if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash); len(invalidDigests) > 0 {
+			if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash, account.ID); len(invalidDigests) > 0 {
 				strippedPayload, strippedCount, stripErr := s.stripSessionInvalidEncryptedContentLogged(
 					currentBridgePayload.payloadRaw, invalidDigests, "ingress_ws_http_bridge_invalid_encrypted_lineage_strip", account.ID, turn, groupID, sessionHash,
 				)
@@ -808,7 +812,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					currentBridgePayload.payloadBytes = len(strippedPayload)
 				}
 				if needsBridgeReplay && bridgeReplayInputExists {
-					bridgeReplayInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(bridgeReplayInput, invalidDigests, groupID, sessionHash)
+					bridgeReplayInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(bridgeReplayInput, invalidDigests, groupID, sessionHash, account.ID)
 					if stripErr != nil {
 						if retry := s.retryCompactionHistory(c); retry != nil {
 							if err := recoverBridgeCompaction(turn, retry); err != nil {
@@ -821,7 +825,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					}
 				}
 				if needsBridgeReplay && bridgeAccountFailoverInputExists {
-					bridgeAccountFailoverInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(bridgeAccountFailoverInput, invalidDigests, groupID, sessionHash)
+					bridgeAccountFailoverInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(bridgeAccountFailoverInput, invalidDigests, groupID, sessionHash, account.ID)
 					if stripErr != nil {
 						if retry := s.retryCompactionHistory(c); retry != nil {
 							if err := recoverBridgeCompaction(turn, retry); err != nil {
@@ -1310,6 +1314,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			upstreamMessage, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 			if readErr != nil {
 				lease.MarkBroken()
+				if ctx.Err() == nil {
+					s.recordOpenAIWSOpaquePolicyClose(c, readErr)
+				}
 				return nil, wrapOpenAIWSIngressTurnError(
 					"read_upstream",
 					fmt.Errorf("read upstream websocket event: %w", readErr),
@@ -1415,7 +1422,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				if fallbackReason == openAIWSFallbackReasonInvalidEncryptedContent {
 					// 记录被上游拒绝的密文摘要；错误照旧透传，下一轮进场时按摘要预剥离。
 					if digests := collectOpenAIEncryptedContentDigestsRaw(payload); len(digests) > 0 {
-						s.markOpenAIWSInvalidEncryptedContentLineage(groupID, sessionHash, digests)
+						s.markOpenAIWSInvalidEncryptedContentLineage(groupID, sessionHash, digests, account.ID)
 						logOpenAIWSModeInfo(
 							"ingress_ws_invalid_encrypted_lineage_mark account_id=%d turn=%d digests=%d",
 							account.ID,
@@ -1856,7 +1863,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		skipBeforeTurn = false
 		// 剥离本会话已知失效的加密项，阻断同一失效密文随历史反复触发上游拒绝。
 		// 历史序列须同步剥离，否则与已剥离的当前 input 项错位，prefix 复用失配。
-		if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash); len(invalidDigests) > 0 {
+		if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash, account.ID); len(invalidDigests) > 0 {
 			strippedPayload, strippedCount, stripErr := s.stripSessionInvalidEncryptedContentLogged(
 				currentPayload, invalidDigests, "ingress_ws_invalid_encrypted_lineage_strip", account.ID, turn, groupID, sessionHash,
 			)
@@ -1946,9 +1953,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		// A full new root replaces cached history. Only validate/renew cached
 		// invalid ciphers if this turn actually continues that history.
 		if currentPreviousResponseID != "" && lastTurnReplayInputExists {
-			if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash); len(invalidDigests) > 0 {
+			if invalidDigests := s.sessionInvalidEncryptedContentDigests(groupID, sessionHash, account.ID); len(invalidDigests) > 0 {
 				var stripErr error
-				lastTurnReplayInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(lastTurnReplayInput, invalidDigests, groupID, sessionHash)
+				lastTurnReplayInput, stripErr = s.stripSessionInvalidEncryptedContentReplay(lastTurnReplayInput, invalidDigests, groupID, sessionHash, account.ID)
 				if stripErr != nil {
 					if retry := s.retryCompactionHistory(c); retry != nil {
 						if err := recoverIngressCompaction(retry); err != nil {

@@ -1531,6 +1531,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 		return NewOpenAIWSClientCloseError(status, reason, cause)
 	}
 
+	if relayExit != nil && relayExit.Stage == "read_upstream" {
+		s.recordOpenAIWSOpaquePolicyClose(c, relayExit.Err)
+	}
 	resultRequestModel, resultUpstreamModel := usageMeta.turnModels(relayResult.RequestModel)
 	result := &OpenAIForwardResult{
 		RequestID: relayResult.RequestID,
