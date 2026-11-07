@@ -31,6 +31,7 @@ func officialBoundaryAuditClient(t *testing.T, svc *OpenAIGatewayService, accoun
 			return
 		}
 		defer conn.CloseNow()
+		conn.SetReadLimit(ResolveOpenAIWSClientReadLimitBytes(svc.cfg))
 		_, first, err := conn.Read(ctx)
 		if err != nil {
 			errs <- err

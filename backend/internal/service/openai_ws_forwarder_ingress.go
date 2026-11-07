@@ -1506,7 +1506,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				// Keep lifecycle frames private until this attempt can no longer
 				// recover. Never replay after emitting a tool or content event.
-				if stageCompaction && !wroteDownstream && !openAIStreamDataStartsClientOutput(string(clientMessage), eventType) && !isTerminalEvent && eventType != "error" {
+				if stageCompaction && !wroteDownstream && !openAIWSDataStartsStreamingOutput(clientMessage, eventType) && !isTerminalEvent && eventType != "error" {
 					compactionPendingBytes += len(clientMessage)
 					if int64(compactionPendingBytes) > openAIFirstOutputStageMaxBytes {
 						return nil, errors.New("compaction recovery first-output staging limit exceeded")

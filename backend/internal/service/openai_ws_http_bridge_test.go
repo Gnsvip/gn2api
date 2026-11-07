@@ -16,10 +16,62 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func TestOpenAIWSHTTPBridgeCompressedToolContinuationKeepsFullHistory(t *testing.T) {
+	svc, account, upstream := httpBridgeFixture(t, "http://127.0.0.1:1")
+	svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	svc.cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	account.Type = AccountTypeAPIKey
+	account.Credentials = map[string]any{"api_key": "fake-key", "base_url": "https://relay.example"}
+	account.Extra = map[string]any{
+		"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge,
+		"openai_http_request_compression":            "zstd",
+	}
+	upstream.responses = nil
+	for i, output := range []string{autoContinuationCall, autoContinuationAnswer, autoContinuationAnswer} {
+		rid := fmt.Sprintf("resp_compressed_%d", i)
+		body := fmt.Sprintf("data: {\"type\":\"response.created\",\"response\":{\"id\":%q}}\n\ndata: %s\n\n", rid, autoContinuationEvent(rid, output))
+		upstream.responses = append(upstream.responses, &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))})
+	}
+	history := strings.Repeat("original history preserved ", 4000)
+	first := []byte(fmt.Sprintf(`{"type":"response.create","model":"gpt-6.1-sol","reasoning":{"effort":"xhigh"},"input":[{"role":"user","content":%q}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object","properties":{}}}]}`, history))
+	second := []byte(fmt.Sprintf(`{"type":"response.create","model":"gpt-6.1-sol","reasoning":{"effort":"xhigh"},"previous_response_id":"resp_compressed_0","input":[%s]}`, autoContinuationTool))
+	third := []byte(`{"type":"response.create","model":"gpt-6.1-sol","reasoning":{"effort":"xhigh"},"previous_response_id":"resp_compressed_1","input":[{"role":"user","content":"continue"}]}`)
+	// The actual WS client sends only new tool/user items after the first turn.
+	// The HTTP upstream must still receive the full reconstructed conversation.
+	officialBoundaryAuditClient(t, svc, account, func(ctx context.Context, client *coderws.Conn) {
+		warmup := officialFollowupExchange(t, ctx, client, []byte(`{"type":"response.create","generate":false,"model":"gpt-6.1-sol","input":[]}`))
+		var err error
+		first, err = sjson.SetBytes(first, "previous_response_id", gjson.GetBytes(warmup, "response.id").String())
+		require.NoError(t, err)
+		for _, payload := range [][]byte{first, second, third} {
+			officialFollowupExchange(t, ctx, client, payload)
+		}
+	})
+	require.Len(t, upstream.reqs, 3)
+	decoder, err := zstd.NewReader(nil)
+	require.NoError(t, err)
+	defer decoder.Close()
+	for i, request := range upstream.reqs {
+		require.Equal(t, "zstd", request.Header.Get("Content-Encoding"))
+		require.Less(t, len(upstream.bodies[i]), len(history)/2)
+		body, err := decoder.DecodeAll(upstream.bodies[i], nil)
+		require.NoError(t, err)
+		require.Contains(t, string(body), history)
+		require.Equal(t, "gpt-6.1-sol", gjson.GetBytes(body, "model").String())
+		require.Equal(t, "xhigh", gjson.GetBytes(body, "reasoning.effort").String())
+		require.False(t, gjson.GetBytes(body, "previous_response_id").Exists())
+		if i > 0 {
+			require.Contains(t, string(body), `"function_call"`)
+			require.Contains(t, string(body), `"function_call_output"`)
+		}
+	}
+}
 
 func TestResolveOpenAIWSClientFirstMessageTimeout(t *testing.T) {
 	defaultTimeout := time.Duration(config.DefaultOpenAIWSClientFirstMessageTimeoutSeconds) * time.Second

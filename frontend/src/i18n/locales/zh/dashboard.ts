@@ -166,6 +166,8 @@ export default {
       noGroupDescription:
         '此 API 密钥尚未分配分组，请先在密钥列表中点击分组列进行分配，然后才能查看使用配置。',
       openai: {
+        httpTransportHint: 'HTTP 客户端可能每轮上传完整历史。大历史上传较慢时，可选择上方 Codex CLI (WebSocket) 配置，使用原生 WS 续传；需分组内账号支持 WS 或 HTTP 桥接。',
+        wsTransportHint: '此配置可用于 Codex CLI、桌面和 VSCode，减少续传时重复上传历史。保存客户端配置并重启后使用新会话；HTTP 桥接账号的上游仍走 HTTP。仅开启账号桥接不会改变已有客户端的入口协议。',
         description: '将以下配置文件添加到 Codex CLI 配置目录中。',
         authModeTitle: 'Codex 认证模式',
         authModeDescription: '配置默认启用实时联网搜索；API Key 模式支持 Codex 原生生图，旧版客户端可选择兼容模式。',

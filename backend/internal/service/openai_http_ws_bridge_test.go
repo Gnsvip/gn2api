@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
@@ -16,6 +18,109 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+// Each upstream step waits for the real SSE client to receive it. Neither
+// changing TTFT nor flushing only at completion can satisfy this handshake.
+func TestHTTPToWSBridgeDeliversProgressBeforeCompletion(t *testing.T) {
+	const created = `{"type":"response.created","response":{"id":"resp_progress"}}`
+	for name, event := range map[string]string{
+		"reasoning progress": `{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
+		"reasoning part":     `{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+		"tool done":          `{"type":"response.function_call_arguments.done","arguments":"{}"}`,
+		"custom tool done":   `{"type":"response.custom_tool_call_input.done","input":"inspect"}`,
+		"message done":       `{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"answer"}]}}`,
+		"text delta":         `{"type":"response.output_text.delta","delta":"answer"}`,
+		"frame bound":        created,
+		"large metadata":     `{"type":"response.metadata","padding":"` + strings.Repeat("x", 256*1024) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			observed := make(chan struct{})
+			preamble := []string{created}
+			if name == "frame bound" {
+				preamble = make([]string, 64)
+				for i := range preamble {
+					preamble[i] = created
+				}
+			}
+			steps := []string{event, `{"type":"response.output_text.delta","delta":"next"}`}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+				for _, frame := range preamble {
+					if conn.WriteMessage(websocket.TextMessage, []byte(frame)) != nil {
+						return
+					}
+				}
+				for _, frame := range steps {
+					if conn.WriteMessage(websocket.TextMessage, []byte(frame)) != nil {
+						return
+					}
+					select {
+					case <-observed:
+					case <-ctx.Done():
+						return
+					}
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, autoContinuationEvent("resp_progress", autoContinuationAnswer))
+			}))
+			defer upstream.Close()
+			s, account, httpUpstream := httpBridgeFixture(t, upstream.URL)
+			// Even with batching configured, useful output must not wait for
+			// another upstream frame to trigger a flush.
+			s.cfg.Gateway.OpenAIWS.EventFlushBatchSize = 100
+			s.cfg.Gateway.OpenAIWS.EventFlushIntervalMS = 60000
+			finished := make(chan error, 1)
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, _ := gin.CreateTestContext(w)
+				c.Request = r
+				SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+				c.Set("api_key", &APIKey{ID: 123})
+				_, err := s.Forward(ctx, c, account, autoContinuationBody(true))
+				finished <- err
+			}))
+			defer gateway.Close()
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, gateway.URL, nil)
+			require.NoError(t, err)
+			response, err := gateway.Client().Do(request)
+			require.NoError(t, err, "first output must arrive without upstream completion")
+			defer response.Body.Close()
+			scanner := bufio.NewScanner(response.Body)
+			scanner.Buffer(make([]byte, 4096), 1<<20)
+			var frames []string
+			for scanner.Scan() {
+				line := scanner.Text()
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				frame := strings.TrimPrefix(line, "data: ")
+				frames = append(frames, frame)
+				step := len(frames) - len(preamble) - 1
+				if step >= 0 && step < len(steps) {
+					require.Equal(t, steps[step], frame)
+					select {
+					case observed <- struct{}{}:
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					}
+				}
+			}
+			require.NoError(t, scanner.Err())
+			require.Len(t, frames, len(preamble)+len(steps)+1)
+			require.Equal(t, preamble, frames[:len(preamble)], "release in order without dropping frames")
+			require.Equal(t, "response.completed", gjson.Get(frames[len(frames)-1], "type").String())
+			require.NoError(t, <-finished)
+			require.Zero(t, httpUpstream.callCount)
+		})
+	}
+}
 
 // Only the network destination is replaced: the production OAuth resolver,
 // forwarder, WS handshake and response conversion all execute normally.

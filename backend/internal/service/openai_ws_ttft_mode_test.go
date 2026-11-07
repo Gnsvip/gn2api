@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,91 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+func TestNativeWSProgressDeliveredBeforeCompletion(t *testing.T) {
+	for _, route := range []string{OpenAIWSIngressModeCtxPool, OpenAIWSIngressModePassthrough, OpenAIWSIngressModeHTTPBridge} {
+		for _, event := range []string{
+			`{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
+			`{"type":"response.function_call_arguments.done","arguments":"{}"}`,
+			`{"type":"response.custom_tool_call_input.done","input":"inspect"}`,
+		} {
+			t.Run(route+"/"+gjson.Get(event, "type").String(), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				observed := make(chan struct{})
+				steps := []string{event, `{"type":"response.output_text.delta","delta":"answer"}`}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var send func([]byte) error
+					var conn *websocket.Conn
+					if websocket.IsWebSocketUpgrade(r) {
+						var err error
+						conn, err = (&websocket.Upgrader{}).Upgrade(w, r, nil)
+						if err != nil {
+							return
+						}
+						defer conn.Close()
+						if _, _, err = conn.ReadMessage(); err != nil {
+							return
+						}
+						send = func(b []byte) error { return conn.WriteMessage(websocket.TextMessage, b) }
+					} else {
+						_, _ = io.Copy(io.Discard, r.Body)
+						w.Header().Set("Content-Type", "text/event-stream")
+						send = func(b []byte) error {
+							_, err := fmt.Fprintf(w, "data: %s\n\n", b)
+							w.(http.Flusher).Flush()
+							return err
+						}
+					}
+					if send([]byte(`{"type":"response.created","response":{"id":"resp_native_progress"}}`)) != nil {
+						return
+					}
+					for _, step := range steps {
+						if send([]byte(step)) != nil {
+							return
+						}
+						select {
+						case <-observed:
+						case <-ctx.Done():
+							return
+						}
+					}
+					_ = send(autoContinuationEvent("resp_native_progress", autoContinuationAnswer))
+					if conn != nil {
+						_, _, _ = conn.ReadMessage()
+					}
+				}))
+				defer upstream.Close()
+				svc, account, _ := httpBridgeFixture(t, upstream.URL)
+				base, err := url.Parse(upstream.URL)
+				require.NoError(t, err)
+				svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+				svc.openaiWSPassthroughDialer = &httpBridgeLocalDialer{url: "ws" + strings.TrimPrefix(upstream.URL, "http")}
+				svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+				officialFollowupAuth(account, route, AccountTypeOAuth)
+				officialBoundaryAuditClient(t, svc, account, func(clientCtx context.Context, client *coderws.Conn) {
+					require.NoError(t, client.Write(clientCtx, coderws.MessageText, autoContinuationBody(true)))
+					_, frame, err := client.Read(clientCtx)
+					require.NoError(t, err)
+					require.Equal(t, "response.created", gjson.GetBytes(frame, "type").String())
+					for _, step := range steps {
+						_, frame, err = client.Read(clientCtx)
+						require.NoError(t, err)
+						require.JSONEq(t, step, string(frame))
+						select {
+						case observed <- struct{}{}:
+						case <-ctx.Done():
+							t.Fatal("progress was withheld until completion")
+						}
+					}
+					_, frame, err = client.Read(clientCtx)
+					require.NoError(t, err)
+					require.Equal(t, "response.completed", gjson.GetBytes(frame, "type").String())
+				})
+			})
+		}
+	}
+}
 
 func TestOpenAITTFTDoesNotInventTerminalTiming(t *testing.T) {
 	for _, mode := range []string{OpenAITTFTModeSemantic, OpenAITTFTModeVisible} {

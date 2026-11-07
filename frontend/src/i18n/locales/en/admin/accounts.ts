@@ -653,6 +653,9 @@ export default {
         responsesWebsocketsV2: 'Responses WebSocket v2',
         responsesWebsocketsV2Desc:
           'Disabled by default. Enable to allow responses_websockets_v2 capability (still gated by global and account-type switches).',
+        httpRequestCompression: 'HTTP request compression',
+        httpRequestCompressionDesc: 'Enable only after verifying upstream support. Losslessly compress large Responses requests while preserving history, images and tools. HTTP remains HTTP; small requests and bodies with little compression benefit are unchanged.',
+        httpRequestCompressionOff: 'Off (default)',
         wsMode: 'WS mode',
         wsModeDesc:
           'Applies only to the current OpenAI account type. Select Off to disable WS. Other modes use the selected connection method only when gateway.openai_ws.mode_router_v2_enabled=true; otherwise, they use the context pool.',

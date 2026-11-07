@@ -57,7 +57,15 @@ func codexHTTPEgressEligible(cfg *config.Config, account *Account, target *url.U
 
 func doCodexEgressHTTP(cfg *config.Config, upstream HTTPUpstream, request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
 	if !codexHTTPEgressEligible(cfg, account, request.URL, request.Header) {
-		return upstream.Do(request, proxyURL, account.ID, account.Concurrency)
+		prepared, err := prepareOpenAIAPIKeyCompressedRequest(request, account)
+		if err != nil {
+			return nil, err
+		}
+		if prepared != request {
+			defer request.Body.Close()
+			requesttiming.AttemptFromContext(prepared.Context()).EncodedSize(prepared.ContentLength)
+		}
+		return upstream.Do(prepared, proxyURL, account.ID, account.Concurrency)
 	}
 	prepared, err := prepareCodexEgressRequest(request)
 	if err != nil {

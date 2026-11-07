@@ -166,6 +166,8 @@ export default {
       noGroupTitle: 'Please assign a group first',
       noGroupDescription: 'This API key has not been assigned to a group. Please click the group column in the key list to assign one before viewing the configuration.',
       openai: {
+        httpTransportHint: 'HTTP clients may upload the full history each turn. For large uploads, choose the Codex CLI (WebSocket) configuration above for native WS continuation. Accounts in the group must support WS or HTTP bridge.',
+        wsTransportHint: 'This configuration supports Codex CLI, desktop and VSCode and reduces repeated history uploads during continuation. Save it, restart the client and start a new session. HTTP bridge accounts still use HTTP upstream; enabling bridge alone does not change existing clients.',
         description: 'Add the following configuration files to your Codex CLI config directory.',
         authModeTitle: 'Codex authentication mode',
         authModeDescription: 'The configuration enables live web search. API Key mode supports native Codex image generation by default. Choose compatibility mode for older clients.',

@@ -1635,6 +1635,27 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('codex_image_generation_bridge')
   })
 
+  it('loads and disables HTTP compression without changing HTTP bridge or other account options', async () => {
+    const account = buildAccount()
+    account.extra = {
+      openai_http_request_compression: 'zstd',
+      openai_apikey_responses_websockets_v2_enabled: true,
+      openai_apikey_responses_websockets_v2_mode: 'http_bridge',
+      openai_http_ttft_mode: 'first_event'
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const wrapper = mountModal(account)
+    const select = wrapper.get('[data-testid="edit-openai-http-compression"]')
+    expect((select.element as HTMLSelectElement).value).toBe('zstd')
+    await select.setValue('off')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).not.toHaveProperty('openai_http_request_compression')
+    expect(extra?.openai_apikey_responses_websockets_v2_mode).toBe('http_bridge')
+    expect(extra?.openai_http_ttft_mode).toBe('first_event')
+  })
+
   it('setup-token account can select and submit OAuth WS mode', async () => {
     const account = buildOpenAISetupTokenAccount()
     updateAccountMock.mockReset()

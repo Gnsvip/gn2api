@@ -51,6 +51,14 @@
           </nav>
         </div>
 
+        <p
+          v-if="platform === 'openai' && (activeClientTab === 'codex' || activeClientTab === 'codex-ws')"
+          data-testid="codex-transport-hint"
+          class="text-xs leading-5 text-gray-600 dark:text-gray-400"
+        >
+          {{ t(activeClientTab === 'codex-ws' ? 'keys.useKeyModal.openai.wsTransportHint' : 'keys.useKeyModal.openai.httpTransportHint') }}
+        </p>
+
         <!-- Codex Authentication Mode -->
         <div
           v-if="showCodexAuthMode"

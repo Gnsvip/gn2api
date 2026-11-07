@@ -160,6 +160,30 @@ func TestRequestTimingHTTPShapeDoesNotRetainOrConsumeBody(t *testing.T) {
 	}
 }
 
+func TestRequestTimingAPIKeyCompressionKeepsActualByteCounts(t *testing.T) {
+	body := `{"model":"gpt-6.1-sol","input":"` + strings.Repeat("private history ", 5000) + `"}`
+	recorder := requesttiming.New(time.Now(), "compressed-request", "", 0)
+	req, err := http.NewRequest("POST", "https://relay.example/v1/responses", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(recorder.Context(req.Context()))
+	upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 200, Header: make(http.Header), Body: http.NoBody}}
+	svc := &OpenAIGatewayService{httpUpstream: upstream}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{"openai_http_request_compression": "zstd"}}
+	resp, err := svc.doTimedOpenAIUpstream(req, "", account, []byte(body))
+	require.NoError(t, err)
+	resp.Body.Close()
+	snapshot, ok := recorder.Finish(200)
+	require.True(t, ok)
+	require.Equal(t, int64(len(body)), *snapshot.Attempts[0].OutboundBytes)
+	require.Equal(t, int64(len(upstream.lastBody)), *snapshot.Attempts[0].EncodedBodyBytes)
+	require.Less(t, *snapshot.Attempts[0].EncodedBodyBytes, *snapshot.Attempts[0].OutboundBytes)
+	require.Nil(t, snapshot.Attempts[0].SentMS, "mock transport does not provide an actual send timestamp")
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "private history")
+}
+
 func TestRequestTimingSharedTransportDoesNotRecordUnobservedRequests(t *testing.T) {
 	for _, path := range []string{"/v1/chat/completions", "/backend-api/codex/usage", "/v1/responses"} {
 		t.Run(path, func(t *testing.T) {

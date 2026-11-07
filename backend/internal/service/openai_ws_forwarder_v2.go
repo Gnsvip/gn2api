@@ -529,7 +529,6 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	firstVisibleSeen := false
-	bufferingOutputSeen := false
 	responseID := ""
 	var finalResponse []byte
 	wroteDownstream := false
@@ -539,6 +538,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		mappedModelBytes = []byte(mappedModel)
 	}
 	bufferedStreamEvents := make([][]byte, 0, 4)
+	bufferedStreamBytes := 0
 	eventCount := 0
 	tokenEventCount := 0
 	terminalEventCount := 0
@@ -565,6 +565,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return
 		}
 		clientDisconnected = true
+		bufferedStreamEvents, bufferedStreamBytes = nil, 0
 		clientDisconnectDrainStartedAt = time.Now()
 		if !upstreamReadDetached {
 			upstreamReadCtx = context.WithoutCancel(ctx)
@@ -649,10 +650,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		frame = append(frame, "data: "...)
 		frame = append(frame, message...)
 		frame = append(frame, '\n', '\n')
+		// Even a failed write may have reached the client in part.
+		wroteDownstream = true
 		_, wErr := c.Writer.Write(frame)
 		if wErr == nil {
 			timing.Written(timingVisible(message))
-			wroteDownstream = true
 			pendingFlushEvents++
 			flushStreamWriter(forceFlush)
 			return
@@ -666,10 +668,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			return
 		}
 		flushed := len(bufferedStreamEvents)
-		for _, buffered := range bufferedStreamEvents {
+		pending := bufferedStreamEvents
+		bufferedStreamEvents, bufferedStreamBytes = nil, 0
+		for i, buffered := range pending {
+			pending[i] = nil
 			emitStreamMessage(buffered, false)
 		}
-		bufferedStreamEvents = bufferedStreamEvents[:0]
 		flushStreamWriter(true)
 		flushedBufferedEventCount += flushed
 		if debugEnabled {
@@ -820,7 +824,6 @@ readLoop:
 		isTokenEvent := isOpenAIWSTokenEvent(eventType)
 		if isTokenEvent {
 			tokenEventCount++
-			bufferingOutputSeen = true
 		}
 		isTerminalEvent := isOpenAIWSTerminalEvent(eventType)
 		if isTerminalEvent {
@@ -971,14 +974,20 @@ readLoop:
 		}
 
 		if reqStream {
-			// 在首个 token 前先缓冲事件（如 response.created），
-			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
-			// Metric mode must not change buffering or safe retry boundaries.
-			shouldBuffer := !bufferingOutputSeen && !isTokenEvent && !isTerminalEvent
-			if shouldBuffer {
+			// Only retain a bounded preamble for early recovery. Typed progress,
+			// tool completions and deltas must leave before the next read.
+			// Non-Responses vendor notices retain their existing preamble role.
+			startsOutput := isTokenEvent || (strings.HasPrefix(eventType, "response.") && openAIWSDataStartsStreamingOutput(message, eventType))
+			shouldBuffer := !wroteDownstream && !startsOutput && !isTerminalEvent &&
+				len(bufferedStreamEvents) < openAIWSPreambleMaxEvents &&
+				len(message) <= openAIWSPreambleMaxBytes-bufferedStreamBytes
+			if clientDisconnected {
+				// Drain usage without retaining more client frames.
+			} else if shouldBuffer {
 				buffered := make([]byte, len(message))
 				copy(buffered, message)
 				bufferedStreamEvents = append(bufferedStreamEvents, buffered)
+				bufferedStreamBytes += len(buffered)
 				bufferedEventCount++
 				if debugEnabled && shouldLogOpenAIWSBufferedEvent(bufferedEventCount) {
 					logOpenAIWSModeDebug(
@@ -992,8 +1001,9 @@ readLoop:
 					)
 				}
 			} else {
+				firstWrite := !wroteDownstream
 				flushBufferedStreamEvents(eventType)
-				emitStreamMessage(message, isTerminalEvent)
+				emitStreamMessage(message, firstWrite || startsOutput || isTerminalEvent)
 			}
 		} else {
 			if responseField.Exists() && responseField.Type == gjson.JSON {

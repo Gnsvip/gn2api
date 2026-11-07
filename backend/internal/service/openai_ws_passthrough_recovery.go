@@ -141,7 +141,7 @@ func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface 
 	defer r.mu.Unlock()
 	event := gjson.GetBytes(payload, "type").String()
 	terminal := openAIStreamEventTypeIsTerminal(event) || event == "error"
-	startsOutput := typ != coderws.MessageText || openAIStreamDataStartsClientOutput(string(payload), event)
+	startsOutput := typ != coderws.MessageText || openAIWSDataStartsStreamingOutput(payload, event)
 	// Observe even buffered empty output-item envelopes: their indices are
 	// needed to prove that the completed transcript has no missing items.
 	if r.active && typ == coderws.MessageText {
@@ -161,18 +161,20 @@ func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface 
 			}
 		}
 	}
-	if r.active && r.complete && !r.committed && !terminal && !startsOutput && len(r.preamble) < 64 && r.preambleBytes+len(payload) <= 256*1024 {
+	if r.active && r.complete && !r.committed && !terminal && !startsOutput && len(r.preamble) < openAIWSPreambleMaxEvents && len(payload) <= openAIWSPreambleMaxBytes-r.preambleBytes {
 		r.preamble = append(r.preamble, bytes.Clone(payload))
 		r.preambleBytes += len(payload)
 		return false, nil
 	}
 	r.committed = true // A failed write may have partially reached the client.
-	for _, frame := range r.preamble {
+	pending := r.preamble
+	r.preamble, r.preambleBytes = nil, 0
+	for i, frame := range pending {
+		pending[i] = nil
 		if err := conn.Write(ctx, coderws.MessageText, frame); err != nil {
 			return false, err
 		}
 	}
-	r.preamble, r.preambleBytes = nil, 0
 	if err := conn.Write(ctx, typ, payload); err != nil {
 		return false, err
 	}

@@ -21,7 +21,88 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/viper"
+	"github.com/stretchr/testify/require"
 )
+
+func TestOpenAIAPIKeyRequestCompressionPreservesBodyAndReplay(t *testing.T) {
+	body := []byte(`{"model":"gpt-6.1-sol","reasoning":{"effort":"xhigh"},"input":[{"role":"user","content":"` + strings.Repeat("history image tool 12345 ", 5000) + `"},{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"unchanged"}],"store":false,"stream":true}`)
+	req, err := http.NewRequest("POST", "https://relay.example/v1/responses", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer test")
+	req.Header.Set("Content-Length", fmt.Sprint(len(body)))
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{"openai_http_request_compression": "zstd"}}
+	prepared, err := prepareOpenAIAPIKeyCompressedRequest(req, account)
+	require.NoError(t, err)
+	require.NotSame(t, req, prepared)
+	defer prepared.Body.Close()
+	encoded, err := io.ReadAll(prepared.Body)
+	require.NoError(t, err)
+	require.Less(t, len(encoded), len(body)/2)
+	require.Equal(t, int64(len(encoded)), prepared.ContentLength)
+	require.Equal(t, "zstd", prepared.Header.Get("Content-Encoding"))
+	require.Empty(t, prepared.Header.Get("Content-Length"))
+	require.Equal(t, "Bearer test", prepared.Header.Get("Authorization"))
+	require.Empty(t, req.Header.Get("Content-Encoding"), "do not mutate the caller's retry request")
+	decoder, err := zstd.NewReader(nil)
+	require.NoError(t, err)
+	defer decoder.Close()
+	decoded, err := decoder.DecodeAll(encoded, nil)
+	require.NoError(t, err)
+	require.Equal(t, body, decoded, "preserve every byte of history, model and reasoning")
+	replay, err := prepared.GetBody()
+	require.NoError(t, err)
+	defer replay.Close()
+	replayed, err := io.ReadAll(replay)
+	require.NoError(t, err)
+	require.Equal(t, encoded, replayed)
+	original, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Equal(t, body, original)
+}
+
+func TestOpenAIAPIKeyRequestCompressionBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*http.Request, *Account)
+	}{
+		{"disabled", func(_ *http.Request, a *Account) { a.Extra = nil }},
+		{"unknown mode", func(_ *http.Request, a *Account) { a.Extra["openai_http_request_compression"] = "auto" }},
+		{"oauth unchanged", func(_ *http.Request, a *Account) { a.Type = AccountTypeOAuth }},
+		{"small", func(r *http.Request, _ *Account) { r.ContentLength = 100 }},
+		{"bounded allocation", func(r *http.Request, _ *Account) { r.ContentLength = openAIHTTPCompressionMaxBytes + 1 }},
+		{"non replayable", func(r *http.Request, _ *Account) { r.GetBody = nil }},
+		{"already encoded", func(r *http.Request, _ *Account) { r.Header.Set("Content-Encoding", "gzip") }},
+		{"other endpoint", func(r *http.Request, _ *Account) { r.URL.Path = "/v1/responses/compact" }},
+		{"multipart", func(r *http.Request, _ *Account) { r.Header.Set("Content-Type", "multipart/form-data") }},
+		{"public API expansion limit", func(r *http.Request, _ *Account) { r.URL.Host = "api.openai.com" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest("POST", "https://relay.example/v1/responses", strings.NewReader(strings.Repeat("x", 100000)))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{"openai_http_request_compression": "zstd"}}
+			tc.change(req, account)
+			prepared, err := prepareOpenAIAPIKeyCompressedRequest(req, account)
+			require.NoError(t, err)
+			require.Same(t, req, prepared)
+			req.Body.Close()
+		})
+	}
+}
+
+func TestOpenAIAPIKeyCompressionDoesNotRetryUpstreamRejection(t *testing.T) {
+	req, err := http.NewRequest("POST", "https://relay.example/v1/responses", strings.NewReader(strings.Repeat("x", 100000)))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: map[string]any{"openai_http_request_compression": "zstd"}}
+	upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: 415, Body: http.NoBody}}
+	resp, err := doCodexEgressHTTP(nil, upstream, req, "", account)
+	require.NoError(t, err)
+	require.Equal(t, 415, resp.StatusCode)
+	require.Len(t, upstream.requests, 1, "never resend user generations to discover encoding support")
+	require.Equal(t, "zstd", upstream.lastReq.Header.Get("Content-Encoding"))
+}
 
 type codexEgressUpstreamStub struct {
 	doCalls        int

@@ -776,6 +776,9 @@ export default {
         responsesWebsocketsV2: 'Responses WebSocket v2',
         responsesWebsocketsV2Desc:
           '默认关闭。开启后可启用 responses_websockets_v2 协议能力（受网关全局开关与账号类型开关约束）。',
+        httpRequestCompression: 'HTTP 请求体压缩',
+        httpRequestCompressionDesc: '仅确认上游支持后启用。Responses 大请求使用无损压缩，完整保留历史、图片和工具；HTTP 出口保持 HTTP。小请求及压缩收益不足的请求保持原样。',
+        httpRequestCompressionOff: '关闭（默认）',
         wsMode: 'WS mode',
         wsModeDesc:
           '仅对当前 OpenAI 账号类型生效。选择“关闭”可禁用 WS；其余模式需全局 gateway.openai_ws.mode_router_v2_enabled=true 才按所选方式连接，未开启时统一使用上下文池。',

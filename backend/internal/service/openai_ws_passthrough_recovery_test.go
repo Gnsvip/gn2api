@@ -116,6 +116,10 @@ func TestOpenAIWSPassthroughRecoveryDoesNotReplayDeliveredContent(t *testing.T) 
 	for name, event := range map[string]string{
 		"text":                  `{"type":"response.output_text.delta","delta":"hello"}`,
 		"reasoning":             `{"type":"response.reasoning_text.delta","delta":"thinking"}`,
+		"reasoning progress":    `{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
+		"reasoning part":        `{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+		"tool done":             `{"type":"response.function_call_arguments.done","arguments":"{}"}`,
+		"custom tool done":      `{"type":"response.custom_tool_call_input.done","input":"inspect"}`,
 		"tool delta":            `{"type":"response.function_call_arguments.delta","delta":"{"}`,
 		"empty tool completion": `{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"run","arguments":""}}`,
 		"encrypted reasoning":   `{"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","summary":[]}}`,
@@ -136,7 +140,7 @@ func TestOpenAIWSPassthroughRecoveryDoesNotReplayDeliveredContent(t *testing.T) 
 }
 
 func TestOpenAIWSPassthroughRecoveryBoundsPreambleAndCommitsFailedWrites(t *testing.T) {
-	for _, scenario := range []string{"frame limit", "byte limit", "write error", "binary"} {
+	for _, scenario := range []string{"frame limit", "byte limit", "write error", "preamble write error", "binary"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := &openAIWSPassthroughRecovery{limit: 1 << 20}
 			w := &passthroughRecoveryWriter{}
@@ -155,6 +159,12 @@ func TestOpenAIWSPassthroughRecoveryBoundsPreambleAndCommitsFailedWrites(t *test
 				w.err = errors.New("partial write")
 				_, err := r.write(context.Background(), w, coderws.MessageText, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
 				require.ErrorIs(t, err, w.err)
+			case "preamble write error":
+				require.False(t, recoveryTestWrite(t, r, w, `{"type":"response.created"}`))
+				w.err = errors.New("partial preamble write")
+				_, err := r.write(context.Background(), w, coderws.MessageText, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
+				require.ErrorIs(t, err, w.err)
+				require.Zero(t, r.preambleBytes, "release retained frames even when flushing fails")
 			case "binary":
 				_, err := r.write(context.Background(), w, coderws.MessageBinary, []byte{1, 2, 3})
 				require.NoError(t, err)
