@@ -64,6 +64,30 @@ func TestUpdateServiceBuildMetadataDoesNotOfferDowngrade(t *testing.T) {
 	}
 }
 
+func TestUpdateServiceFourComponentRevision(t *testing.T) {
+	for _, tc := range []struct {
+		current, latest string
+		wantUpdate      bool
+	}{
+		{"0.2.20", "v0.2.20.1", true},
+		{"0.2.20.1", "v0.2.20.2", true},
+		{"0.2.20.1", "v0.2.20.10", true},
+		{"0.2.20.1", "v0.2.20.1", false},
+		{"0.2.20.1", "v0.2.20", false},
+		{"0.2.20.2", "v0.2.20.1", false},
+		{"0.2.20.1+build.1", "v0.2.20.1+build.2", false},
+		{"0.2.71", "v0.2.20.1", false},
+	} {
+		t.Run(tc.current+"_to_"+tc.latest, func(t *testing.T) {
+			client := &updateServiceGitHubClientStub{release: &GitHubRelease{TagName: tc.latest}}
+			svc := NewUpdateService(&updateServiceCacheStub{}, client, tc.current, "release")
+			info, err := svc.CheckUpdate(context.Background(), true)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantUpdate, info.HasUpdate)
+		})
+	}
+}
+
 func TestUpdateServiceRejectsForeignAndLegacyCache(t *testing.T) {
 	for _, repo := range []string{"", "Wei-Shaw/sub2api", "Gnsvip/gn2api"} {
 		t.Run(repo, func(t *testing.T) {

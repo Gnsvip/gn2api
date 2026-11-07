@@ -128,11 +128,14 @@ scripts
 #openspec/
 code-reviews/
 AGENTS.md
+!/AGENTS.md
 backend/cmd/server/server
 deploy/docker-compose.override.yml
 .gocache/
 vite.config.js
 docs/*
+!docs/agent-resource-safety.md
+!docs/moego-json-batching.md
 !docs/admin-api-keys.md
 !docs/mcp.md
 !docs/PAYMENT.md
@@ -165,3 +168,11 @@ issues/
 .vite/
 # 本地闭源插件开发目录及构建产物不进入 Sub2API 仓库
 /plugins/
+
+!docs/UPSTREAM_0_2_20_INTEGRATION.md
+!docs/RELEASE_NOTES_v0.2.20.1.md
+
+# Local verification output is never release source.
+__pycache__/
+*.pyc
+/extensions/outputs/

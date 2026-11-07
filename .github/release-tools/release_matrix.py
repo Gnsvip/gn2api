@@ -17,7 +17,7 @@ import yaml
 FULL_CONFIG = Path('.goreleaser.yaml')
 SIMPLE_CONFIG = Path('.goreleaser.simple.yaml')
 VERSION_FILE = Path('backend/cmd/server/VERSION')
-VERSION_RE = re.compile(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?')
+VERSION_RE = re.compile(r'\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?')
 
 
 def config(simple=False):
@@ -48,6 +48,58 @@ def archive_name(version, target):
 def sha256(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def runtime_files():
+    """One explicit allowlist shared by manual binary releases and GoReleaser."""
+    files = config()['archives'][0]['files']
+    if len(files) != len(set(files)):
+        raise ValueError('duplicate runtime archive path')
+    for name in files:
+        if not isinstance(name, str):
+            raise ValueError('runtime archive paths must be strings')
+        path = Path(name)
+        if (path.is_absolute() or '..' in path.parts
+                or any(c in name for c in '*?[]\\') or path.as_posix() != name
+                or any(part.lower() in ('tests', '__tests__', 'fixtures', '__pycache__', 'node_modules') for part in path.parts)
+                or path.name.startswith(('test_', 'test-'))
+                or path.name.endswith(('_test.go', '_test.py', '.spec.ts', '.test.ts', '.pyc', '.log'))):
+            raise ValueError('invalid runtime archive path: ' + str(name))
+    return files
+
+
+def package_runtime(args):
+    """Package an already-built Linux amd64 binary without source or test trees."""
+    target = {'goos': 'linux', 'goarch': 'amd64'}
+    archive_filename = archive_name(args.version, target)
+    files = runtime_files()
+    binary = Path(args.binary)
+    with binary.open('rb') as stream:
+        header = stream.read(20)
+    if len(header) < 20 or header[:6] != b'\x7fELF\x02\x01' or header[18:20] != b'\x3e\x00':
+        raise ValueError('expected a Linux amd64 ELF binary')
+    sources = [('sub2api', binary)] + [(name, Path(name)) for name in files]
+    for name, source in sources:
+        if not source.is_file() or source.is_symlink():
+            raise ValueError('missing or non-regular release file: ' + name)
+    directory = Path(args.output)
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / archive_filename
+    if dest.exists():
+        raise ValueError('refuse to overwrite an existing release archive')
+    with tarfile.open(dest, 'w:gz') as archive:
+        for arcname, source in sources:
+            info = archive.gettarinfo(source, arcname=arcname)
+            info.mode = 0o755 if arcname == 'sub2api' or arcname.endswith('.sh') else 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ''
+            with source.open('rb') as stream:
+                archive.addfile(info, stream)
+    with tarfile.open(dest, 'r:gz') as archive:
+        members = archive.getmembers()
+        if [member.name for member in members] != [name for name, _ in sources] or any(not member.isfile() for member in members):
+            raise ValueError('runtime archive membership mismatch')
+    return dest
 
 
 def plan(args):
@@ -157,6 +209,10 @@ def contexts(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
+    p = commands.add_parser('package-runtime')
+    for arg in ('version', 'binary', 'output'):
+        p.add_argument('--' + arg, required=True)
+    p.set_defaults(run=package_runtime)
     p = commands.add_parser('plan')
     p.add_argument('--ref', required=True)
     p.add_argument('--simple', action='store_true')

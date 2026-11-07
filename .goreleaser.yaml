@@ -40,9 +40,24 @@ archives:
       - goos: windows
         format: zip
     files:
-      - LICENSE*
-      - README*
-      - deploy/*
+      - LICENSE
+      - deploy/install.sh
+      - deploy/sub2api.service
+      - deploy/config.example.yaml
+      - deploy/codex-instructions.md.tmpl
+      - deploy/nginx/gn2api-ingress-http.conf
+      - deploy/nginx/gn2api-ingress-server.conf
+      - extensions/modeltrace/service.py
+      - extensions/modeltrace/attempts.py
+      - extensions/modeltrace/evidence.py
+      - extensions/modeltrace/qa_policy.py
+      - extensions/modeltrace/modeltrace.js
+      - extensions/modeltrace/requirements.txt
+      - extensions/modeltrace/auto-pause.conf
+      - extensions/modeltrace/modeltrace-ovh.service
+      - extensions/modeltrace/vendor/LICENSE
+      - extensions/modeltrace/vendor/fingerprint.py
+      - extensions/modeltrace/vendor/data/unified_bank.json
 
 checksum:
   name_template: 'checksums.txt'

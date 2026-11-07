@@ -943,6 +943,9 @@ func buildOpenAIWSReplayInputSequence(
 	if currentErr != nil {
 		return nil, false, currentErr
 	}
+	if !currentExists && gjson.GetBytes(currentPayload, "generate").Type == gjson.False {
+		currentExists = true // Metadata-only warmups have a known empty input.
+	}
 	items, exists := buildOpenAIWSReplayInputSequenceFromItems(
 		previousFullInput,
 		previousFullInputExists,
@@ -971,6 +974,18 @@ func setOpenAIWSPayloadInputSequence(
 		return nil, marshalErr
 	}
 	return sjson.SetRawBytes(payload, "input", inputRaw)
+}
+
+func openAIWSReplayInputPortable(items []json.RawMessage) bool {
+	parsed := make([]gjson.Result, 0, len(items))
+	for _, item := range items {
+		value := gjson.Parse(openAIWSPayloadStringView(item))
+		if value.Get("type").String() == "item_reference" {
+			return false
+		}
+		parsed = append(parsed, value)
+	}
+	return openAIWSContinuationToolsComplete(parsed, nil)
 }
 
 func buildOpenAIWSCurrentTurnRetryPayload(

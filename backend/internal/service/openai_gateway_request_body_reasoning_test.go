@@ -106,8 +106,8 @@ func TestTrimOpenAIEncryptedReasoningItems_Compaction(t *testing.T) {
 		encrypted bool
 		changed   bool
 	}{
-		{name: "compaction", itemType: "compaction", encrypted: true, changed: true},
-		{name: "compaction summary", itemType: "compaction_summary", encrypted: true, changed: true},
+		{name: "compaction", itemType: "compaction", encrypted: true, changed: false},
+		{name: "compaction summary", itemType: "compaction_summary", encrypted: true, changed: false},
 		{name: "unencrypted compaction", itemType: "compaction", encrypted: false, changed: false},
 	}
 

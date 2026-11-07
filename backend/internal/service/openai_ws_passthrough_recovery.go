@@ -20,7 +20,9 @@ type openAIWSPassthroughRecovery struct {
 	limit           int64
 	history         []json.RawMessage
 	historyComplete bool
+	historyDetached bool
 	lastResponseID  string
+	parents         *openAIWSResponseHistory
 	input           []json.RawMessage
 	metadata        []byte
 	model           string
@@ -29,6 +31,7 @@ type openAIWSPassthroughRecovery struct {
 	committed       bool
 	incompatible    bool
 	contentObserved bool
+	compaction      bool
 	retainedBytes   int64
 	outputs         openAIWSToolCallReplayCollector
 	outputShape     openAIWSContinuationOutputCollector
@@ -40,12 +43,14 @@ func (r *openAIWSPassthroughRecovery) begin(payload []byte, model string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	previous := gjson.GetBytes(payload, "previous_response_id").String()
+	r.selectParent(previous)
 	input, exists, err := buildOpenAIWSReplayInputSequence(r.history, r.historyComplete, payload, previous != "")
 	metadata, metadataErr := sjson.DeleteBytes(payload, "input")
 	r.input, r.metadata, r.model = input, bytes.Clone(metadata), model
 	r.complete = err == nil && metadataErr == nil && exists && !r.incompatible &&
 		(previous == "" || (r.historyComplete && previous == r.lastResponseID))
 	r.active, r.committed, r.contentObserved = true, false, false
+	r.compaction = HasCompactionTriggerInInput(payload)
 	r.outputs, r.outputShape = openAIWSToolCallReplayCollector{}, openAIWSContinuationOutputCollector{}
 	r.preamble, r.preambleBytes = nil, 0
 	r.retainedBytes = int64(len(r.metadata))
@@ -58,8 +63,32 @@ func (r *openAIWSPassthroughRecovery) begin(payload []byte, model string) {
 	}
 }
 
+// Caller holds mu. A different/unknown parent must never borrow last-turn input.
+func (r *openAIWSPassthroughRecovery) selectParent(id string) {
+	if r.parents == nil {
+		r.parents = &openAIWSResponseHistory{limit: int(r.limit)}
+	}
+	if id != "" && id == r.lastResponseID && r.historyComplete && r.history != nil {
+		return
+	}
+	state, _ := r.parents.parent(id)
+	r.history, r.historyComplete, r.lastResponseID = state.replay, state.complete, state.responseID
+	r.historyDetached = state.upstreamDetached
+}
+
+// The downstream session survives compaction recovery. Keep its bounded local
+// snapshots, but do not assume their response IDs exist on the new upstream.
+// Called only after the old relay's goroutines have joined.
+func (r *openAIWSPassthroughRecovery) upstreamReconnected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.parents.detach()
+	r.historyDetached = true
+}
+
 func (r *openAIWSPassthroughRecovery) discardReplay() {
 	r.complete, r.historyComplete = false, false
+	r.historyDetached = false
 	r.input, r.history, r.metadata = nil, nil, nil
 	r.outputs, r.outputShape = openAIWSToolCallReplayCollector{}, openAIWSContinuationOutputCollector{}
 }
@@ -70,6 +99,9 @@ func (r *openAIWSPassthroughRecovery) clientControl() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.incompatible = true
+	if r.parents != nil {
+		*r.parents = openAIWSResponseHistory{limit: int(r.limit)}
+	}
 	r.discardReplay()
 }
 
@@ -77,6 +109,14 @@ func (r *openAIWSPassthroughRecovery) canRetry() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.active && !r.committed && r.complete
+}
+
+// A legacy first frame can be retried as-is without a local transcript, but
+// never after a client control edit/cancel or a downstream write.
+func (r *openAIWSPassthroughRecovery) canRetryInitial() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active && !r.committed && !r.incompatible
 }
 
 func (r *openAIWSPassthroughRecovery) failover(cause error) error {
@@ -151,7 +191,19 @@ func (r *openAIWSPassthroughRecovery) write(ctx context.Context, conn interface 
 			r.historyComplete = complete && (!r.contentObserved || len(output) > 0)
 			if r.historyComplete {
 				r.history = combineOpenAIWSReplayItems(r.input, output)
+				if r.compaction && compactionRecoveryHasSummary(output) {
+					r.history = output
+				}
 				r.lastResponseID = strings.Clone(gjson.GetBytes(payload, "response.id").String())
+				r.historyDetached = false
+				if r.lastResponseID != "" {
+					r.parents.limit = int(r.limit)
+					retained := r.parents.put(r.lastResponseID, openAIWSResponseHistoryState{
+						replay: r.history, replayExists: true, complete: true,
+						responseID: r.lastResponseID, model: r.model,
+					})
+					r.history = retained.replay
+				}
 			}
 		}
 		r.input, r.metadata = nil, nil

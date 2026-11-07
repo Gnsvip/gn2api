@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func TestResolveOpenAIWSClientFirstMessageTimeout(t *testing.T) {
@@ -2351,4 +2352,98 @@ func TestOpenAIWSHTTPBridge_IdleTimeoutClosesClientSession(t *testing.T) {
 		t.Fatal("timed out waiting for idle HTTP bridge session to close")
 	}
 	require.Len(t, upstream.bodies, 1, "an idle client must not leave a continuation request running")
+}
+
+func TestProxyOpenAIWSHTTPBridgeTurn_StagesCodexFingerprint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	run := func(account *Account, session string, bodyOnly bool) *http.Request {
+		sse := `data: {"type":"response.completed","response":{"id":"resp_fp","model":"gpt-5.5","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
+		upstream := &httpUpstreamRecorder{resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}}
+		svc := &OpenAIGatewayService{
+			cfg:          &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}},
+			httpUpstream: upstream,
+		}
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+		payload := []byte(`{"type":"response.create","model":"gpt-5.5","store":false,"input":"hi"}`)
+		if bodyOnly {
+			payload, _ = sjson.SetBytes(payload, "client_metadata.session_id", session)
+		} else {
+			c.Request.Header.Set("session-id", session)
+		}
+		_, err := svc.proxyOpenAIWSHTTPBridgeTurn(
+			context.Background(), c, account, "test-token", payload, len(payload),
+			"gpt-5.5", "", "", "", "", 1,
+			func([]byte) error { return nil },
+		)
+		require.NoError(t, err)
+		require.NotNil(t, upstream.lastReq)
+		if account.GetCodexFingerprintMode() == codexFingerprintFull {
+			require.NotEmpty(t, gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
+			require.Equal(t, upstream.lastReq.Header.Get("session-id"), gjson.GetBytes(upstream.lastBody, "client_metadata.session_id").String())
+		}
+		return upstream.lastReq
+	}
+
+	full := newTestOAuthAccount(7101, map[string]any{"codex_fingerprint_mode": "full"})
+	first := run(full, "bridge-client-a", false)
+	require.NotEmpty(t, first.Header.Get("session-id"))
+	require.Empty(t, first.Header.Get("x-codex-installation-id"), "the pinned wire profile carries installation identity in metadata, not an extra HTTP header")
+	require.Empty(t, first.Header.Get("session_id"), "native Codex projection removes legacy underscore aliases")
+	require.Equal(t, first.Header.Get("session-id"), run(full, "bridge-client-a", false).Header.Get("session-id"))
+	require.Equal(t, first.Header.Get("session-id"), run(full, "bridge-client-a", true).Header.Get("session-id"), "body-only session evidence must use the same derivation")
+	require.NotEqual(t, first.Header.Get("session-id"), run(full, "bridge-client-b", false).Header.Get("session-id"), "distinct clients must not collapse into an account-wide session")
+	off := newTestOAuthAccount(7102, map[string]any{"codex_fingerprint_mode": "off"})
+	require.Empty(t, run(off, "", false).Header.Get("session_id"), "disabled convergence must not leave stale account IDs")
+}
+
+func TestOpenAIWSHTTPBridgeBodySessionIdentityAcrossTurnsAndClients(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, account, upstream := httpBridgeFixture(t, "http://127.0.0.1:1")
+	svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	account.Extra = newTestOAuthAccount(account.ID, map[string]any{
+		"codex_fingerprint_mode":                    "full",
+		"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModeHTTPBridge,
+	}).Extra
+	upstream.responses = nil
+	for i := 0; i < 6; i++ {
+		responseID := fmt.Sprintf("resp_bridge_identity_%d", i)
+		created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, responseID)
+		upstream.responses = append(upstream.responses, &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: " + created + "\n\ndata: " + string(autoContinuationEvent(responseID, autoContinuationAnswer)) + "\n\n")),
+		})
+	}
+	for _, session := range []string{"bridge-client-a", "bridge-client-a", "bridge-client-b"} {
+		officialBoundaryAuditClient(t, svc, account, func(ctx context.Context, client *coderws.Conn) {
+			for turn := 0; turn < 2; turn++ {
+				payload := postRepairAuditRequest("", fmt.Sprintf("turn %d", turn))
+				payload, err := sjson.SetBytes(payload, "client_metadata.session_id", session)
+				require.NoError(t, err)
+				officialFollowupExchange(t, ctx, client, payload)
+			}
+		})
+	}
+	require.Len(t, upstream.reqs, 6)
+	for i, req := range upstream.reqs {
+		session := "bridge-client-a"
+		if i >= 4 {
+			session = "bridge-client-b"
+		}
+		baseline, _ := httpBridgeContext(session)
+		ids := resolveCodexFingerprintIDsForRawBody(baseline, account, baseline.Request.Header, postRepairAuditRequest("", "baseline"))
+		require.NotNil(t, ids)
+		require.Equal(t, ids.sessionID, req.Header.Get("session-id"), "bridge must derive identity once from the client's original session")
+		require.Equal(t, ids.sessionID, gjson.GetBytes(upstream.bodies[i], "client_metadata.session_id").String())
+		require.Equal(t, ids.installationID, gjson.GetBytes(upstream.bodies[i], "client_metadata.x-codex-installation-id").String())
+		require.Empty(t, req.Header.Get("session_id"))
+		require.Empty(t, req.Header.Get("x-codex-installation-id"))
+	}
+	require.Equal(t, upstream.reqs[0].Header.Get("session-id"), upstream.reqs[3].Header.Get("session-id"))
+	require.NotEqual(t, upstream.reqs[0].Header.Get("session-id"), upstream.reqs[4].Header.Get("session-id"))
 }

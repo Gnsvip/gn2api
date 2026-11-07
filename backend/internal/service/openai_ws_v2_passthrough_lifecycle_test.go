@@ -719,7 +719,7 @@ func TestPassthroughLifecycle_BufferedPreambleAllowsPromptClientCancel(t *testin
 	}
 }
 
-func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
+func TestPassthroughLifecycle_QueuesOverlappingResponseCreate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	controlCtx, cancelControl := context.WithCancelCause(context.Background())
 	defer cancelControl(context.Canceled)
@@ -727,7 +727,15 @@ func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
 	cfg.Gateway.OpenAIFirstOutputTimeoutSeconds = 3
 	upstream := newStagedPassthroughConn()
 	upstream.Send(`{"type":"response.created","response":{"id":"resp_overlap_first","model":"gpt-5.1"}}`)
-	server, serverErr := startPassthroughLifecycleServer(t, controlCtx, newPassthroughLifecycleService(cfg, upstream), passthroughLifecycleAccount())
+	var beforeTurns, afterTurns []int
+	server, serverErr := startPassthroughLifecycleServerWithHooks(t, controlCtx, newPassthroughLifecycleService(cfg, upstream), passthroughLifecycleAccount(), func(*gin.Context) *OpenAIWSIngressHooks {
+		return &OpenAIWSIngressHooks{
+			BeforeTurn: func(turn int) error { beforeTurns = append(beforeTurns, turn); return nil },
+			AfterTurn: func(turn int, _ *OpenAIForwardResult, _ error) {
+				afterTurns = append(afterTurns, turn)
+			},
+		}
+	})
 	defer server.Close()
 	clientConn := dialPassthroughLifecycleClient(t, server)
 	defer func() { _ = clientConn.CloseNow() }()
@@ -737,24 +745,40 @@ func TestPassthroughLifecycle_RejectsOverlappingResponseCreate(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "response.created", gjson.GetBytes(created, "type").String())
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
-	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1"}`))
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.1","input":"queued"}`))
 	cancelWrite()
 	require.NoError(t, err)
 
-	_, err = readPassthroughLifecycleFrame(t, clientConn, time.Second)
-	var websocketCloseErr coderws.CloseError
-	require.ErrorAs(t, err, &websocketCloseErr)
-	require.Equal(t, coderws.StatusPolicyViolation, websocketCloseErr.Code)
-	require.Equal(t, "overlapping response.create is not supported", websocketCloseErr.Reason)
+	// Official WS permits FIFO creates while the preceding turn is active.
+	// The gateway still serializes them, including admission and settlement.
+	select {
+	case raw := <-upstream.writes:
+		t.Fatalf("queued create reached upstream before the first turn ended: %s", raw)
+	case <-time.After(30 * time.Millisecond):
+	}
+	upstream.Send(`{"type":"response.completed","response":{"id":"resp_overlap_first","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)
+	completed, err := readPassthroughLifecycleFrame(t, clientConn, time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "resp_overlap_first", gjson.GetBytes(completed, "response.id").String())
+	second := requirePassthroughUpstreamWrite(t, upstream, time.Second)
+	require.Equal(t, "queued", gjson.GetBytes(second, "input").String())
+	upstream.Send(`{"type":"response.created","response":{"id":"resp_overlap_second","model":"gpt-5.1"}}`)
+	upstream.Send(`{"type":"response.output_text.delta","response_id":"resp_overlap_second","delta":"ok"}`)
+	upstream.Send(`{"type":"response.completed","response":{"id":"resp_overlap_second","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`)
+	for _, kind := range []string{"response.created", "response.output_text.delta", "response.completed"} {
+		frame, err := readPassthroughLifecycleFrame(t, clientConn, time.Second)
+		require.NoError(t, err)
+		require.Equal(t, kind, gjson.GetBytes(frame, "type").String())
+	}
+	require.NoError(t, clientConn.Close(coderws.StatusNormalClosure, "done"))
 	select {
 	case err := <-serverErr:
-		var closeErr *OpenAIWSClientCloseError
-		require.ErrorAs(t, err, &closeErr)
-		require.Equal(t, coderws.StatusPolicyViolation, closeErr.StatusCode())
-		require.Equal(t, "overlapping response.create is not supported", closeErr.Reason())
+		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		t.Fatal("overlapping response.create did not terminate passthrough")
+		t.Fatal("queued response.create test did not exit")
 	}
+	require.Equal(t, []int{2}, beforeTurns, "the first passthrough turn was already admitted by the handshake")
+	require.Equal(t, []int{1, 2}, afterTurns, "settle each completed turn exactly once")
 }
 
 func TestPassthroughLifecycle_ActiveTurnActivityRefreshesReadTimeout(t *testing.T) {

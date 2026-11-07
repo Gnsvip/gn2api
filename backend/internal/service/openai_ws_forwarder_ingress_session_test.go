@@ -1668,7 +1668,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_1","model":"gpt-5.1","output":[],"usage":{"input_tokens":1,"output_tokens":0}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_preflight_rewrite_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
@@ -1763,7 +1763,9 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	firstTurn := readMessage()
 	require.Equal(t, "resp_preflight_rewrite_1", gjson.GetBytes(firstTurn, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"previous_response_id":"resp_stale_external","input":[{"type":"input_text","text":"world"}]}`)
+	// A known parent plus changed instructions requires a full create. An
+	// unrelated external parent must never borrow this connection's history.
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","instructions":"changed","stream":false,"store":false,"previous_response_id":"resp_preflight_rewrite_1","input":[{"type":"input_text","text":"world"}]}`)
 	secondTurn := readMessage()
 	require.Equal(t, "resp_preflight_rewrite_2", gjson.GetBytes(secondTurn, "response.id").String())
 
@@ -1809,7 +1811,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 
 	firstConn := &openAIWSPreflightFailConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_ping_drop_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_turn_ping_drop_1","model":"gpt-5.1","output":[],"usage":{"input_tokens":1,"output_tokens":0}}}`),
 		},
 	}
 	secondConn := &openAIWSCaptureConn{
@@ -1910,7 +1912,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledPre
 	firstTurn := readMessage()
 	require.Equal(t, "resp_turn_ping_drop_1", gjson.GetBytes(firstTurn, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"previous_response_id":"resp_stale_external","input":[{"type":"input_text","text":"world"}]}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","instructions":"changed","stream":false,"store":false,"previous_response_id":"resp_turn_ping_drop_1","input":[{"type":"input_text","text":"world"}]}`)
 	secondTurn := readMessage()
 	require.Equal(t, "resp_turn_ping_drop_2", gjson.GetBytes(secondTurn, "response.id").String())
 
@@ -2220,7 +2222,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_1","model":"gpt-5.1","output":[{"type":"function_call","id":"fc_auto_1","call_id":"call_auto_1","name":"lookup","arguments":"{}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
@@ -2352,7 +2354,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledToo
 
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_tool_search_prev_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_tool_search_prev_1","model":"gpt-5.1","output":[{"type":"tool_search_call","id":"tsc_auto_1","call_id":"call_search_1","execution":"client","arguments":{"query":"lookup"},"status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_tool_search_prev_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}
@@ -2447,7 +2449,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledToo
 	firstTurn := readMessage()
 	require.Equal(t, "resp_tool_search_prev_1", gjson.GetBytes(firstTurn, "response.id").String())
 
-	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"input":[{"type":"tool_search_output","call_id":"call_search_1","output":"ok"}]}`)
+	writeMessage(`{"type":"response.create","model":"gpt-5.1","stream":false,"store":false,"input":[{"type":"tool_search_output","call_id":"call_search_1","execution":"client","tools":[]}]}`)
 	secondTurn := readMessage()
 	require.Equal(t, "resp_tool_search_prev_2", gjson.GetBytes(secondTurn, "response.id").String())
 
@@ -2754,7 +2756,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_StoreDisabledFun
 
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_ref_1","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_ref_1","model":"gpt-5.1","output":[{"type":"function_call","id":"fc_ref_1","call_id":"call_ref_1","name":"lookup","arguments":"{}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1}}}`),
 			[]byte(`{"type":"response.completed","response":{"id":"resp_auto_prev_ref_2","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
 		},
 	}

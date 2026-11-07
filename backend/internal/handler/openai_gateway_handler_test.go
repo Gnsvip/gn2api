@@ -1931,6 +1931,7 @@ func newOpenAIWSHandlerTestServer(t *testing.T, h *OpenAIGatewayHandler, subject
 }
 
 type openAIResponsesWSUsageLogCase struct {
+	unbilledLocalTurns     int // Local HTTP-bridge warmups have no upstream request or usage.
 	standardBillingCache   *handlerInflightCache
 	usageBillingRepo       service.UsageBillingRepository
 	afterFirstCompleted    func()
@@ -3181,11 +3182,18 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	clientEvents := make([][]byte, 0, turnCount)
 	readCompleted := func() {
 		readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
-		_, event, readErr := clientConn.Read(readCtx)
-		cancelRead()
-		require.NoError(t, readErr)
-		require.Equal(t, "response.completed", gjson.GetBytes(event, "type").String())
-		clientEvents = append(clientEvents, append([]byte(nil), event...))
+		defer cancelRead()
+		for {
+			_, event, readErr := clientConn.Read(readCtx)
+			require.NoError(t, readErr)
+			kind := gjson.GetBytes(event, "type").String()
+			if tc.unbilledLocalTurns > 0 && (kind == "response.created" || kind == "response.in_progress") {
+				continue
+			}
+			require.Equal(t, "response.completed", kind)
+			clientEvents = append(clientEvents, append([]byte(nil), event...))
+			return
+		}
 	}
 	readCompleted()
 	if tc.afterFirstCompleted != nil {
@@ -3229,8 +3237,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	}
 	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
 
-	usageLogs := make([]*service.UsageLog, 0, turnCount)
-	for len(usageLogs) < turnCount {
+	workTurns := turnCount - tc.unbilledLocalTurns
+	usageLogs := make([]*service.UsageLog, 0, workTurns)
+	for len(usageLogs) < workTurns {
 		select {
 		case usageLog := <-usageRepo.created:
 			require.NotNil(t, usageLog)
@@ -3240,14 +3249,19 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		}
 	}
 
-	upstreamPayloads := make([][]byte, 0, turnCount)
-	for len(upstreamPayloads) < turnCount {
+	upstreamPayloads := make([][]byte, 0, workTurns)
+	for len(upstreamPayloads) < workTurns {
 		select {
 		case payload := <-upstreamPayloadCh:
 			upstreamPayloads = append(upstreamPayloads, payload)
 		case <-time.After(3 * time.Second):
 			t.Fatal("等待上游 WebSocket 请求帧超时")
 		}
+	}
+
+	if tc.unbilledLocalTurns > 0 {
+		require.Empty(t, usageRepo.created, "warmup must not produce an extra usage record")
+		require.Empty(t, upstreamPayloadCh, "warmup must not send an extra model request")
 	}
 
 	if tc.accountPlatform == service.PlatformGrok || tc.ingressMode == service.OpenAIWSIngressModeHTTPBridge {

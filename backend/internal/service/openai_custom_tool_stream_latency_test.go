@@ -184,7 +184,7 @@ func TestCustomToolBufferedBurstPreservesBytesAndReducesFrames(t *testing.T) {
 	arguments := `{"input":"first` + strings.Repeat(part, chunks) + `"}`
 	send(map[string]any{"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": `"}`})
 	send(map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": arguments})
-	body := newResponsesClientToolStreamBody(io.NopCloser(strings.NewReader(stream.String())), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize)
+	body := newResponsesClientToolStreamBody(io.NopCloser(strings.NewReader(stream.String())), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize, nil)
 	defer body.Close()
 	b, err := io.ReadAll(body)
 	require.NoError(t, err)
@@ -231,7 +231,7 @@ func TestCustomToolBatchPreservesCallAndSSEMetadataBoundaries(t *testing.T) {
 	stream.WriteString(": keep-alive\n\n")
 	send("", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_a", "arguments": `{"input":"startA1A2A3"}`})
 	send("", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_b", "output_index": 1, "arguments": `{"input":"startB1"}`})
-	body := newResponsesClientToolStreamBody(io.NopCloser(strings.NewReader(stream.String())), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize)
+	body := newResponsesClientToolStreamBody(io.NopCloser(strings.NewReader(stream.String())), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize, nil)
 	defer body.Close()
 	b, err := io.ReadAll(body)
 	require.NoError(t, err)
@@ -270,7 +270,7 @@ func TestCustomToolBatchDrainsWithoutManufacturingCompletion(t *testing.T) {
 			if ending == "read_error" {
 				source = io.MultiReader(source, &customToolReadError{})
 			}
-			body := newResponsesClientToolStreamBody(io.NopCloser(source), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize)
+			body := newResponsesClientToolStreamBody(io.NopCloser(source), apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize, nil)
 			defer body.Close()
 			b, err := io.ReadAll(body)
 			if ending == "read_error" || ending == "malformed" {
@@ -357,7 +357,7 @@ func TestCustomToolAdapterTimingSeparatesBufferedFallback(t *testing.T) {
 	a := r.Begin(1, "http")
 	source, writer := io.Pipe()
 	defer writer.Close()
-	body := newResponsesClientToolStreamBody(source, apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize, a)
+	body := newResponsesClientToolStreamBody(source, apicompat.ResponsesClientToolMapping{CustomTools: map[string]bool{"exec": true}}, defaultMaxLineSize, nil, a)
 	defer body.Close()
 	go func() {
 		defer writer.Close()

@@ -271,6 +271,9 @@ type OpenAIForwardResult struct {
 	RequestedReasoningEffort *string
 	Stream                   bool
 	OpenAIWSMode             bool
+	// LocalWarmup retains a WS generate:false context on an HTTP bridge without
+	// contacting upstream. It must not be billed or treated as a performance sample.
+	LocalWarmup bool
 	// RouteDegraded is set only when Tibo route selection applied (Cookie WS
 	// accounts): true means every route was degraded and the request was served
 	// on the plain HTTP fallback; false means a healthy/unknown route served it.
@@ -315,6 +318,9 @@ type OpenAIForwardResult struct {
 // that may clear model-scoped transient state. The zero value remains a success
 // for existing non-WS callers.
 func (r *OpenAIForwardResult) SucceededForScheduling() bool {
+	if r != nil && r.LocalWarmup {
+		return false
+	}
 	if r == nil || !r.OpenAIWSMode || r.UpstreamTerminalEvent == "" {
 		return true
 	}
@@ -484,6 +490,8 @@ type OpenAIGatewayService struct {
 
 	openaiWSPoolOnce               sync.Once
 	openaiWSStateStoreOnce         sync.Once
+	openaiCompactionRecoveryOnce   sync.Once
+	openaiCompactionRecovery       *openAICompactionRecoveryStore
 	openaiSchedulerOnce            sync.Once
 	openaiProxyStreamCircuitOnce   sync.Once
 	openaiWSPassthroughDialerOnce  sync.Once
@@ -512,8 +520,8 @@ type OpenAIGatewayService struct {
 	responseHeaderFilter                *responseheaders.CompiledHeaderFilter
 	codexSnapshotThrottle               *accountWriteThrottle
 	openAIModelsCache                   openAIModelsCache
-	openaiCompatSessionResponses        sync.Map
-	openaiCompatAnthropicDigestSessions sync.Map
+	openaiCompatSessionResponses        sessionMemoryCache
+	openaiCompatAnthropicDigestSessions sessionMemoryCache
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
@@ -735,15 +743,18 @@ func (s *OpenAIGatewayService) billingDeps() *billingDeps {
 	}
 }
 
-// CloseOpenAIWSPool 关闭 OpenAI WebSocket 连接池的后台 worker 和空闲连接。
+// CloseOpenAIWSPool 关闭 OpenAI WebSocket 连接池、后台 worker 和会话缓存清理 timer。
 // 应在应用优雅关闭时调用。
 func (s *OpenAIGatewayService) CloseOpenAIWSPool() {
-	if s != nil {
-		if closer, ok := s.httpUpstream.(interface{ CloseCodexTransports() }); ok {
-			closer.CloseCodexTransports()
-		}
+	if s == nil {
+		return
 	}
-	if s != nil && s.openaiWSPool != nil {
+	s.openaiCompatSessionResponses.Close()
+	s.openaiCompatAnthropicDigestSessions.Close()
+	if closer, ok := s.httpUpstream.(interface{ CloseCodexTransports() }); ok {
+		closer.CloseCodexTransports()
+	}
+	if s.openaiWSPool != nil {
 		s.openaiWSPool.Close()
 	}
 }

@@ -191,3 +191,46 @@ func TestOpenAIWSTurnBillingIdleConnectionReleasesReservation(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAIWSHTTPBridgeLocalWarmupAdmissionAndSettlement(t *testing.T) {
+	t.Run("releases_without_billing", func(t *testing.T) {
+		cache := newHandlerInflightCache(0.01)
+		repo := &compatStreamUsageBillingRepo{}
+		got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
+			ingressMode: service.OpenAIWSIngressModeHTTPBridge, standardBillingCache: cache, usageBillingRepo: repo,
+			unbilledLocalTurns: 1,
+			firstPayload:       `{"type":"response.create","model":"gpt-5.1","generate":false,"input":[]}`,
+			secondPayload:      `{"type":"response.create","model":"gpt-5.1","input":[{"role":"user","content":"now generate"}]}`,
+			afterFirstCompleted: func() {
+				require.Eventually(t, func() bool { return cache.count() == 0 }, time.Second, time.Millisecond)
+				balance, err := cache.GetUserBalance(context.Background(), 1701)
+				require.NoError(t, err)
+				require.Equal(t, 0.01, balance, "warmup cannot deduct even a fixed per-request price")
+				repo.mu.Lock()
+				defer repo.mu.Unlock()
+				require.Empty(t, repo.commands)
+			},
+		})
+		require.Len(t, got.logs, 1)
+		require.Len(t, got.upstreamPayloads, 1)
+		require.Len(t, got.clientEvents, 2)
+		require.Eventually(t, func() bool { return cache.count() == 0 }, time.Second, time.Millisecond)
+		repo.mu.Lock()
+		defer repo.mu.Unlock()
+		require.Len(t, repo.commands, 1, "only the generated turn is charged")
+	})
+	t.Run("quota_still_applies", func(t *testing.T) {
+		cache := newHandlerInflightCache(0.001)
+		runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
+			ingressMode: service.OpenAIWSIngressModeHTTPBridge, standardBillingCache: cache,
+			firstPayload:            `{"type":"response.create","model":"gpt-5.1","generate":false,"input":[]}`,
+			firstFrameCloseExpected: true, closeReason: "billing check failed", billingErrorCode: "insufficient_quota",
+			onBillingReady: func(billing *service.BillingCacheService, key *service.APIKey) {
+				held, err := billing.ReserveInflight(context.Background(), key.User, nil, nil, 1)
+				require.NoError(t, err)
+				t.Cleanup(held.HandlerDone)
+			},
+		})
+		require.Equal(t, 1, cache.count(), "denied warmup cannot disturb another request's reservation")
+	})
+}

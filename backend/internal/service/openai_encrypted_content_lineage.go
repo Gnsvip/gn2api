@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,10 +17,63 @@ import (
 // 上游判定某轮请求中的加密 reasoning/compaction 项不可解后，同一失效密文会随
 // 客户端维护的会话历史在后续每一轮重新出现，重复触发"整包被拒→剥离→重试/
 // 重连"。这里按会话记录已被上游拒绝过的 encrypted_content 摘要
-// （OpenAIWSStateStore，带 TTL 与容量自保护）；后续请求进场时仅剥离摘要命中
-// 的项，新生成的密文摘要不同，不会被误删。
+// （OpenAIWSStateStore，带 TTL 与容量自保护）；后续请求仅清理命中的 reasoning。
+// 命中 compaction 则明确失败，不能删除唯一的压缩历史。新密文不受旧摘要影响。
 
 const openAIWSFallbackReasonInvalidEncryptedContent = "invalid_encrypted_content"
+
+var errOpenAIEncryptedCompactionContext = errors.New("Encrypted compaction context is unavailable; resend full history or start a new conversation.")
+
+// nil invalid means an upstream cipher error did not identify a particular item.
+// In that case any encrypted compaction prevents destructive recovery.
+func hasOpenAIEncryptedCompaction(reqBody map[string]any, invalid map[string]struct{}) bool {
+	check := func(value any) bool {
+		item, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		itemType, _ := item["type"].(string)
+		if !isOpenAICompactionType(strings.TrimSpace(itemType)) {
+			return false
+		}
+		encrypted, exists := item["encrypted_content"]
+		if !exists {
+			return false
+		}
+		if invalid == nil {
+			return true
+		}
+		cipher, ok := encrypted.(string)
+		_, hit := invalid[openAIEncryptedContentDigest(cipher)]
+		return ok && cipher != "" && hit
+	}
+	switch input := reqBody["input"].(type) {
+	case []any:
+		for _, item := range input {
+			if check(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range input {
+			if check(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		return check(input)
+	}
+	return false
+}
+
+func writeOpenAIEncryptedCompactionError(c *gin.Context) error {
+	setOpsUpstreamError(c, http.StatusBadRequest, errOpenAIEncryptedCompactionContext.Error(), "")
+	c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{
+		"type": "invalid_request_error", "code": openAIWSFallbackReasonInvalidEncryptedContent,
+		"message": errOpenAIEncryptedCompactionContext.Error(),
+	}})
+	return errOpenAIEncryptedCompactionContext
+}
 
 // openAIWSIngressSessionHashContextKey 在 gin context 中携带 ingress 会话哈希，
 // 供 HTTP bridge turn 内的 lineage 记录复用同一会话键。
@@ -76,15 +131,18 @@ func collectOpenAIEncryptedContentDigestsRaw(payload []byte) []string {
 
 // stripOpenAIInvalidEncryptedContentItems 剥离 input 中摘要命中 invalid 的密文
 // 项，剥离语义与 trimOpenAIEncryptedReasoningItems 对齐：reasoning 仅剥
-// encrypted_content（连带 content:null 清理与空骨架删除），compaction/
-// compaction_summary 整项删除。返回被改写的项数。
-func stripOpenAIInvalidEncryptedContentItems(reqBody map[string]any, invalid map[string]struct{}) int {
+// encrypted_content（连带 content:null 清理与空骨架删除）。压缩历史不可删除；
+// 在任何改写之前检查，避免返回部分清理后的请求。返回被改写的项数。
+func stripOpenAIInvalidEncryptedContentItems(reqBody map[string]any, invalid map[string]struct{}) (int, error) {
 	if len(reqBody) == 0 || len(invalid) == 0 {
-		return 0
+		return 0, nil
+	}
+	if hasOpenAIEncryptedCompaction(reqBody, invalid) {
+		return 0, errOpenAIEncryptedCompactionContext
 	}
 	inputValue, has := reqBody["input"]
 	if !has {
-		return 0
+		return 0, nil
 	}
 	stripped := 0
 	stripItem := func(item any) (next any, changed bool, keep bool) {
@@ -115,31 +173,31 @@ func stripOpenAIInvalidEncryptedContentItems(reqBody map[string]any, invalid map
 			filtered = append(filtered, nextItem)
 		}
 		if stripped == 0 {
-			return 0
+			return 0, nil
 		}
 		if len(filtered) == 0 {
 			delete(reqBody, "input")
-			return stripped
+			return stripped, nil
 		}
 		reqBody["input"] = filtered
-		return stripped
+		return stripped, nil
 	case map[string]any:
 		nextItem, changed, keep := stripItem(input)
 		if !changed {
-			return 0
+			return 0, nil
 		}
 		if !keep {
 			delete(reqBody, "input")
-			return 1
+			return 1, nil
 		}
 		nextMap, ok := nextItem.(map[string]any)
 		if !ok {
-			return 0
+			return 0, nil
 		}
 		reqBody["input"] = nextMap
-		return 1
+		return 1, nil
 	default:
-		return 0
+		return 0, nil
 	}
 }
 
@@ -182,9 +240,9 @@ func openAIRawPayloadHasInvalidEncryptedContent(payload []byte, invalid map[stri
 // stripOpenAIInvalidEncryptedContentFromReplayItems 对 replay 历史序列做同款
 // 剥离。有改动时返回新头数组，命中项以重写后的新正文整体替换（遵守 replay
 // 所有权不变式，原正文不被修改）；未命中时原样返回。
-func stripOpenAIInvalidEncryptedContentFromReplayItems(items []json.RawMessage, invalid map[string]struct{}) ([]json.RawMessage, int) {
+func stripOpenAIInvalidEncryptedContentFromReplayItems(items []json.RawMessage, invalid map[string]struct{}) ([]json.RawMessage, int, error) {
 	if len(items) == 0 || len(invalid) == 0 {
-		return items, 0
+		return items, 0, nil
 	}
 	hit := false
 	for _, item := range items {
@@ -193,12 +251,14 @@ func stripOpenAIInvalidEncryptedContentFromReplayItems(items []json.RawMessage, 
 			continue
 		}
 		if _, matched := invalid[openAIEncryptedContentDigest(encrypted.String())]; matched {
+			if isOpenAICompactionType(strings.TrimSpace(gjson.Get(openAIWSPayloadStringView(item), "type").String())) {
+				return items, 0, errOpenAIEncryptedCompactionContext
+			}
 			hit = true
-			break
 		}
 	}
 	if !hit {
-		return items, 0
+		return items, 0, nil
 	}
 	stripped := 0
 	next := make([]json.RawMessage, 0, len(items))
@@ -235,9 +295,9 @@ func stripOpenAIInvalidEncryptedContentFromReplayItems(items []json.RawMessage, 
 		next = append(next, json.RawMessage(rebuilt))
 	}
 	if stripped == 0 {
-		return items, 0
+		return items, 0, nil
 	}
-	return next, stripped
+	return next, stripped, nil
 }
 
 // stripOpenAIInvalidEncryptedContentRaw 是 raw JSON 版剥离：先零成本探测，命中
@@ -250,7 +310,10 @@ func stripOpenAIInvalidEncryptedContentRaw(payload []byte, invalid map[string]st
 	if err := decodeOpenAIJSONUseNumber(payload, &decoded); err != nil {
 		return payload, 0, err
 	}
-	stripped := stripOpenAIInvalidEncryptedContentItems(decoded, invalid)
+	stripped, stripErr := stripOpenAIInvalidEncryptedContentItems(decoded, invalid)
+	if stripErr != nil {
+		return payload, 0, stripErr
+	}
 	if stripped == 0 {
 		return payload, 0, nil
 	}
@@ -287,6 +350,24 @@ func (s *OpenAIGatewayService) sessionInvalidEncryptedContentDigests(groupID int
 	return stateStore.GetSessionInvalidEncryptedContentDigests(groupID, sessionHash)
 }
 
+// Renew only when a request/replay actually uses a known invalid item, not on
+// lookups. Mark merges under the store lock and preserves capacity/idle expiry.
+func (s *OpenAIGatewayService) touchSessionInvalidEncryptedContent(groupID int64, sessionHash string, invalid map[string]struct{}) {
+	digests := make([]string, 0, len(invalid))
+	for digest := range invalid {
+		digests = append(digests, digest)
+	}
+	s.markOpenAIWSInvalidEncryptedContentLineage(groupID, sessionHash, digests)
+}
+
+func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentReplay(items []json.RawMessage, invalid map[string]struct{}, groupID int64, sessionHash string) ([]json.RawMessage, error) {
+	next, count, err := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
+	if count > 0 || errors.Is(err, errOpenAIEncryptedCompactionContext) {
+		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid)
+	}
+	return next, err
+}
+
 // openAIWSLineageSessionHashFromContext 取 lineage 会话键：优先 ingress 循环
 // 写入的会话哈希（与读取侧同键），否则按请求体派生。
 func (s *OpenAIGatewayService) openAIWSLineageSessionHashFromContext(c *gin.Context, body []byte) string {
@@ -321,15 +402,24 @@ func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineageFromPay
 
 // stripSessionInvalidEncryptedContentLogged 对 payload 执行会话失效密文剥离并
 // 输出观测日志（logKey / logKey+"_skip"），返回（可能已替换的）payload 与剥离
-// 项数；未命中或剥离失败时原样返回。
+// 项数；无法恢复的压缩历史返回错误，其他解析失败保留原请求交给上游校验。
 func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 	payload []byte,
 	invalid map[string]struct{},
 	logKey string,
 	accountID int64,
 	turn int,
-) ([]byte, int) {
+	groupID int64,
+	sessionHash string,
+) ([]byte, int, error) {
 	strippedPayload, strippedCount, stripErr := stripOpenAIInvalidEncryptedContentRaw(payload, invalid)
+	if strippedCount > 0 || errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid)
+	}
+	if errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+		logOpenAIWSModeInfo("%s_blocked account_id=%d turn=%d reason=unrecoverable_compaction_context", logKey, accountID, turn)
+		return payload, 0, stripErr
+	}
 	if stripErr != nil {
 		logOpenAIWSModeInfo(
 			"%s_skip account_id=%d turn=%d reason=strip_error cause=%s",
@@ -338,7 +428,7 @@ func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 			turn,
 			truncateOpenAIWSLogValue(stripErr.Error(), openAIWSLogValueMaxLen),
 		)
-		return payload, 0
+		return payload, 0, nil
 	}
 	if strippedCount > 0 {
 		logOpenAIWSModeInfo(
@@ -349,5 +439,5 @@ func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 			strippedCount,
 		)
 	}
-	return strippedPayload, strippedCount
+	return strippedPayload, strippedCount, nil
 }

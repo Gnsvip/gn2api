@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requesttiming"
 	"github.com/gin-gonic/gin"
@@ -140,11 +141,12 @@ func newResponsesClientToolStreamBody(
 	source io.ReadCloser,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	cfg *config.Config,
 	timing ...*requesttiming.Attempt,
 ) io.ReadCloser {
 	reader, writer := io.Pipe()
 	body := &responsesClientToolStreamBody{PipeReader: reader, source: source}
-	go transformResponsesClientToolStream(source, writer, mapping, maxLineSize, timing...)
+	go transformResponsesClientToolStream(source, writer, mapping, maxLineSize, cfg, timing...)
 	return body
 }
 
@@ -152,9 +154,10 @@ func newGrokResponsesClientToolStreamBody(
 	source io.ReadCloser,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	cfg *config.Config,
 	timing ...*requesttiming.Attempt,
 ) io.ReadCloser {
-	return newResponsesClientToolStreamBody(source, mapping, maxLineSize, timing...)
+	return newResponsesClientToolStreamBody(source, mapping, maxLineSize, cfg, timing...)
 }
 
 func transformResponsesClientToolStream(
@@ -162,6 +165,7 @@ func transformResponsesClientToolStream(
 	destination *io.PipeWriter,
 	mapping apicompat.ResponsesClientToolMapping,
 	maxLineSize int,
+	cfg *config.Config,
 	timing ...*requesttiming.Attempt,
 ) {
 	defer func() { _ = source.Close() }()
@@ -174,6 +178,7 @@ func transformResponsesClientToolStream(
 	scanBuf := getSSEScannerBuf64K()
 	defer putSSEScannerBuf64K(scanBuf)
 	scanner.Buffer(scanBuf[:0], maxLineSize)
+	scanner.Split(newBoundedSSESplit(cfg, maxLineSize, nil))
 	documents := newOpenAISSEJSONDocumentScanner(scanner)
 	restorer := apicompat.NewResponsesClientToolStreamRestorer(mapping)
 	buffered := bufio.NewWriterSize(destination, 4*1024)

@@ -57,6 +57,33 @@ class ReleaseMatrixTest(unittest.TestCase):
         self.assertNotIn({'goos': 'windows', 'goarch': 'arm64'}, full)
         self.assertEqual(release.targets(True), [{'goos': 'linux', 'goarch': 'amd64'}])
 
+    def test_four_component_binary_release_and_runtime_allowlist(self):
+        self.assertEqual(release.archive_name('0.2.20.1', {'goos': 'linux', 'goarch': 'amd64'}),
+                         'sub2api_0.2.20.1_linux_amd64.tar.gz')
+        files = release.runtime_files()
+        for name in files:
+            path = Path(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'runtime fixture')
+        for name in ['deploy/test_extra.py', 'extensions/modeltrace/test_private.py',
+                     'extensions/modeltrace/__pycache__/service.pyc', 'deploy/tests/secret-fixture',
+                     'extensions/modeltrace/validation.log']:
+            path = Path(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'must not ship')
+        binary = Path('binary')
+        binary.write_bytes(b'\x7fELF\x02\x01' + b'\0' * 12 + b'\x3e\x00')
+        args = argparse.Namespace(version='0.2.20.1', binary='binary', output='packaged')
+        package = release.package_runtime(args)
+        with tarfile.open(package) as archive:
+            self.assertEqual(archive.getnames(), ['sub2api', *files])
+            self.assertEqual(archive.getmember('sub2api').mode, 0o755)
+        with self.assertRaisesRegex(ValueError, 'overwrite'):
+            release.package_runtime(args)
+        with patch.object(release, 'config', return_value={'archives': [{'files': ['deploy/*']}]}):
+            with self.assertRaisesRegex(ValueError, 'archive path'):
+                release.runtime_files()
+
     def test_leaf_keeps_packaging_and_selects_only_one_target(self):
         original = release.config()
         release.generate_config(argparse.Namespace(mode='build', simple=False, goos='darwin', goarch='arm64', output='leaf.yaml'))

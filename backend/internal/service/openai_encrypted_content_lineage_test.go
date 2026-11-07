@@ -44,7 +44,8 @@ func TestStripOpenAIInvalidEncryptedContentItems(t *testing.T) {
 				map[string]any{"type": "input_text", "text": "hello"},
 			},
 		}
-		stripped := stripOpenAIInvalidEncryptedContentItems(reqBody, invalid)
+		stripped, err := stripOpenAIInvalidEncryptedContentItems(reqBody, invalid)
+		require.NoError(t, err)
 		require.Equal(t, 1, stripped)
 		input, ok := reqBody["input"].([]any)
 		require.True(t, ok)
@@ -59,7 +60,7 @@ func TestStripOpenAIInvalidEncryptedContentItems(t *testing.T) {
 		require.Equal(t, "fresh-cipher", second["encrypted_content"], "新密文不得误删")
 	})
 
-	t.Run("compaction_removed_entirely", func(t *testing.T) {
+	t.Run("compaction_fails_without_mutation", func(t *testing.T) {
 		t.Parallel()
 		reqBody := map[string]any{
 			"input": []any{
@@ -67,14 +68,12 @@ func TestStripOpenAIInvalidEncryptedContentItems(t *testing.T) {
 				map[string]any{"type": "input_text", "text": "hello"},
 			},
 		}
-		stripped := stripOpenAIInvalidEncryptedContentItems(reqBody, invalid)
-		require.Equal(t, 1, stripped)
-		input, ok := reqBody["input"].([]any)
-		require.True(t, ok)
-		require.Len(t, input, 1)
-		survivor, ok := input[0].(map[string]any)
-		require.True(t, ok)
-		require.Equal(t, "input_text", survivor["type"])
+		stripped, err := stripOpenAIInvalidEncryptedContentItems(reqBody, invalid)
+		require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext)
+		require.Zero(t, stripped)
+		input := reqBody["input"].([]any)
+		require.Len(t, input, 2)
+		require.Equal(t, "stale-cipher", input[0].(map[string]any)["encrypted_content"])
 	})
 
 	t.Run("no_hit_no_change", func(t *testing.T) {
@@ -84,7 +83,9 @@ func TestStripOpenAIInvalidEncryptedContentItems(t *testing.T) {
 				map[string]any{"type": "reasoning", "encrypted_content": "fresh-cipher"},
 			},
 		}
-		require.Zero(t, stripOpenAIInvalidEncryptedContentItems(reqBody, invalid))
+		count, err := stripOpenAIInvalidEncryptedContentItems(reqBody, invalid)
+		require.NoError(t, err)
+		require.Zero(t, count)
 	})
 }
 
@@ -99,12 +100,12 @@ func TestStripOpenAIInvalidEncryptedContentFromReplayItems(t *testing.T) {
 		t.Parallel()
 		original := json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"stale-cipher"}`)
 		clean := json.RawMessage(`{"type":"input_text","text":"hello"}`)
-		compaction := json.RawMessage(`{"type":"compaction","encrypted_content":"stale-cipher"}`)
-		items := []json.RawMessage{original, clean, compaction}
+		items := []json.RawMessage{original, clean}
 
-		next, stripped := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
-		require.Equal(t, 2, stripped)
-		require.Len(t, next, 1, "compaction 和没有可用内容的 reasoning 骨架应删除")
+		next, stripped, err := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
+		require.NoError(t, err)
+		require.Equal(t, 1, stripped)
+		require.Len(t, next, 1, "没有可用内容的 reasoning 骨架应删除")
 		// 未命中项正文共享；原命中项正文不被修改（整体替换语义）。
 		require.Same(t, &clean[0], &next[0][0])
 		require.Contains(t, string(original), "stale-cipher")
@@ -113,7 +114,8 @@ func TestStripOpenAIInvalidEncryptedContentFromReplayItems(t *testing.T) {
 	t.Run("miss_returns_original_header", func(t *testing.T) {
 		t.Parallel()
 		items := []json.RawMessage{json.RawMessage(`{"type":"reasoning","encrypted_content":"fresh-cipher"}`)}
-		next, stripped := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
+		next, stripped, err := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
+		require.NoError(t, err)
 		require.Zero(t, stripped)
 		require.Same(t, &items[0][0], &next[0][0])
 	})

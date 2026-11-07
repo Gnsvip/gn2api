@@ -8,6 +8,7 @@ import (
 	"time"
 
 	coderws "github.com/coder/websocket"
+	"github.com/tidwall/gjson"
 )
 
 type openAIWSClientReadResult struct {
@@ -21,10 +22,17 @@ type openAIWSClientReadHandoffKey struct{}
 // One pending socket read belongs to the client session, not an upstream
 // attempt. Canceling a relay waiter must not close the client or lose its next
 // frame when the handler switches to an HTTP bridge.
+const (
+	openAIWSQueuedCreateLimit = 32
+	openAIWSQueuedCreateBytes = 64 * 1024 * 1024
+)
+
 type openAIWSClientReadHandoff struct {
-	mu      sync.Mutex
-	conn    *coderws.Conn
-	pending chan openAIWSClientReadResult
+	mu          sync.Mutex
+	conn        *coderws.Conn
+	pending     chan openAIWSClientReadResult
+	queued      []openAIWSClientReadResult
+	queuedBytes int
 }
 
 func WithOpenAIWSClientReadHandoff(ctx context.Context, conn *coderws.Conn) context.Context {
@@ -57,6 +65,39 @@ func (r *openAIWSClientReadHandoff) consumed(ch chan openAIWSClientReadResult) {
 	if r.pending == ch {
 		r.pending = nil
 	}
+}
+
+// Maintenance and active relays keep reading control/disconnect events while
+// future creates wait in a bounded session queue. Admission happens on delivery.
+func (r *openAIWSClientReadHandoff) queueCreate(result openAIWSClientReadResult) (bool, error) {
+	if result.err != nil || (result.messageType != coderws.MessageText && result.messageType != coderws.MessageBinary) ||
+		!gjson.ValidBytes(result.payload) || gjson.GetBytes(result.payload, "type").String() != "response.create" {
+		return false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.queued) >= openAIWSQueuedCreateLimit || len(result.payload) > openAIWSQueuedCreateBytes-r.queuedBytes {
+		return true, NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "websocket pending request queue is full", errors.New("pending response.create queue limit exceeded"))
+	}
+	r.queued = append(r.queued, result)
+	r.queuedBytes += len(result.payload)
+	return true, nil
+}
+
+func (r *openAIWSClientReadHandoff) takeQueued() (openAIWSClientReadResult, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.queued) == 0 {
+		return openAIWSClientReadResult{}, false
+	}
+	result := r.queued[0]
+	r.queued[0] = openAIWSClientReadResult{}
+	r.queued = r.queued[1:]
+	r.queuedBytes -= len(result.payload)
+	if len(r.queued) == 0 {
+		r.queued = nil
+	}
+	return result, true
 }
 
 // ReadOpenAIWSClientMessage keeps one reader alive while control events send
@@ -146,7 +187,18 @@ func readOpenAIWSClientMessageWithTimeoutStart(
 		return 0, nil, NewOpenAIWSClientCloseError(status, reason, cause)
 	}
 
+	deliver := func(result openAIWSClientReadResult) (coderws.MessageType, []byte, error) {
+		if sink, ok := controlCtx.Value(comparisonSinkKey{}).(comparisonSink); ok && result.err == nil && json.Valid(result.payload) {
+			sink("ws_ingress_message", json.RawMessage(result.payload))
+		}
+		return result.messageType, result.payload, result.err
+	}
 	for {
+		if shared && controlCtx.Err() == nil && (waiterDone == nil || waitContexts[0].Err() == nil) && (timeoutActive == nil || timeoutActive()) {
+			if result, ok := reader.takeQueued(); ok {
+				return deliver(result)
+			}
+		}
 		select {
 		case result := <-readDone:
 			if waiterDone != nil && waitContexts[0].Err() != nil {
@@ -154,10 +206,16 @@ func readOpenAIWSClientMessageWithTimeoutStart(
 				return 0, nil, waitContexts[0].Err()
 			}
 			reader.consumed(readDone)
-			if sink, ok := controlCtx.Value(comparisonSinkKey{}).(comparisonSink); ok && result.err == nil && json.Valid(result.payload) {
-				sink("ws_ingress_message", json.RawMessage(result.payload))
+			if shared && timeoutActive != nil && !timeoutActive() {
+				if queued, queueErr := reader.queueCreate(result); queued {
+					if queueErr != nil {
+						return 0, nil, queueErr
+					}
+					readDone = reader.start()
+					continue
+				}
 			}
-			return result.messageType, result.payload, result.err
+			return deliver(result)
 		case <-waiterDone:
 			return 0, nil, waitContexts[0].Err()
 		case <-timeoutStart:

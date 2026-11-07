@@ -68,7 +68,7 @@ func TestOpenAIRequestView_ApplyPatches(t *testing.T) {
 	view.MarkPatchDelete("previous_response_id")
 	view.MarkPatchSet("reasoning.effort", "none")
 
-	patched, err := view.ApplyPatches()
+	patched, err := view.ApplyPatches(context.Background())
 	require.NoError(t, err)
 	require.JSONEq(t, `{"model":"gpt-5.1","reasoning":{"effort":"none"},"input":[{"type":"message","content":"hi"}]}`, string(patched))
 }
@@ -78,7 +78,7 @@ func TestOpenAIRequestView_RejectsEscapedPatchPath(t *testing.T) {
 	view.MarkPatchSet(`metadata.user\.id`, "new")
 
 	require.False(t, view.HasPatches())
-	_, err := view.ApplyPatches()
+	_, err := view.ApplyPatches(context.Background())
 	require.Error(t, err)
 }
 
@@ -87,7 +87,7 @@ func TestOpenAIRequestView_ApplyPatchesDisabled(t *testing.T) {
 	view.MarkPatchSet("model", "gpt-5.1")
 	view.DisablePatches()
 
-	_, err := view.ApplyPatches()
+	_, err := view.ApplyPatches(context.Background())
 	require.Error(t, err)
 }
 
@@ -591,7 +591,7 @@ func TestOpenAIGatewayService_Forward_HTTPRetryRecoveryDoesNotDecodeBeforeError(
 	require.Equal(t, "summary_text", gjson.GetBytes(upstream.bodies[1], "input.0.summary.0.type").String())
 }
 
-func TestOpenAIGatewayService_Forward_HTTPRetryRecoveryDropsCompaction(t *testing.T) {
+func TestOpenAIGatewayService_Forward_HTTPRetryRecoveryRejectsCompactionLoss(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstream := &httpUpstreamRecorder{
 		responses: []*http.Response{
@@ -629,12 +629,11 @@ func TestOpenAIGatewayService_Forward_HTTPRetryRecoveryDropsCompaction(t *testin
 
 	body := []byte(`{"model":"gpt-5.6-sol","stream":false,"input":[{"id":"cmp_stale","type":"compaction","encrypted_content":"gAAA"},{"type":"message","content":[{"type":"input_text","text":"hi"}]}]}`)
 	result, err := svc.Forward(context.Background(), c, account, body)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Len(t, upstream.bodies, 2)
+	require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext)
+	require.Nil(t, result)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Len(t, upstream.bodies, 1, "must not retry without compressed history")
 	require.Equal(t, "compaction", gjson.GetBytes(upstream.bodies[0], "input.0.type").String())
-	require.Equal(t, "message", gjson.GetBytes(upstream.bodies[1], "input.0.type").String())
-	require.False(t, gjson.GetBytes(upstream.bodies[1], "input.1").Exists())
 }
 
 func TestOpenAIGatewayService_Forward_HTTPThinkingSignatureRecoveryAndLineage(t *testing.T) {

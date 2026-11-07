@@ -130,6 +130,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	var firstOutputStage *openAIFirstOutputStage
 	if stageFirstOutput {
 		firstOutputStage = newDefaultOpenAIFirstOutputStage()
+		if preserveCompactionRecoveryHistory(c) {
+			firstOutputStage.memoryOnly = true
+		}
 		defer func() {
 			if err := firstOutputStage.Close(); err != nil {
 				logger.LegacyPrintf("service.openai_gateway", "OpenAI first-output staging cleanup failed: account=%d model=%s error=%v", account.ID, originalModel, err)
@@ -171,8 +174,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	scanner := bufio.NewScanner(resp.Body)
 	scanBuf := getSSEScannerBuf64K()
 	scanner.Buffer(scanBuf[:0], maxLineSize)
+	scanner.Split(newBoundedSSESplit(s.cfg, maxLineSize, nil))
 	if stageFirstOutput {
-		scanner.Split(openAIFirstOutputDynamicScanLines(&firstOutputScanGuard))
+		scanner.Split(newBoundedSSESplit(s.cfg, maxLineSize, openAIFirstOutputDynamicScanLines(&firstOutputScanGuard)))
 	}
 	documentScanner := newOpenAISSEJSONDocumentScanner(scanner)
 
@@ -219,7 +223,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	var firstOutputTimer *time.Timer
 	var firstOutputCh <-chan time.Time
 	if firstOutputTimeout > 0 {
-		remaining := time.Until(startTime.Add(firstOutputTimeout))
+		remaining := time.Until(compactionRecoveryOutputDeadline(c, startTime, firstOutputTimeout))
 		if remaining <= 0 {
 			remaining = time.Nanosecond
 		}
@@ -441,6 +445,15 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			failoverErr.SafeToFailoverAfterWrite = true
 			return resultWithUsage(), failoverErr, true
 		}
+		if errors.Is(scanErr, errSSETransportLimit) && stageFirstOutput && !firstOutputProgressObserved {
+			logger.LegacyPrintf("service.openai_gateway", "SSE event exceeded transport limit before first output: account=%d error=%v", account.ID, scanErr)
+			failoverErr := s.newOpenAIStreamFailoverError(
+				c, account, false, upstreamRequestID, nil,
+				"OpenAI SSE event exceeds first-output transport limit: "+scanErr.Error(),
+			)
+			failoverErr.SafeToFailoverAfterWrite = true
+			return resultWithUsage(), failoverErr, true
+		}
 		if errors.Is(scanErr, bufio.ErrTooLong) && stageFirstOutput && !firstOutputProgressObserved {
 			logger.LegacyPrintf("service.openai_gateway", "SSE line too long before first output: account=%d max_size=%d error=%v", account.ID, maxLineSize, scanErr)
 			failoverErr := s.newOpenAIStreamFailoverError(
@@ -538,6 +551,12 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 			cyberHit := false
 			if eventType == "response.failed" || eventType == "error" {
+				if !clientDisconnected && !openAIStreamClientOutputStarted(c, clientOutputStarted) && (isInternalRecoveryCompact(c) || isCompactionRecoveryError(dataBytes)) {
+					if retry := s.retryCompactionError(c, dataBytes); retry != nil {
+						streamEarlyErr = retry
+						return
+					}
+				}
 				if codexFailureTerminal && eventType == "error" {
 					sawBareError = true
 					bareErrorPayload = append(bareErrorPayload[:0], dataBytes...)
@@ -665,6 +684,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				return
 			}
 			restoredData = restoreCodexToolNamesFromSSEContext(c, restoredData, eventType)
+			restoredData = restoreOpenAIResponsesInstructionsEchoInEvent(c, restoredData)
+			if !clientDisconnected {
+				s.observeCompactionRecovery(c, restoredData, eventType)
+			}
 			if !bytes.Equal(restoredData, dataBytes) {
 				dataBytes = restoredData
 				data = string(restoredData)
@@ -860,13 +883,18 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	// the timeout-disabled path preserves the legacy depth of 16.
 	events := make(chan scanEvent, openAIFirstOutputEventQueueSize(guardFirstOutput))
 	done := make(chan struct{})
+	queueBudget := newSSEQueueBudget(s.cfg)
 	sendEvent := func(ev scanEvent) bool {
+		if !queueBudget.acquire(len(ev.line), done) {
+			return false
+		}
 		if firstOutputScanGuard.Load() {
 			ev.processed = make(chan struct{})
 		}
 		select {
 		case events <- ev:
 		case <-done:
+			queueBudget.release(len(ev.line))
 			return false
 		}
 		if ev.processed == nil {
@@ -904,6 +932,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	for {
 		select {
 		case ev, ok := <-events:
+			if ok {
+				queueBudget.release(len(ev.line))
+			}
 			if !ok {
 				if stageFirstOutput && eventInProgress {
 					// EOF dispatches the final SSE event even without a trailing blank
@@ -1626,6 +1657,11 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	if err != nil {
 		return nil, err
 	}
+	if isInternalRecoveryCompact(c) || isCompactionRecoveryError(body) {
+		if retry := s.retryCompactionError(c, body); retry != nil {
+			return nil, retry
+		}
+	}
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -1692,7 +1728,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		return nil, fmt.Errorf("restore OpenAI namespace response: %w", err)
 	}
 	body = restoreCodexToolNamesFromContext(c, body)
+	body = restoreOpenAIResponsesInstructionsEchoInResponse(c, body)
 	body = ensureOpenAIResponseObjectCreatedAt(body)
+	s.observeCompactionRecovery(c, body, "json")
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	// Codex 协议要求 /responses/compact JSON 响应携带 x-codex-turn-state
 	// （codex-api/src/endpoint/compact.rs 从响应头捕获），显式回传。
@@ -1744,6 +1782,11 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+		if isInternalRecoveryCompact(c) || isCompactionRecoveryError(terminalPayload) {
+			if retry := s.retryCompactionError(c, terminalPayload); retry != nil {
+				return nil, retry
+			}
+		}
 		msg := extractOpenAISSEErrorMessage(terminalPayload)
 		if msg == "" {
 			msg = "Upstream compact response failed"
@@ -1796,11 +1839,14 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			return nil, fmt.Errorf("restore OpenAI namespace response: %w", restoreErr)
 		}
 		restoredBody = restoreCodexToolNamesFromContext(c, restoredBody)
+		restoredBody = restoreOpenAIResponsesInstructionsEchoInResponse(c, restoredBody)
 		body = ensureOpenAIResponseObjectCreatedAt(restoredBody)
+		s.observeCompactionRecovery(c, body, "json")
 	} else {
 		if originalModel != mappedModel {
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
+		bodyText = restoreOpenAIResponsesInstructionsEchoInSSEBody(c, bodyText)
 		body = []byte(bodyText)
 	}
 

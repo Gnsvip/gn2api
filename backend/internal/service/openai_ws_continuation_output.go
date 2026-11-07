@@ -256,3 +256,20 @@ func openAIWSCanReplayMissingToolOutput(responseError gjson.Result, request map[
 	}
 	return false
 }
+
+// A persisted anchor may contain state the upstream cannot replay. Callers
+// must have inferred the anchor from a retained full request and must not have
+// delivered any output before retrying that full request on a fresh socket.
+func openAIWSIsPersistedContextRejection(responseError gjson.Result) bool {
+	if kind := responseError.Get("type").String(); kind != "" && kind != "invalid_request_error" {
+		return false
+	}
+	if code := responseError.Get("code").String(); code != "" {
+		return code == "unsupported_persisted_item_context"
+	}
+	// Some upstreams omit the structured code. Match the complete known
+	// diagnostic, never a fragment that might occur in an unrelated error.
+	message := strings.TrimSpace(responseError.Get("message").String())
+	message = strings.TrimPrefix(message, "Codex error: ")
+	return message == "Persisted response contains hosted-tool, compaction, or unverifiable hidden reasoning state that Rustponses cannot replay. Start a new response or use the Python Responses service for this continuation."
+}

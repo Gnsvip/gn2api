@@ -73,20 +73,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	)
 
 	payload := s.buildOpenAIWSCreatePayload(reqBody, account)
-	strategyAttempt := attempt
 	if c != nil {
 		c.Set("openai_ws_auto_incremental_succeeded", false)
 		c.Set("openai_ws_auto_incremental_item_index", -1)
 		c.Set("openai_ws_auto_incremental_item_type", "")
 		c.Set("openai_ws_auto_incremental_previous_item_type", "")
 		c.Set("openai_ws_auto_incremental_changed_fields", "")
-		if c.GetBool("openai_ws_auto_incremental_replay") {
-			// Replaying a rejected inferred anchor must retain the original
-			// include (notably reasoning.encrypted_content) on every retry.
-			strategyAttempt = 1
-		}
 	}
-	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, strategyAttempt)
+	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, attempt)
 	turnState := ""
 	turnMetadata := ""
 	if c != nil && c.Request != nil {
@@ -754,6 +748,12 @@ readLoop:
 		if eventType == "" {
 			continue
 		}
+		if !wroteDownstream && !clientDisconnected && ctx.Err() == nil && isCompactionRecoveryError(message) {
+			if retry := s.retryCompactionError(c, message); retry != nil {
+				lease.MarkBroken()
+				return nil, retry
+			}
+		}
 		observeOpenAIRequestTiming(timing, message, eventType)
 		responseModelObserver.ObserveOpenAI(message, eventType)
 		if eventType == "response.completed" {
@@ -817,7 +817,7 @@ readLoop:
 			}
 			responseError := gjson.GetBytes(message, path)
 			reason, _ := classifyOpenAIWSErrorEventFromRaw(responseError.Get("code").String(), responseError.Get("type").String(), responseError.Get("message").String())
-			if reason == "previous_response_not_found" || openAIWSCanReplayMissingToolOutput(responseError, reqBody) {
+			if reason == "previous_response_not_found" || openAIWSCanReplayMissingToolOutput(responseError, reqBody) || openAIWSIsPersistedContextRejection(responseError) {
 				lease.MarkBroken()
 				if c != nil {
 					c.Set("openai_ws_auto_incremental_replay", true)
@@ -835,6 +835,7 @@ readLoop:
 				}
 			}
 			message = restoreCodexToolNamesFromContext(c, message)
+			s.observeCompactionRecovery(c, message, eventType)
 		}
 		if openAIWSMessageShouldParseUsage(eventType, message) {
 			parseOpenAIWSResponseUsageFromCompletedEvent(message, usage)

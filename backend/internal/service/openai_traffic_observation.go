@@ -84,7 +84,7 @@ func (s *trafficObservationStore) add(sample trafficObservationSample) {
 // ObserveOpenAITraffic is called synchronously after a forwarding attempt/turn,
 // before usage is queued. Partial billable usage is not proof of a good sample.
 func (s *OpenAIGatewayService) ObserveOpenAITraffic(c *gin.Context, account *Account, result *OpenAIForwardResult, forwardErr error) {
-	if result != nil && result.trafficObservationHandled {
+	if result != nil && (result.trafficObservationHandled || result.LocalWarmup) {
 		return
 	}
 	s.observeOpenAITraffic(c, account, result, forwardErr, requesttiming.FromGin(c).Current().Completion(), GetOpsCyberPolicy(c) != nil)

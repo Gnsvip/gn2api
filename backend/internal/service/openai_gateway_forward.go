@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
@@ -20,6 +21,27 @@ import (
 
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	defer finishCompactionRecoveryTurn(c)
+	if account != nil && account.IsOpenAI() {
+		body = s.beginCompactionRecoveryTurn(c, body, isOpenAIResponsesCompactPath(c), account)
+	}
+	for attempt := 0; ; attempt++ {
+		result, err := s.forwardOpenAIOnce(ctx, c, account, body)
+		var retry *openAICompactionReplayRetry
+		if attempt >= 2 || !errors.As(err, &retry) || ctx.Err() != nil || openAIStreamClientOutputStarted(c, false) {
+			return result, err
+		}
+		previous := compactionRecoveryTurn(c)
+		replay, prepareErr := s.prepareCompactionRetry(ctx, c, account, retry)
+		if prepareErr != nil {
+			return nil, writeOpenAIRecompactionError(c, prepareErr)
+		}
+		body = s.beginCompactionRecoveryTurn(c, replay, isOpenAIResponsesCompactPath(c), account)
+		resumeCompactionRecoveryTurn(c, previous)
+	}
+}
+
+func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	ctx = requesttiming.Context(c, ctx)
 	clearOpenAIWSLatency(c)
 	officialCodexClient := c != nil && openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))
@@ -37,13 +59,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	clearOpenAIResponsesClientToolMapping(c)
 	clearOpenAIResponsesNamespaceNames(c)
 	setCodexToolNameReverse(c, nil)
+	rememberOpenAIResponsesClientInstructions(c, body)
 	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
 		return nil, err
 	}
 	restoreClientSession := stageCodexHTTPClientSession(c, account, body)
 	defer restoreClientSession()
 	s.codexWireProfileForRequest(c, account, body)
-	startTime := time.Now()
+	startTime := compactionRecoveryStartTime(c, time.Now())
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
 	canonicalImageIntentBody := body
 
@@ -126,10 +149,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, GetOpenAIClientTransport(c), account)
 	passthroughEnabled := account.IsOpenAIPassthroughEnabled()
 	compactPath := isOpenAIResponsesCompactPath(c)
-	if compactPath {
+	if compactPath || isInternalRecoveryCompact(c) {
 		wsDecision = openAIWSHTTPDecision("compact_http")
 	}
-	httpWSBridge := GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP && account.IsOpenAI() && account.IsOpenAIOAuthLike() && !compactPath && !passthroughEnabled
+	httpWSBridge := GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP && account.IsOpenAI() && account.IsOpenAIOAuthLike() && !compactPath && !passthroughEnabled && !isInternalRecoveryCompact(c)
 	c.Set(openAIWSSessionRecoveryContextKey, (*openAIWSSessionRecovery)(nil))
 	var wsRecovery *openAIWSSessionRecovery
 	// A WS continuation cannot be replayed as stateless HTTP without its history.
@@ -324,16 +347,45 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	bodyModified := false
 	clientPromptCacheKey := promptCacheKey
 	var reqBody map[string]any
-	ensureReqBody := func() (map[string]any, error) {
-		if requestView.HasPatches() {
-			patchedBody, patchErr := requestView.ApplyPatches()
-			if patchErr != nil {
-				return nil, patchErr
-			}
+	// Each patched body supersedes the previous one, so this attempt holds only
+	// the live output's budget, returned when Forward ends rather than retained
+	// across failover attempts until the handler returns.
+	releasePatchedBodyMemory := func() {}
+	defer func() { releasePatchedBodyMemory() }()
+	flushPatches := func() error {
+		if !requestView.HasPatches() {
+			return nil
+		}
+		patchCtx, releasePatch := httputil.WithRequestBodyMemoryScope(ctx)
+		patchedBody, patchErr := requestView.ApplyPatches(patchCtx)
+		if patchErr == nil {
+			releasePatchedBodyMemory()
+			releasePatchedBodyMemory = releasePatch
 			body = patchedBody
 			requestView = newOpenAIRequestView(body)
 			reqBody = nil
 			bodyModified = false
+			return nil
+		}
+		releasePatch()
+		if errors.Is(patchErr, httputil.ErrRequestBodyMemoryBudget) {
+			return patchErr
+		}
+		// Raw edits cannot express this patch set. Replay it on the decoded
+		// body so the map-based fallback still applies every edit.
+		if reqBody == nil {
+			decoded, decodeErr := requestView.Decode(c)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			reqBody = decoded
+		}
+		requestView.MovePatchesTo(reqBody)
+		return nil
+	}
+	ensureReqBody := func() (map[string]any, error) {
+		if err := flushPatches(); err != nil {
+			return nil, err
 		}
 		if reqBody != nil {
 			return reqBody, nil
@@ -406,8 +458,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	isCompactRequest := compactPath
 	requestedModel := reqModel
-	billingModel, upstreamModel := resolveOpenAIForwardMappedModels(account, requestedModel, isCompactRequest)
-	if isCompactRequest {
+	billingModel, upstreamModel := resolveOpenAIForwardMappedModels(account, requestedModel, isCompactRequest && !isInternalRecoveryCompact(c))
+	if isCompactRequest && !isInternalRecoveryCompact(c) {
 		if compactModel := s.resolveOpenAICompactFallbackModel(account, requestedModel); compactModel != "" {
 			upstreamModel = compactModel
 		}
@@ -795,19 +847,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
-		if truncateOpenAIResponsesInputText(decoded) {
+		if !preserveCompactionRecoveryHistory(c) && truncateOpenAIResponsesInputText(decoded) {
 			markDecodedModified()
 		}
 	}
 
 	if bodyModified {
-		if requestView.HasPatches() {
-			if patchedBody, patchErr := requestView.ApplyPatches(); patchErr == nil {
-				body = patchedBody
-				requestView = newOpenAIRequestView(body)
-				reqBody = nil
-				bodyModified = false
-			}
+		if err := flushPatches(); err != nil {
+			return nil, err
 		}
 		if bodyModified {
 			decoded, decodeErr := ensureReqBody()
@@ -841,9 +888,15 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if stateStore := s.getOpenAIWSStateStore(); stateStore != nil && stateStore.HasAnySessionInvalidEncryptedContent() {
 		lineageSessionHash = s.GenerateSessionHash(c, body)
 		if invalidDigests := stateStore.GetSessionInvalidEncryptedContentDigests(lineageGroupID, lineageSessionHash); len(invalidDigests) > 0 {
-			strippedBody, strippedCount := s.stripSessionInvalidEncryptedContentLogged(
-				body, invalidDigests, "invalid_encrypted_lineage_strip", account.ID, 0,
+			strippedBody, strippedCount, stripErr := s.stripSessionInvalidEncryptedContentLogged(
+				body, invalidDigests, "invalid_encrypted_lineage_strip", account.ID, 0, lineageGroupID, lineageSessionHash,
 			)
+			if stripErr != nil {
+				if retry := s.retryCompactionHistory(c); retry != nil {
+					return nil, retry
+				}
+				return nil, writeOpenAIEncryptedCompactionError(c)
+			}
 			if strippedCount > 0 {
 				body = strippedBody
 				requestView = newOpenAIRequestView(body)
@@ -1002,6 +1055,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if wsErr == nil {
 				break
 			}
+			var compactionRetry *openAICompactionReplayRetry
+			if errors.As(wsErr, &compactionRetry) {
+				return nil, wsErr
+			}
 			if c != nil && c.Writer != nil && c.Writer.Written() {
 				break
 			}
@@ -1025,9 +1082,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
 				continue
 			}
-			if reason == "invalid_encrypted_content" && recoverInvalidEncryptedContent(attempt) {
-				connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
-				continue
+			if reason == "invalid_encrypted_content" {
+				if hasOpenAIEncryptedCompaction(wsReqBody, nil) {
+					if retry := s.retryCompactionHistory(c); retry != nil {
+						return nil, retry
+					}
+					s.markOpenAIWSInvalidEncryptedContentLineageFromPayload(c, lineageEntryBody, "invalid_encrypted_compaction_blocked", account.ID, 0)
+					return nil, writeOpenAIEncryptedCompactionError(c)
+				}
+				if recoverInvalidEncryptedContent(attempt) {
+					connectCtx = withOpenAIWSConnectBudget(ctx, time.Now(), retryBudget)
+					continue
+				}
 			}
 			if retryable && attempt < maxAttempts {
 				backoff := s.openAIWSRetryBackoff(attempt)
@@ -1169,12 +1235,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		if isInternalRecoveryCompact(c) {
+			// Maintenance must obey its cancellation and two-minute budget.
+			upstreamCtx = ctx
+		}
 		var headerGuard *openAIFirstOutputHeaderGuard
 		if firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
-				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
+				upstreamCtx, releaseUpstreamCtx, compactionRecoveryOutputDeadline(c, startTime, firstOutputTimeout),
 			)
 		}
+		syncOpenAIResponsesInstructionsEcho(c, body)
 		upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, reqStream, promptCacheKey, isCodexCLI)
 		if headerGuard == nil {
 			releaseUpstreamCtx()
@@ -1236,6 +1307,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 			upstreamCode := extractUpstreamErrorCode(respBody)
+			if retry := s.retryCompactionError(c, respBody); retry != nil {
+				return nil, retry
+			}
 			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
 				agentTaskRecoveryTried = true
 				expectedTaskID := account.GetCredential("task_id")
@@ -1257,6 +1331,13 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					return nil, decodeErr
 				}
 				invalidDigests := collectOpenAIEncryptedContentDigestsRaw(lineageEntryBody)
+				if hasOpenAIEncryptedCompaction(decoded, nil) {
+					if retry := s.retryCompactionHistory(c); retry != nil {
+						return nil, retry
+					}
+					s.markOpenAIWSInvalidEncryptedContentLineageFromPayload(c, lineageEntryBody, "invalid_encrypted_compaction_blocked", account.ID, 0)
+					return nil, writeOpenAIEncryptedCompactionError(c)
+				}
 				if trimOpenAIEncryptedReasoningItems(decoded) {
 					body, err = marshalOpenAIUpstreamJSON(decoded)
 					if err != nil {
@@ -1344,7 +1425,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
 				maxLineSize = s.cfg.Gateway.MaxLineSize
 			}
-			resp.Body = newResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize, requesttiming.FromGin(c).Current())
+			resp.Body = newResponsesClientToolStreamBody(resp.Body, mapping, maxLineSize, s.cfg, requesttiming.FromGin(c).Current())
 		}
 
 		serviceTier := extractOpenAIServiceTierFromBody(body)
