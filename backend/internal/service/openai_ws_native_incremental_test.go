@@ -292,3 +292,231 @@ func TestHTTPToWSOversizeBeforeAnyWrite(t *testing.T) {
 		})
 	}
 }
+
+// A deployment discards socket-local anchors. Keep this regression alongside
+// the existing size fallback tests: restoring history must make the following
+// tool turn incremental again without dropping historical images.
+func TestHTTPToWSHistoryRestoreAfterPoolRestart(t *testing.T) {
+	var dials, generations, warmups atomic.Int32
+	requests := make(chan []byte, 16)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		dials.Add(1)
+		previous := ""
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			requests <- raw
+			if id := gjson.GetBytes(raw, "previous_response_id").String(); id != "" && id != previous {
+				t.Error("restoration used an anchor belonging to another connection")
+				return
+			}
+			output := autoContinuationAnswer
+			if gjson.GetBytes(raw, "generate").Type == gjson.False {
+				previous = fmt.Sprintf("resp_warm_%d", warmups.Add(1))
+				output = ""
+			} else {
+				n := generations.Add(1)
+				previous = fmt.Sprintf("resp_generated_%d", n)
+				if n == 2 {
+					output = autoContinuationCall
+				}
+			}
+			event := autoContinuationEvent(previous, output)
+			if output == "" {
+				event = []byte(strings.Replace(string(event), `"output_tokens":5`, `"output_tokens":0`, 1))
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, event)
+		}
+	}))
+	defer server.Close()
+	s, a, _ := httpBridgeFixture(t, server.URL)
+	s.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = true
+	payload := nativeContinuationPayload(t)
+	payload["stream"] = false
+	image := map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_image", "image_url": "data:image/png;base64," + strings.Repeat("A", 6<<20), "detail": "original"}}}
+	input := append(payload["input"].([]any), image, image)
+	forward := func(s *OpenAIGatewayService) string {
+		t.Helper()
+		payload["input"] = input
+		body, err := json.Marshal(payload)
+		require.NoError(t, err)
+		c, rec := httpBridgeContext("restart-large-history")
+		result, err := s.Forward(context.Background(), c, a, body)
+		require.NoError(t, err)
+		require.True(t, result.OpenAIWSMode)
+		require.NotContains(t, rec.Body.String(), "resp_warm_")
+		return c.GetString("openai_ws_auto_incremental_reason")
+	}
+	require.Equal(t, "no_checkpoint", forward(s))
+	<-requests
+	s.openaiWSPool.Close()
+	// Simulate a process restart, including loss of the session/state store.
+	s, a, upstream := httpBridgeFixture(t, server.URL)
+	s.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = true
+	input = append(input, json.RawMessage(autoContinuationAnswer), image)
+	require.Equal(t, "history_restored", forward(s))
+	require.Zero(t, upstream.callCount)
+	require.Equal(t, int32(1), warmups.Load())
+	require.Equal(t, int32(2), generations.Load())
+	first, final := <-requests, <-requests
+	require.Less(t, len(first), 15<<20)
+	require.Less(t, len(final), 15<<20)
+	require.False(t, gjson.GetBytes(first, "previous_response_id").Exists())
+	require.Equal(t, "resp_warm_1", gjson.GetBytes(final, "previous_response_id").String())
+	require.Equal(t, 3, strings.Count(string(first)+string(final), "data:image/png;base64,"))
+	for _, raw := range [][]byte{first, final} {
+		require.Equal(t, "gpt-6-astra", gjson.GetBytes(raw, "model").String())
+		require.Equal(t, "xhigh", gjson.GetBytes(raw, "reasoning.effort").String())
+	}
+	input = append(input, json.RawMessage(autoContinuationCall), json.RawMessage(autoContinuationTool))
+	require.Equal(t, "prefix_matched", forward(s))
+	delta := <-requests
+	require.Equal(t, "resp_generated_2", gjson.GetBytes(delta, "previous_response_id").String())
+	require.JSONEq(t, "["+autoContinuationTool+"]", gjson.GetBytes(delta, "input").Raw)
+	require.NotContains(t, string(delta), "data:image/")
+	require.Equal(t, int32(2), dials.Load())
+}
+
+func TestOpenAIWSHistoryRestorePlanBoundaries(t *testing.T) {
+	message := func(n int) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"role": "user", "content": strings.Repeat("x", n)})
+		return b
+	}
+	for _, name := range []string{"valid", "oversize_item", "oversize_pair", "missing_result", "explicit_anchor", "compaction", "unknown", "too_many_parts", "prewarm"} {
+		t.Run(name, func(t *testing.T) {
+			input := []json.RawMessage{message(1800), json.RawMessage(autoContinuationCall), json.RawMessage(autoContinuationTool), message(1800)}
+			payload := map[string]any{"type": "response.create", "model": "gpt-6-astra", "input": input, "reasoning": map[string]any{"effort": "xhigh"}, "tools": []any{}}
+			switch name {
+			case "oversize_item":
+				input[0] = message(4000)
+			case "oversize_pair":
+				input[1] = json.RawMessage(`{"type":"function_call","call_id":"call_test","name":"f","arguments":"` + strings.Repeat("x", 1800) + `"}`)
+				input[2] = json.RawMessage(`{"type":"function_call_output","call_id":"call_test","output":"` + strings.Repeat("y", 1800) + `"}`)
+			case "missing_result":
+				input[2] = message(1)
+			case "explicit_anchor":
+				payload["previous_response_id"] = "resp_other_socket"
+			case "compaction":
+				input[0] = json.RawMessage(`{"type":"compaction_trigger"}`)
+			case "unknown":
+				input[0] = json.RawMessage(`{"type":"item_reference","id":"msg_unknown"}`)
+			case "too_many_parts":
+				input = make([]json.RawMessage, 12)
+				for i := range input {
+					input[i] = message(1800)
+				}
+			case "prewarm":
+				payload["generate"] = false
+			}
+			payload["input"] = input
+			wire, _ := json.Marshal(payload)
+			parts, ok := planOpenAIWSHistoryRestore(wire, 3300)
+			require.Equal(t, name == "valid", ok)
+			if !ok {
+				return
+			}
+			var restored []json.RawMessage
+			for _, part := range parts {
+				raw, _ := json.Marshal(part)
+				require.Less(t, len(raw), 3300)
+				require.True(t, openAIWSContinuationToolsComplete(gjson.GetBytes(raw, "input").Array(), nil))
+				restored = append(restored, part["input"].([]json.RawMessage)...)
+			}
+			a, _ := json.Marshal(input)
+			b, _ := json.Marshal(restored)
+			require.JSONEq(t, string(a), string(b))
+		})
+	}
+}
+
+func TestHTTPToWSHistoryRestoreFailureReplaysFullHTTP(t *testing.T) {
+	var writes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err == nil {
+			writes.Add(1)
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_request_error","message":"warmup unavailable"}}}`))
+		}
+	}))
+	defer server.Close()
+	s, account, httpUpstream := httpBridgeFixture(t, server.URL)
+	s.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = true
+	s.cfg.Gateway.OpenAIWS.HTTPBridgeThresholdBytes = 6000
+	payload := autoContinuationPayload(t)
+	input := payload["input"].([]any)
+	for i := 0; i < 4; i++ {
+		input = append(input, map[string]any{"role": "user", "content": fmt.Sprintf("marker%d-%s", i, strings.Repeat("x", 2200))})
+	}
+	payload["input"], payload["stream"] = input, false
+	body, _ := json.Marshal(payload)
+	c, rec := httpBridgeContext("restore-failure")
+	result, err := s.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.False(t, result.OpenAIWSMode)
+	require.Equal(t, int32(1), writes.Load())
+	require.Equal(t, 1, httpUpstream.callCount)
+	require.NotContains(t, rec.Body.String(), "warmup unavailable")
+	require.False(t, gjson.GetBytes(httpUpstream.bodies[0], "previous_response_id").Exists())
+	for i := 0; i < 4; i++ {
+		require.Contains(t, string(httpUpstream.bodies[0]), fmt.Sprintf("marker%d-", i))
+	}
+}
+
+func TestOpenAIWSHistoryRestoreRejectsInvalidTerminalsAndHonorsCancellation(t *testing.T) {
+	for _, name := range []string{"failed", "missing_anchor", "unexpected_output", "malformed", "canceled", "unauthorized", "encrypted_context"} {
+		t.Run(name, func(t *testing.T) {
+			s, account, _ := httpBridgeFixture(t, "http://127.0.0.1")
+			event := `{"type":"response.completed","response":{"id":"resp_warm","status":"completed","output":[],"usage":{"output_tokens":0}}}`
+			switch name {
+			case "failed":
+				event = `{"type":"response.failed","response":{"status":"failed"}}`
+			case "missing_anchor":
+				event = strings.Replace(event, `"resp_warm"`, `""`, 1)
+			case "unexpected_output":
+				event = strings.Replace(event, `"output":[]`, `"output":[`+autoContinuationAnswer+`]`, 1)
+			case "malformed":
+				event = `{`
+			case "unauthorized":
+				event = `{"type":"error","error":{"code":"invalid_api_key","type":"authentication_error","message":"Invalid API key"}}`
+			case "encrypted_context":
+				event = `{"type":"error","error":{"code":"invalid_encrypted_content","type":"invalid_request_error","message":"Encrypted content could not be verified"}}`
+			}
+			upstream := &openAIWSCaptureConn{events: [][]byte{[]byte(event)}}
+			lease := &openAIWSConnLease{accountID: account.ID, conn: newOpenAIWSConn("restore_failure", account.ID, upstream, nil)}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			if name == "canceled" {
+				upstream.readDelays = []time.Duration{time.Second}
+			}
+			c, _ := httpBridgeContext("restore_failure")
+			part := map[string]any{"type": "response.create", "generate": false}
+			wire, _ := json.Marshal(part)
+			started := time.Now()
+			_, err := s.sendOpenAIWSHistoryPart(ctx, c, lease, account, part, wire, len(wire), "gpt-5.1", "gpt-5.1")
+			require.Error(t, err)
+			if name == "unauthorized" {
+				var failover *UpstreamFailoverError
+				require.ErrorAs(t, err, &failover)
+				require.Equal(t, http.StatusUnauthorized, failover.StatusCode)
+			}
+			if name == "encrypted_context" {
+				var recovery *openAIWSFallbackError
+				require.ErrorAs(t, err, &recovery)
+				require.Equal(t, "invalid_encrypted_content", recovery.Reason)
+			}
+			require.Less(t, time.Since(started), 500*time.Millisecond)
+			require.Nil(t, lease.conn.autoContinuation.Load())
+		})
+	}
+}

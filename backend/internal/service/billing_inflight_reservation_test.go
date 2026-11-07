@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -703,4 +704,57 @@ func TestCompactionRecompactBillsEachCallAndStopsOnBalance(t *testing.T) {
 			require.Equal(t, 2, calls, "no upstream call after funds exhausted")
 		})
 	}
+}
+
+func TestWSHistoryRestoreBillsAcceptedPartsAndStopsOnBalance(t *testing.T) {
+	svc, account, _ := httpBridgeFixture(t, "http://127.0.0.1")
+	usageRepo := &recoveryBillingLogRepo{}
+	userRepo := &openAIRecordUsageUserRepoStub{}
+	billingRepo := &openAIRecordUsageBillingRepoStub{}
+	fixture := newOpenAIRecordUsageServiceWithBillingRepoForTest(usageRepo, billingRepo, userRepo, &openAIRecordUsageSubRepoStub{}, nil)
+	svc.billingService, svc.usageLogRepo, svc.usageBillingRepo, svc.userRepo = fixture.billingService, usageRepo, billingRepo, userRepo
+	svc.deferredService = &DeferredService{}
+	svc.cfg.Default.RateMultiplier = 1
+	cache := newMemInflightCache(10)
+	svc.billingCacheService = newInflightSvc(t, cache, 60)
+	c, _ := httpBridgeContext("warmup-billing")
+	key := &APIKey{ID: 123, User: &User{ID: 7}}
+	SetOpenAICompactionBilling(c, &OpenAIRecordUsageInput{APIKey: key, User: key.User, Account: account, PricingAt: time.Now()})
+	upstream := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_warm_paid","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":0,"input_tokens_details":{"cached_tokens":20}}}}`),
+		[]byte(`{"type":"response.failed","response":{"id":"resp_warm_failed","status":"failed","error":{"code":"context_length_exceeded"},"usage":{"input_tokens":70,"output_tokens":0}}}`),
+	}}
+	lease := &openAIWSConnLease{accountID: account.ID, conn: newOpenAIWSConn("warmup_billing", account.ID, upstream, nil)}
+	part := map[string]any{"type": "response.create", "model": "gpt-5.1", "generate": false, "input": []any{}, "reasoning": json.RawMessage(`{"effort":"xhigh"}`), "service_tier": json.RawMessage(`"flex"`)}
+	wire, _ := json.Marshal(part)
+	ctx := context.WithValue(context.Background(), ctxkey.ClientRequestID, "same-client-turn")
+	id, err := svc.sendOpenAIWSHistoryPart(ctx, c, lease, account, part, wire, len(wire), "gpt-5.1", "gpt-5.1")
+	require.NoError(t, err)
+	require.Equal(t, "resp_warm_paid", id)
+	_, err = svc.sendOpenAIWSHistoryPart(ctx, c, lease, account, part, wire, 2*len(wire), "gpt-5.1", "gpt-5.1")
+	require.Error(t, err)
+	require.Equal(t, 2, billingRepo.calls)
+	require.Len(t, usageRepo.rows, 2)
+	require.NotEqual(t, usageRepo.rows[0].RequestID, usageRepo.rows[1].RequestID)
+	for _, row := range usageRepo.rows {
+		require.Contains(t, row.RequestID, "ws_history_restore:")
+		require.Greater(t, row.ActualCost, 0.0)
+		require.Nil(t, row.FirstTokenMs, "warmup is not a TTFT sample")
+		require.Zero(t, row.OutputTokens)
+		require.False(t, row.NativeCompactionV2)
+		require.NotNil(t, row.ServiceTier)
+		require.Equal(t, "flex", *row.ServiceTier)
+		require.NotNil(t, row.ReasoningEffort)
+		require.Equal(t, "xhigh", *row.ReasoningEffort)
+	}
+	require.Equal(t, 80, usageRepo.rows[0].InputTokens)
+	require.Equal(t, 20, usageRepo.rows[0].CacheReadTokens)
+	require.Equal(t, 70, usageRepo.rows[1].InputTokens)
+	require.Zero(t, cache.count())
+	cache.mu.Lock()
+	cache.balance = 0
+	cache.mu.Unlock()
+	_, err = svc.sendOpenAIWSHistoryPart(ctx, c, lease, account, part, wire, 3*len(wire), "gpt-5.1", "gpt-5.1")
+	require.ErrorIs(t, err, ErrInsufficientBalance)
+	require.Len(t, upstream.writes, 2)
 }

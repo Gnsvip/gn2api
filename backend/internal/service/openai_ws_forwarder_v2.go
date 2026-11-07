@@ -441,9 +441,45 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 		payloadBytes = len(wirePayload)
 		if int64(payloadBytes) >= s.openAIWSHTTPBridgeThresholdBytes() {
-			cleanExit = true
-			logOpenAIWSModeInfo("http_bridge_preflight account_id=%d payload_bytes=%d threshold_bytes=%d incremental=%v", account.ID, payloadBytes, s.openAIWSHTTPBridgeThresholdBytes(), autoContinuation)
-			return nil, wrapOpenAIWSFallback("payload_too_large", errors.New("outgoing WS payload exceeds HTTP bridge threshold"))
+			// A replacement socket cannot use the old socket's anchor. Restore
+			// complete history in bounded, non-generating parts before falling
+			// back to HTTP; keep the draft for the ORIGINAL complete input.
+			var parts []map[string]any
+			if attempt == 1 && !autoContinuation && continuationDraft != nil && previousResponseID == "" {
+				parts, _ = planOpenAIWSHistoryRestore(wirePayload, s.openAIWSHTTPBridgeThresholdBytes())
+			}
+			if len(parts) == 0 {
+				cleanExit = true
+				logOpenAIWSModeInfo("http_bridge_preflight account_id=%d payload_bytes=%d threshold_bytes=%d incremental=%v", account.ID, payloadBytes, s.openAIWSHTTPBridgeThresholdBytes(), autoContinuation)
+				return nil, wrapOpenAIWSFallback("payload_too_large", errors.New("outgoing WS payload exceeds HTTP bridge threshold"))
+			}
+			timing.Stage("restore_websocket_history")
+			restored, restoreErr := s.restoreOpenAIWSHistory(ctx, c, lease, account, parts, originalModel, mappedModel)
+			if restoreErr != nil {
+				// An internal warmup may have changed upstream state. Discard
+				// this socket and replay the untouched full reqBody over HTTP.
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				var failover *UpstreamFailoverError
+				var contextRecovery *openAIWSFallbackError
+				if errors.As(restoreErr, &failover) || errors.As(restoreErr, &contextRecovery) {
+					return nil, restoreErr
+				}
+				logOpenAIWSModeInfo("history_restore_failed account_id=%d conn_id=%s error_type=%T", account.ID, connID, restoreErr)
+				return nil, wrapOpenAIWSFallback("payload_too_large", restoreErr)
+			}
+			payload = restored
+			previousResponseID = openAIWSPayloadString(payload, "previous_response_id")
+			previousResponseIDKind = ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
+			payloadBytes = -1
+			autoContinuation = true
+			if c != nil {
+				c.Set("openai_ws_auto_incremental", true)
+				c.Set("openai_ws_auto_incremental_reason", "history_restored")
+			}
+			timing.Incremental(true, "history_restored")
+			recordOpenAIWSRequestShape(timing, payload)
 		}
 	}
 
