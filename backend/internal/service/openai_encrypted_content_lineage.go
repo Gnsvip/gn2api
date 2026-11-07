@@ -375,7 +375,7 @@ func (s *OpenAIGatewayService) touchSessionInvalidEncryptedContent(groupID int64
 
 func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentReplay(items []json.RawMessage, invalid map[string]struct{}, groupID int64, sessionHash string, accountID int64) ([]json.RawMessage, error) {
 	next, count, err := stripOpenAIInvalidEncryptedContentFromReplayItems(items, invalid)
-	if count > 0 || errors.Is(err, errOpenAIEncryptedCompactionContext) {
+	if count > 0 {
 		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid, accountID)
 	}
 	return next, err
@@ -416,7 +416,7 @@ func (s *OpenAIGatewayService) markOpenAIWSInvalidEncryptedContentLineageFromPay
 
 // stripSessionInvalidEncryptedContentLogged 对 payload 执行会话失效密文剥离并
 // 输出观测日志（logKey / logKey+"_skip"），返回（可能已替换的）payload 与剥离
-// 项数；无法恢复的压缩历史返回错误，其他解析失败保留原请求交给上游校验。
+// 项数；压缩历史返回原窗口和恢复信号，调用方优先恢复副本，无副本时交上游验证。
 func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 	payload []byte,
 	invalid map[string]struct{},
@@ -427,11 +427,13 @@ func (s *OpenAIGatewayService) stripSessionInvalidEncryptedContentLogged(
 	sessionHash string,
 ) ([]byte, int, error) {
 	strippedPayload, strippedCount, stripErr := stripOpenAIInvalidEncryptedContentRaw(payload, invalid)
-	if strippedCount > 0 || errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+	if strippedCount > 0 {
 		s.touchSessionInvalidEncryptedContent(groupID, sessionHash, invalid, accountID)
 	}
 	if errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
-		logOpenAIWSModeInfo("%s_blocked account_id=%d turn=%d reason=unrecoverable_compaction_context", logKey, accountID, turn)
+		logOpenAIWSModeInfo("%s_revalidate account_id=%d turn=%d reason=preserve_compaction_context", logKey, accountID, turn)
+		// Let callers restore a verified undo record first. If none exists,
+		// they must preserve this window and let the upstream revalidate it.
 		return payload, 0, stripErr
 	}
 	if stripErr != nil {

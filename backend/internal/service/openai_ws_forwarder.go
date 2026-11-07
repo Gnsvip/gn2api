@@ -43,8 +43,9 @@ const (
 	openAIWSStoreDisabledConnModeAdaptive = "adaptive"
 	openAIWSStoreDisabledConnModeOff      = "off"
 
-	openAIWSIngressStagePreviousResponseNotFound = "previous_response_not_found"
-	openAIWSMaxPrevResponseIDDeletePasses        = 8
+	openAIWSIngressStagePreviousResponseNotFound    = "previous_response_not_found"
+	openAIWSIngressStagePersistedContextUnsupported = "unsupported_persisted_item_context"
+	openAIWSMaxPrevResponseIDDeletePasses           = 8
 )
 
 var openAIWSLogValueReplacer = strings.NewReplacer(
@@ -190,12 +191,13 @@ func openAIWSIngressTurnRetryReason(err error) string {
 	return turnErr.stage
 }
 
-func isOpenAIWSIngressPreviousResponseNotFound(err error) bool {
+func isOpenAIWSIngressPreviousResponseUnusable(err error) bool {
 	var turnErr *openAIWSIngressTurnError
 	if !errors.As(err, &turnErr) || turnErr == nil {
 		return false
 	}
-	if strings.TrimSpace(turnErr.stage) != openAIWSIngressStagePreviousResponseNotFound {
+	stage := strings.TrimSpace(turnErr.stage)
+	if stage != openAIWSIngressStagePreviousResponseNotFound && stage != openAIWSIngressStagePersistedContextUnsupported {
 		return false
 	}
 	return !turnErr.wroteDownstream

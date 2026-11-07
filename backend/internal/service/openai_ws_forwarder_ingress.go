@@ -805,7 +805,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						turn--
 						continue
 					}
-					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+					if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+					}
 				}
 				if strippedCount > 0 {
 					currentBridgePayload.payloadRaw = strippedPayload
@@ -821,7 +823,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 							turn--
 							continue
 						}
-						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+						if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+							return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+						}
 					}
 				}
 				if needsBridgeReplay && bridgeAccountFailoverInputExists {
@@ -834,7 +838,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 							turn--
 							continue
 						}
-						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+						if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+							return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+						}
 					}
 				}
 			}
@@ -1352,7 +1358,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if eventType == "error" || eventType == "response.failed" {
 				markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
 			}
-			// Both error envelopes can report an evicted parent. Tool results are
+			// Both error envelopes can report an evicted or unusable parent. Tool results are
 			// recoverable too: the outer loop validates the complete replay before
 			// dropping the anchor. Never retry after exposing any output.
 			if (eventType == "error" || eventType == "response.failed") &&
@@ -1364,7 +1370,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				failure := gjson.GetBytes(upstreamMessage, path)
 				reason, _ := classifyOpenAIWSErrorEventFromRaw(failure.Get("code").String(), failure.Get("type").String(), failure.Get("message").String())
-				if reason == openAIWSIngressStagePreviousResponseNotFound {
+				if openAIWSIsPersistedContextRejection(failure) {
+					reason = openAIWSIngressStagePersistedContextUnsupported
+				}
+				if reason == openAIWSIngressStagePreviousResponseNotFound || reason == openAIWSIngressStagePersistedContextUnsupported {
 					lease.MarkBroken()
 					message := strings.TrimSpace(failure.Get("message").String())
 					if message == "" {
@@ -1741,7 +1750,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return nil
 	}
 	recoverIngressPrevResponseNotFound := func(relayErr error, turn int, connID string) bool {
-		if !isOpenAIWSIngressPreviousResponseNotFound(relayErr) {
+		if !isOpenAIWSIngressPreviousResponseUnusable(relayErr) {
 			return false
 		}
 		if turnPrevRecoveryTried || !s.openAIWSIngressPreviousResponseRecoveryEnabled() || ctx.Err() != nil {
@@ -1874,7 +1883,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					}
 					continue
 				}
-				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+				if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+				}
 			}
 			if strippedCount > 0 {
 				currentPayload = strippedPayload
@@ -1963,7 +1974,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 						}
 						continue
 					}
-					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+					if !errors.Is(stripErr, errOpenAIEncryptedCompactionContext) {
+						return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, stripErr.Error(), stripErr)
+					}
 				}
 			}
 		}

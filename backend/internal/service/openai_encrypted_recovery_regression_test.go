@@ -215,7 +215,10 @@ func TestForwardEncryptedCompactionFailsWithoutDestructiveRetry(t *testing.T) {
 			if transport == "http" {
 				account.Type = AccountTypeAPIKey
 				account.Credentials = map[string]any{"api_key": "sk-test"}
-				upstream.responses = []*http.Response{{StatusCode: 400, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_encrypted_content","message":"Cannot decrypt compaction"}}`))}}
+			}
+			upstream.responses = nil
+			for range 2 {
+				upstream.responses = append(upstream.responses, &http.Response{StatusCode: 400, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_encrypted_content","message":"Cannot decrypt compaction"}}`))})
 			}
 			body := []byte(`{"model":"gpt-6-astra","stream":false,"include":["reasoning.encrypted_content"],"input":[{"type":"reasoning","encrypted_content":"reasoning"},{"type":"compaction","encrypted_content":"stale"},{"role":"user","content":"continue"}]}`)
 			for turn := range 2 {
@@ -225,17 +228,24 @@ func TestForwardEncryptedCompactionFailsWithoutDestructiveRetry(t *testing.T) {
 				require.Nil(t, result)
 				require.Equal(t, http.StatusBadRequest, rec.Code)
 				require.Equal(t, "invalid_encrypted_content", gjson.Get(rec.Body.String(), "error.code").String())
+				var failover *UpstreamFailoverError
+				require.False(t, errors.As(err, &failover), "a context 400 must never switch accounts")
+				require.True(t, json.Valid(rec.Body.Bytes()))
 			}
 			var sent []byte
 			if transport == "http" {
-				require.Equal(t, 1, upstream.callCount)
+				require.Equal(t, 2, upstream.callCount, "each request revalidates with its original transport")
 				sent = upstream.bodies[0]
 			} else {
-				require.Zero(t, upstream.callCount, "do not hide failure using HTTP fallback")
-				require.Len(t, requests, 1, "known invalid summary must be rejected before the next upstream call")
+				require.Zero(t, upstream.callCount, "a cipher error must not change WS to HTTP")
+				require.Len(t, requests, 2, "each request revalidates over WS without a local permanent rejection")
 				sent = <-requests
 			}
 			require.Equal(t, "stale", gjson.GetBytes(sent, `input.#(type=="compaction").encrypted_content`).String())
+			for _, raw := range upstream.bodies {
+				require.Equal(t, "stale", gjson.GetBytes(raw, `input.#(type=="compaction").encrypted_content`).String())
+				require.Equal(t, "reasoning", gjson.GetBytes(raw, `input.#(type=="reasoning").encrypted_content`).String())
+			}
 		})
 	}
 }
@@ -295,31 +305,19 @@ func TestWSIngressKnownInvalidCompactionAndReplacementHistory(t *testing.T) {
 				}
 				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-6-astra","input":`+input+`}`)))
 				_, message, readErr := client.Read(ctx)
-				if rejected {
-					require.Equal(t, coderws.StatusPolicyViolation, coderws.CloseStatus(readErr))
-					require.Contains(t, readErr.Error(), "resend full history")
-				} else {
-					require.NoError(t, readErr)
-					require.Equal(t, "response.completed", gjson.GetBytes(message, "type").String())
-					_ = client.Close(coderws.StatusNormalClosure, "done")
-				}
+				require.NoError(t, readErr, "an old rejection must not block upstream revalidation")
+				require.Equal(t, "response.completed", gjson.GetBytes(message, "type").String())
+				_ = client.Close(coderws.StatusNormalClosure, "done")
 				select {
 				case err := <-errCh:
-					if rejected {
-						require.ErrorIs(t, err, errOpenAIEncryptedCompactionContext)
-					} else {
-						require.NoError(t, err)
-					}
+					require.NoError(t, err)
 				case <-ctx.Done():
 					t.Fatal("gateway did not finish")
 				}
 				capture.mu.Lock()
 				writes := len(capture.writes)
 				capture.mu.Unlock()
-				if rejected {
-					require.Zero(t, writes)
-					require.Nil(t, upstream.lastReq)
-				} else if bridge {
+				if bridge {
 					require.NotNil(t, upstream.lastReq)
 				} else {
 					require.Equal(t, 1, writes)

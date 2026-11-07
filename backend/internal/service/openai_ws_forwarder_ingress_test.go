@@ -47,20 +47,25 @@ func TestIsOpenAIWSClientDisconnectError(t *testing.T) {
 	}
 }
 
-func TestIsOpenAIWSIngressPreviousResponseNotFound(t *testing.T) {
+func TestIsOpenAIWSIngressPreviousResponseUnusable(t *testing.T) {
 	t.Parallel()
 
-	require.False(t, isOpenAIWSIngressPreviousResponseNotFound(nil))
-	require.False(t, isOpenAIWSIngressPreviousResponseNotFound(errors.New("plain error")))
-	require.False(t, isOpenAIWSIngressPreviousResponseNotFound(
+	require.False(t, isOpenAIWSIngressPreviousResponseUnusable(nil))
+	require.False(t, isOpenAIWSIngressPreviousResponseUnusable(errors.New("plain error")))
+	require.False(t, isOpenAIWSIngressPreviousResponseUnusable(
 		wrapOpenAIWSIngressTurnError("read_upstream", errors.New("upstream read failed"), false),
 	))
-	require.False(t, isOpenAIWSIngressPreviousResponseNotFound(
+	require.False(t, isOpenAIWSIngressPreviousResponseUnusable(
 		wrapOpenAIWSIngressTurnError(openAIWSIngressStagePreviousResponseNotFound, errors.New("previous response not found"), true),
 	))
-	require.True(t, isOpenAIWSIngressPreviousResponseNotFound(
+	require.True(t, isOpenAIWSIngressPreviousResponseUnusable(
 		wrapOpenAIWSIngressTurnError(openAIWSIngressStagePreviousResponseNotFound, errors.New("previous response not found"), false),
 	))
+	for _, wrote := range []bool{false, true} {
+		require.Equal(t, !wrote, isOpenAIWSIngressPreviousResponseUnusable(
+			wrapOpenAIWSIngressTurnError(openAIWSIngressStagePersistedContextUnsupported, errors.New("cannot replay persisted context"), wrote),
+		))
+	}
 }
 
 func TestOpenAIWSIngressPreviousResponseRecoveryEnabled(t *testing.T) {

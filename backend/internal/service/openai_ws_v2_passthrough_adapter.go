@@ -1450,8 +1450,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughOnce(
 					return nil
 				}
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
+				parentError := gjson.GetBytes(payload, "error")
+				if eventType == "response.failed" {
+					parentError = gjson.GetBytes(payload, "response.error")
+				}
 				if (eventType == "error" || eventType == "response.failed") &&
-					(errCodeRaw == "previous_response_not_found" || gjson.GetBytes(payload, "response.error.code").String() == "previous_response_not_found") && recovery.canRetry() && ctx.Err() == nil &&
+					(parentError.Get("code").String() == "previous_response_not_found" || openAIWSIsPersistedContextRejection(parentError)) && recovery.canRetry() && ctx.Err() == nil &&
 					s.cfg != nil && s.cfg.Gateway.OpenAIWS.IngressPreviousResponseRecoveryEnabled {
 					recovery.mu.Lock()
 					hasParent := gjson.GetBytes(recovery.metadata, "previous_response_id").String() != ""

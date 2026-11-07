@@ -258,8 +258,8 @@ func openAIWSCanReplayMissingToolOutput(responseError gjson.Result, request map[
 }
 
 // A persisted anchor may contain state the upstream cannot replay. Callers
-// must have inferred the anchor from a retained full request and must not have
-// delivered any output before retrying that full request on a fresh socket.
+// must retain complete replay history for that anchor and must not have
+// delivered any output before retrying the full context on a fresh socket.
 func openAIWSIsPersistedContextRejection(responseError gjson.Result) bool {
 	if kind := responseError.Get("type").String(); kind != "" && kind != "invalid_request_error" {
 		return false

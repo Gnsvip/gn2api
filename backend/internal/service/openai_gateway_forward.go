@@ -895,7 +895,9 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 				if retry := s.retryCompactionHistory(c); retry != nil {
 					return nil, retry
 				}
-				return nil, writeOpenAIEncryptedCompactionError(c)
+				// No verified undo is available. An old negative cache must not
+				// permanently reject this window locally; keep every item and let
+				// the same account validate it on the selected transport.
 			}
 			if strippedCount > 0 {
 				body = strippedBody

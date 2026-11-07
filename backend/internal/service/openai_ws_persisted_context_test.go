@@ -44,6 +44,80 @@ func TestOpenAIWSPersistedContextRejection(t *testing.T) {
 	}
 }
 
+func TestNativeWSPersistedContextRecovery(t *testing.T) {
+	for _, mode := range []string{OpenAIWSIngressModeCtxPool, OpenAIWSIngressModePassthrough} {
+		for _, envelope := range []string{"error", "response.failed"} {
+			t.Run(mode+"/"+envelope, func(t *testing.T) {
+				var calls, dials atomic.Int32
+				requests := make(chan []byte, 5)
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !websocket.IsWebSocketUpgrade(r) {
+						t.Error("context recovery must stay on WS")
+						http.Error(w, "unexpected HTTP", http.StatusBadRequest)
+						return
+					}
+					if r.Header.Get("Authorization") != "Bearer sk-test" {
+						t.Error("credential changed")
+					}
+					conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					dials.Add(1)
+					defer conn.Close()
+					for {
+						_, raw, err := conn.ReadMessage()
+						if err != nil {
+							return
+						}
+						requests <- raw
+						n := calls.Add(1)
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp_%d","status":"in_progress"}}`, n)))
+						if n == 2 {
+							failure := `{"type":"error","error":{"code":"unsupported_persisted_item_context","type":"invalid_request_error","message":"Persisted context cannot be replayed"}}`
+							if envelope == "response.failed" {
+								failure = `{"type":"response.failed","response":{"id":"resp_2","status":"failed","error":{"code":"unsupported_persisted_item_context","type":"invalid_request_error","message":"Persisted context cannot be replayed"}}}`
+							}
+							_ = conn.WriteMessage(websocket.TextMessage, []byte(failure))
+							return
+						}
+						output := autoContinuationAnswer
+						if n == 1 {
+							output = autoContinuationCall
+						}
+						if conn.WriteMessage(websocket.TextMessage, autoContinuationEvent(fmt.Sprintf("resp_%d", n), output)) != nil {
+							return
+						}
+					}
+				}))
+				defer upstream.Close()
+				svc, account, httpUpstream := httpBridgeFixture(t, upstream.URL)
+				svc.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+				svc.cfg.Gateway.OpenAIWS.IngressPreviousResponseRecoveryEnabled = true
+				svc.openaiWSPassthroughDialer = &httpBridgeLocalDialer{url: "ws" + strings.TrimPrefix(upstream.URL, "http")}
+				account.Status, account.Schedulable = StatusActive, true
+				account.Extra = map[string]any{"openai_oauth_responses_websockets_v2_mode": mode}
+				base := compactionTestBody(recoverySummary+","+recoveryImage+","+recoveryUser, true)
+				next, err := sjson.SetBytes(compactionTestBody(autoContinuationTool, true), "previous_response_id", "resp_1")
+				require.NoError(t, err)
+				runCompactionRecoveryNativeClient(t, svc, account, [][]byte{base, next})
+				require.Zero(t, httpUpstream.callCount)
+				require.EqualValues(t, 3, calls.Load(), "one failed continuation and one full-context WS replay")
+				require.EqualValues(t, 2, dials.Load(), "the rejected socket must be replaced")
+				<-requests
+				delta, replay := <-requests, <-requests
+				require.Equal(t, "resp_1", gjson.GetBytes(delta, "previous_response_id").String())
+				require.False(t, gjson.GetBytes(replay, "previous_response_id").Exists())
+				for _, value := range []string{"recovery-test-cipher", "7391", "data:image/png", "lookup result"} {
+					require.Contains(t, string(replay), value)
+				}
+				require.Equal(t, "xhigh", gjson.GetBytes(replay, "reasoning.effort").String())
+				require.True(t, AnalyzeToolCallOutputContextCoverageBytes(replay).ContextCoversAllCallIDs)
+			})
+		}
+	}
+}
+
 func TestHTTPToWSPersistedContextRecovery(t *testing.T) {
 	for _, mode := range []string{"error", "failed", "message_only", "full_rejected", "text_started", "tool_started", "unknown_delta", "unrelated", "client_anchor", "canceled"} {
 		t.Run(mode, func(t *testing.T) {
