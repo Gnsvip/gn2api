@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -440,15 +441,15 @@ func TestCompactionRecoveryLRUExpiryAndConcurrentIsolation(t *testing.T) {
 }
 
 func TestCompactionRecoveryScopeAndRetryBudget(t *testing.T) {
-	svc := &OpenAIGatewayService{}
-	closeRecoveryStore(t, svc.compactionRecoveryStore())
-	c, _ := httpBridgeContext("thread-one")
-	c.Request.Header.Set("thread-id", "thread-one")
-	c.Set("api_key", &APIKey{ID: 123, GroupID: new(int64)})
-	svc.beginCompactionRecoveryTurn(c, compactionTestBody(recoveryImage+","+recoveryTrigger, true), false)
-	svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 	body := compactionTestBody(recoverySummary+","+recoveryUser, true)
 	for _, scenario := range []string{"thread", "key", "group", "cancelled", "same"} {
+		svc := &OpenAIGatewayService{}
+		closeRecoveryStore(t, svc.compactionRecoveryStore())
+		c, _ := httpBridgeContext("thread-one")
+		c.Request.Header.Set("thread-id", "thread-one")
+		c.Set("api_key", &APIKey{ID: 123, GroupID: new(int64)})
+		svc.beginCompactionRecoveryTurn(c, compactionTestBody(recoveryImage+","+recoveryTrigger, true), false)
+		svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 		next, _ := httpBridgeContext("thread-one")
 		next.Request.Header.Set("thread-id", "thread-one")
 		group := int64(0)
@@ -470,7 +471,7 @@ func TestCompactionRecoveryScopeAndRetryBudget(t *testing.T) {
 		started := time.Now().Add(-3 * time.Second)
 		compactionRecoveryStartTime(next, started)
 		retry := svc.retryCompactionHistory(next)
-		if scenario != "same" {
+		if scenario != "same" && scenario != "group" {
 			require.Nil(t, retry, scenario)
 			continue
 		}
@@ -509,7 +510,7 @@ func TestCompactionRecoveryNestedWindowAndActiveExpiry(t *testing.T) {
 // Recovery must find verified history after a reconnect, without borrowing
 // another key's history or accepting an edited compact window.
 func TestCompactionRecoveryReconnectLookup(t *testing.T) {
-	for _, scenario := range []string{"session_changed", "restart", "other_key", "other_group", "other_thread", "other_lane", "other_stream", "changed_cipher", "changed_tail", "legacy_owner", "ambiguous"} {
+	for _, scenario := range []string{"session_changed", "restart", "group_changed", "group_changed_restart", "legacy_group_changed_restart", "other_user", "other_key", "other_thread", "other_lane", "other_stream", "changed_cipher", "changed_tail", "legacy_owner", "ambiguous"} {
 		t.Run(scenario, func(t *testing.T) {
 			svc := &OpenAIGatewayService{}
 			store := svc.compactionRecoveryStore()
@@ -523,6 +524,13 @@ func TestCompactionRecoveryReconnectLookup(t *testing.T) {
 			body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
 			svc.beginCompactionRecoveryTurn(seed, body, false, account)
 			svc.noteCompactionStreamFailure(seed, []byte(recoveryCipherError))
+			if scenario == "legacy_group_changed_restart" {
+				store.mu.Lock()
+				for _, entry := range store.entries {
+					entry.owner = fmt.Sprintf("%x", sha256.Sum256([]byte(`compaction-owner:123:0:"":"":""`)))
+				}
+				store.mu.Unlock()
+			}
 			if scenario == "legacy_owner" {
 				store.mu.Lock()
 				for _, entry := range store.entries {
@@ -533,7 +541,7 @@ func TestCompactionRecoveryReconnectLookup(t *testing.T) {
 			if scenario == "ambiguous" {
 				require.True(t, store.put("conflicting-scope", recoveryItems(t, recoveryUser+","+recoveryRetained), recoveryItems(t, recoverySummary+","+recoveryRetained), compactionRecoveryTurn(seed).owner))
 			}
-			if scenario == "restart" {
+			if scenario == "restart" || strings.HasSuffix(scenario, "_restart") {
 				store.closePersistence()
 				svc = &OpenAIGatewayService{}
 				require.NoError(t, svc.compactionRecoveryStore().startPersistence(dir, "reconnect-test-secret"))
@@ -541,9 +549,11 @@ func TestCompactionRecoveryReconnectLookup(t *testing.T) {
 			}
 			c, _ := httpBridgeContext("after-reconnect")
 			switch scenario {
+			case "other_user":
+				c.Set("api_key", &APIKey{ID: 123, UserID: 999})
 			case "other_key":
 				c.Set("api_key", &APIKey{ID: 999})
-			case "other_group":
+			case "group_changed", "group_changed_restart", "legacy_group_changed_restart":
 				group := int64(99)
 				c.Set("api_key", &APIKey{ID: 123, GroupID: &group})
 			case "other_lane":
@@ -558,7 +568,7 @@ func TestCompactionRecoveryReconnectLookup(t *testing.T) {
 				body = []byte(strings.ReplaceAll(string(body), "retained-tail", "edited-tail"))
 			}
 			restored := svc.beginCompactionRecoveryTurn(c, body, false, account)
-			if scenario != "session_changed" && scenario != "restart" {
+			if scenario != "session_changed" && scenario != "restart" && !strings.Contains(scenario, "group_changed") {
 				require.Equal(t, body, restored)
 				require.Nil(t, svc.retryCompactionHistory(c))
 				return
@@ -567,6 +577,119 @@ func TestCompactionRecoveryReconnectLookup(t *testing.T) {
 			require.NotContains(t, string(restored), "recovery-test-cipher")
 			require.JSONEq(t, "["+recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained+","+recoveryUser+"]", gjson.GetBytes(restored, "input").Raw)
 			require.Equal(t, "xhigh", gjson.GetBytes(restored, "reasoning.effort").String())
+		})
+	}
+}
+
+// Active traffic must retain its undo even when a client presents a changed
+// window (which remains ineligible for restoration), or a turn lasts past TTL.
+func TestCompactionRecoveryActiveRetention(t *testing.T) {
+	for _, scenario := range []string{"http", "ws_delta", "changed_window", "other_key", "in_flight_expiry", "capacity", "restart", "failed", "cancelled", "concurrent"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			svc := &OpenAIGatewayService{}
+			store := svc.compactionRecoveryStore()
+			require.NoError(t, store.startPersistence(dir, "active-recovery-secret"))
+			t.Cleanup(store.closePersistence)
+			seed, _ := httpBridgeContext("active-recovery")
+			svc.beginCompactionRecoveryTurn(seed, compactionTestBody(recoveryImage+","+recoveryRetained+","+recoveryTrigger, true), false)
+			svc.observeCompactionRecovery(seed, autoContinuationEvent("resp_compact", recoverySummary+","+recoveryRetained), "response.completed")
+			var entry *openAICompactionRecoveryEntry
+			store.mu.Lock()
+			for _, e := range store.entries {
+				entry = e
+				e.expires = time.Now().Add(time.Minute)
+			}
+			store.mu.Unlock()
+			require.NotNil(t, entry)
+			c, _ := httpBridgeContext("active-recovery")
+			t.Cleanup(func() { finishCompactionRecoveryTurn(c) })
+			body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
+			if scenario == "other_key" {
+				c.Set("api_key", &APIKey{ID: 999})
+			}
+			if scenario == "changed_window" {
+				body = []byte(strings.ReplaceAll(string(body), "retained-tail", "edited-tail"))
+			}
+			if scenario == "ws_delta" {
+				delta, err := sjson.SetBytes(compactionTestBody(recoveryUser, true), "previous_response_id", "resp_compact")
+				require.NoError(t, err)
+				actual := svc.beginCompactionRecoveryWithReplay(c, delta, recoveryItems(t, recoverySummary+","+recoveryRetained), "resp_compact", true)
+				require.Equal(t, delta, actual, "retaining undo must not expand the wire delta")
+			} else {
+				require.Equal(t, body, svc.beginCompactionRecoveryTurn(c, body, false))
+			}
+			store.mu.Lock()
+			deadline := entry.expires
+			store.mu.Unlock()
+			if scenario == "other_key" {
+				require.True(t, deadline.Before(time.Now().Add(2*time.Minute)), "another key cannot refresh retention")
+				return
+			}
+			require.True(t, deadline.After(time.Now().Add(50*time.Minute)))
+			if scenario == "changed_window" {
+				require.Nil(t, svc.retryCompactionHistory(c), "renewal must not bypass window validation")
+			}
+			if scenario == "in_flight_expiry" {
+				store.mu.Lock()
+				entry.expires = time.Now().Add(-time.Second)
+				store.mu.Unlock()
+				store.expire(entry)
+				store.mu.Lock()
+				kept := store.entries[entry.key]
+				store.mu.Unlock()
+				require.Same(t, entry, kept, "active turn must retain its undo")
+			}
+			if scenario == "capacity" {
+				for i := range openAICompactionRecoveryMaxEntries + 1 {
+					require.True(t, store.put(fmt.Sprint(i), recoveryItems(t, recoveryImage), recoveryItems(t, recoverySummary)))
+				}
+				store.mu.Lock()
+				kept, count := store.entries[entry.key], len(store.entries)
+				store.mu.Unlock()
+				require.Same(t, entry, kept, "evict idle snapshots before an in-flight undo")
+				require.LessOrEqual(t, count, openAICompactionRecoveryMaxEntries)
+			}
+			// Even ordinary, non-compaction terminal events release the active hold.
+			switch scenario {
+			case "failed":
+				svc.observeCompactionRecovery(c, []byte(recoveryCipherError), "response.failed")
+			case "cancelled":
+				finishCompactionRecoveryTurn(c)
+			case "concurrent":
+				other, _ := httpBridgeContext("active-recovery")
+				svc.beginCompactionRecoveryTurn(other, body, false)
+				finishCompactionRecoveryTurn(c)
+				store.mu.Lock()
+				entry.expires = time.Now().Add(-time.Second)
+				store.mu.Unlock()
+				store.expire(entry)
+				store.mu.Lock()
+				kept := store.entries[entry.key]
+				store.mu.Unlock()
+				finishCompactionRecoveryTurn(other)
+				require.Same(t, entry, kept, "one completed turn must not release another turn's hold")
+			default:
+				svc.observeCompactionRecovery(c, autoContinuationEvent("resp_next", recoveryUser), "response.completed")
+			}
+			if scenario == "restart" {
+				store.closePersistence()
+				loaded := (&OpenAIGatewayService{}).compactionRecoveryStore()
+				require.NoError(t, loaded.startPersistence(dir, "active-recovery-secret"))
+				t.Cleanup(loaded.closePersistence)
+				next, ok := loaded.restore(compactionRecoveryTurn(c).scope, body, true, compactionRecoveryTurn(c).owner)
+				require.True(t, ok)
+				require.Contains(t, string(next), "7391")
+				return
+			}
+			store.mu.Lock()
+			entry.expires = time.Now().Add(-time.Second)
+			store.mu.Unlock()
+			store.expire(entry)
+			store.mu.Lock()
+			kept := store.entries[entry.key]
+			store.mu.Unlock()
+			require.Nil(t, kept, "completed traffic must not pin snapshots forever")
 		})
 	}
 }
@@ -778,9 +901,11 @@ func (u compactionRecoveryLocalHTTP) DoWithTLS(req *http.Request, proxy string, 
 
 func TestCompactionRecoveryEndToEnd(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, path := range []string{"http", "http_passthrough", "http_to_ws", "ws", "ws_to_http", "ws_delta", "ws_to_http_delta", "ws_delta_compact", "ws_to_http_delta_compact", "ws_passthrough", "ws_passthrough_delta", "ws_passthrough_delta_compact"} {
+	for _, path := range []string{"http", "http_passthrough", "http_to_ws", "http_group_restart", "http_to_ws_group_restart", "ws", "ws_to_http", "ws_delta", "ws_to_http_delta", "ws_delta_compact", "ws_to_http_delta_compact", "ws_passthrough", "ws_passthrough_delta", "ws_passthrough_delta_compact"} {
 		for _, failure := range []string{"error", "response.failed"} {
 			t.Run(path+"/"+failure, func(t *testing.T) {
+				crossGroup := strings.HasSuffix(path, "_group_restart")
+				path := strings.TrimSuffix(path, "_group_restart")
 				requests := make(chan []byte, 12)
 				var rejected atomic.Int32
 				events := func(raw []byte) [][]byte {
@@ -838,6 +963,12 @@ func TestCompactionRecoveryEndToEnd(t *testing.T) {
 				base, _ := url.Parse(upstream.URL)
 				svc.httpUpstream = compactionRecoveryLocalHTTP{base}
 				closeRecoveryStore(t, svc.compactionRecoveryStore())
+				var recoveryDir string
+				if crossGroup {
+					recoveryDir = t.TempDir()
+					require.NoError(t, svc.compactionRecoveryStore().startPersistence(recoveryDir, "cross-group-e2e"))
+					t.Cleanup(svc.compactionRecoveryStore().closePersistence)
+				}
 				if path != "http_to_ws" {
 					account.Type = AccountTypeAPIKey
 					account.Credentials = map[string]any{"api_key": "sk-test"}
@@ -886,6 +1017,20 @@ func TestCompactionRecoveryEndToEnd(t *testing.T) {
 				} else {
 					for i, body := range bodies {
 						c, rec := httpBridgeContext("recovery-e2e")
+						if crossGroup {
+							group := int64(42)
+							if i == 0 {
+								group = 97
+							}
+							c.Set("api_key", &APIKey{ID: 123, UserID: 484, GroupID: &group})
+							if i == 1 {
+								svc.compactionRecoveryStore().closePersistence()
+								svc.openaiCompactionRecoveryOnce = sync.Once{}
+								svc.openaiCompactionRecovery = nil
+								require.NoError(t, svc.compactionRecoveryStore().startPersistence(recoveryDir, "cross-group-e2e"))
+								t.Cleanup(svc.compactionRecoveryStore().closePersistence)
+							}
+						}
 						result, err := svc.Forward(c.Request.Context(), c, account, body)
 						if i == failedTurn {
 							require.Contains(t, rec.Body.String(), "invalid_encrypted_content")
@@ -1042,7 +1187,7 @@ func runCompactionRecoveryClientSession(t *testing.T, svc *OpenAIGatewayService,
 }
 
 func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
-	for _, scenario := range []string{"ws", "http_bridge", "ws_restart", "http_bridge_restart", "passthrough_restart"} {
+	for _, scenario := range []string{"ws", "http_bridge", "ws_restart", "http_bridge_restart", "passthrough_restart", "ws_group_restart", "http_bridge_group_restart", "passthrough_group_restart"} {
 		t.Run(scenario, func(t *testing.T) {
 			requests := make(chan []byte, 4)
 			events := [][]byte{[]byte(`{"type":"response.created","response":{"id":"resp_ok","status":"in_progress"}}`), autoContinuationEvent("resp_ok", autoContinuationAnswer)}
@@ -1090,12 +1235,16 @@ func TestCompactionRecoveryNativeKnownInvalidBeforeUpstream(t *testing.T) {
 			if strings.HasPrefix(scenario, "http_bridge") {
 				mode = OpenAIWSIngressModeHTTPBridge
 			}
-			if scenario == "passthrough_restart" {
+			if strings.HasPrefix(scenario, "passthrough") {
 				mode = OpenAIWSIngressModePassthrough
 				svc.openaiWSPassthroughDialer = &httpBridgeLocalDialer{url: "ws" + strings.TrimPrefix(upstream.URL, "http")}
 			}
 			account.Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": mode}
 			c, _ := httpBridgeContext("recovery-e2e")
+			if strings.Contains(scenario, "group_restart") {
+				group := int64(97)
+				c.Set("api_key", &APIKey{ID: 123, GroupID: &group})
+			}
 			svc.beginCompactionRecoveryTurn(c, compactionTestBody(recoveryImage+","+recoveryTrigger, true), false)
 			svc.observeCompactionRecovery(c, autoContinuationEvent("resp_compact", recoverySummary), "response.completed")
 			body := compactionTestBody(recoverySummary+","+recoveryUser, true)

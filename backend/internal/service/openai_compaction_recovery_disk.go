@@ -38,6 +38,7 @@ type openAICompactionRecoveryDisk struct {
 }
 
 type compactionDiskStamp struct {
+	owner          string
 	expires        time.Time
 	invalid        bool
 	limitAccount   int64
@@ -258,7 +259,7 @@ func (d *openAICompactionRecoveryDisk) load(s *openAICompactionRecoveryStore) er
 			}
 			continue
 		}
-		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
+		d.written[name] = compactionDiskStamp{r.Owner, r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
 	}
 	return d.flush(s, false)
 }
@@ -268,7 +269,10 @@ func (d *openAICompactionRecoveryDisk) flush(s *openAICompactionRecoveryStore, f
 	records := make(map[string]openAICompactionRecoveryEntry, len(s.entries))
 	for _, e := range s.entries {
 		if !time.Now().Before(e.expires) {
-			continue
+			if e.active == 0 {
+				continue
+			}
+			s.renew(e)
 		}
 		// Both byte arrays are immutable. Copy metadata under the lock; do
 		// serialization/encryption and IO after releasing the forwarding lock.
@@ -295,7 +299,7 @@ func (d *openAICompactionRecoveryDisk) flush(s *openAICompactionRecoveryStore, f
 		old, exists := d.written[name]
 		// Refresh expiry at most every five minutes while a snapshot is used.
 		// Rejections and new snapshots are written immediately; shutdown flushes all.
-		if exists && sizes[name] > 0 && old.invalid == e.invalid && old.limitAccount == e.limitAccount && old.limitCondition == e.limitCondition && (old.expires.Equal(e.expires) || (!force && e.expires.Sub(old.expires) < 5*time.Minute)) {
+		if exists && sizes[name] > 0 && old.owner == e.owner && old.invalid == e.invalid && old.limitAccount == e.limitAccount && old.limitCondition == e.limitCondition && (old.expires.Equal(e.expires) || (!force && e.expires.Sub(old.expires) < 5*time.Minute)) {
 			continue
 		}
 		fingerprints := make([]byte, 0, len(e.output)*32)
@@ -321,7 +325,7 @@ func (d *openAICompactionRecoveryDisk) flush(s *openAICompactionRecoveryStore, f
 			return err
 		}
 		total += int64(len(sealed)) - sizes[name]
-		d.written[name] = compactionDiskStamp{r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
+		d.written[name] = compactionDiskStamp{r.Owner, r.Expires, r.Invalid, r.LimitAccount, r.LimitCondition}
 	}
 	return nil
 }

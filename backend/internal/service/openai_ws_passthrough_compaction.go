@@ -185,6 +185,7 @@ func (s *OpenAIGatewayService) beginPassthroughCompaction(c *gin.Context, replay
 		// A prior untracked edit also forbids substituting an older undo on
 		// ingress. Continue forwarding this session without reconstructing it.
 		if c != nil {
+			compactionRecoveryTurn(c).releaseHistory()
 			c.Set(openAICompactionRecoveryContextKey, nil)
 		}
 		replay.begin(body, model)

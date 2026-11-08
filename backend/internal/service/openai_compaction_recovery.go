@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +35,7 @@ const (
 // Input uses the client's canonical names, before account-specific transforms.
 type openAICompactionRecoveryEntry struct {
 	scope, key      string
-	owner           string // key + group + thread + lane; exact-cipher lookup after reconnect
+	owner           string // authenticated user + key + thread + lane, independent of routing group
 	input           []byte // gzip; immutable after insertion
 	output          [][sha256.Size]byte
 	compactionIndex int
@@ -50,6 +51,7 @@ type openAICompactionRecoveryEntry struct {
 	expires        time.Time
 	timer          *time.Timer
 	element        *list.Element
+	active         int // in-flight turns referencing this undo; never persisted
 }
 
 type openAICompactionRecoveryStore struct {
@@ -68,7 +70,7 @@ func (s *OpenAIGatewayService) compactionRecoveryStore() *openAICompactionRecove
 	return s.openaiCompactionRecovery
 }
 
-func (s *openAICompactionRecoveryStore) remove(e *openAICompactionRecoveryEntry) {
+func (s *openAICompactionRecoveryStore) remove(e *openAICompactionRecoveryEntry, reasons ...string) {
 	delete(s.entries, e.key)
 	s.lru.Remove(e.element)
 	s.bytes -= len(e.input) + len(e.output)*sha256.Size
@@ -76,6 +78,9 @@ func (s *openAICompactionRecoveryStore) remove(e *openAICompactionRecoveryEntry)
 		e.timer.Stop()
 	}
 	s.notifyPersistence()
+	if s.disk != nil && len(reasons) > 0 {
+		logOpenAIWSModeInfo("compaction_recovery_snapshot_removed reason=%s scope=%s", reasons[0], e.scope)
+	}
 }
 
 func (s *openAICompactionRecoveryStore) expire(e *openAICompactionRecoveryEntry) {
@@ -84,11 +89,88 @@ func (s *openAICompactionRecoveryStore) expire(e *openAICompactionRecoveryEntry)
 	if s.closed || s.entries[e.key] != e {
 		return
 	}
+	if e.active > 0 {
+		s.renew(e)
+	}
 	if wait := time.Until(e.expires); wait > 0 {
 		e.timer.Reset(wait)
 		return
 	}
-	s.remove(e)
+	s.remove(e, "idle_expired")
+}
+
+// Caller holds mu. Refresh metadata only; encryption and disk IO stay on the
+// persistence worker, and no ordinary request creates another history copy.
+func (s *openAICompactionRecoveryStore) renew(e *openAICompactionRecoveryEntry) {
+	e.expires = time.Now().Add(openAICompactionRecoveryTTL)
+	s.lru.MoveToFront(e.element)
+	s.notifyPersistence()
+}
+
+// v2 owners included the routing group. Recompute that exact legacy identity
+// from authenticated request data before promoting it; never match by cipher
+// alone. Ownerless v1 snapshots cannot prove cross-group ownership.
+func (s *openAICompactionRecoveryStore) migrateLegacyOwners(keyID int64, identity, owner string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	legacy := make(map[int64]string)
+	for _, e := range s.entries {
+		if e.replacement || e.owner == "" || strings.HasPrefix(e.owner, "v3:") || !time.Now().Before(e.expires) {
+			continue
+		}
+		group, _, ok := strings.Cut(e.scope, ":")
+		groupID, err := strconv.ParseInt(group, 10, 64)
+		if !ok || err != nil {
+			continue
+		}
+		expected, ok := legacy[groupID]
+		if !ok {
+			expected = fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("compaction-owner:%d:%d:%s", keyID, groupID, identity))))
+			legacy[groupID] = expected
+		}
+		if e.owner == expected {
+			e.owner = owner
+			s.notifyPersistence()
+		}
+	}
+}
+
+// Retention only requires the authenticated owner and exact ciphertext. It
+// does not authorize restoration of an edited/pruned window: restoreWindow
+// still verifies all history and tool relationships before replacing input.
+func (s *openAICompactionRecoveryStore) hold(scope, owner string, anchors []string) func() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	held := make(map[*openAICompactionRecoveryEntry]struct{})
+	for _, digest := range anchors {
+		if e := s.lookup(scope, owner, digest); e != nil {
+			if _, exists := held[e]; !exists {
+				e.active++
+				s.renew(e)
+				held[e] = struct{}{}
+			}
+		}
+	}
+	s.mu.Unlock()
+	if len(held) == 0 {
+		return nil
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for e := range held {
+				e.active--
+				if s.entries[e.key] == e && !s.closed {
+					s.renew(e)
+				}
+			}
+		})
+	}
 }
 
 func compactionRecoveryDigest(item []byte) ([sha256.Size]byte, bool) {
@@ -192,11 +274,14 @@ func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry)
 	for node := s.lru.Back(); node != nil && count >= openAICompactionRecoveryPerScope; {
 		prev := node.Prev()
 		entry := node.Value.(*openAICompactionRecoveryEntry)
-		if entry.scope == e.scope {
-			s.remove(entry)
+		if entry.scope == e.scope && entry.active == 0 {
+			s.remove(entry, "scope_capacity")
 			count--
 		}
 		node = prev
+	}
+	if count >= openAICompactionRecoveryPerScope {
+		return false
 	}
 	size := len(e.input) + len(e.output)*sha256.Size
 	maxBytes := openAICompactionRecoveryMaxBytes
@@ -206,10 +291,14 @@ func (s *openAICompactionRecoveryStore) insert(e *openAICompactionRecoveryEntry)
 		maxBytes = openAICompactionRecoveryDurableBytes
 	}
 	for len(s.entries) >= openAICompactionRecoveryMaxEntries || s.bytes+size > maxBytes {
-		if s.lru.Back() == nil {
+		node := s.lru.Back()
+		for node != nil && node.Value.(*openAICompactionRecoveryEntry).active > 0 {
+			node = node.Prev()
+		}
+		if node == nil {
 			return false
 		}
-		s.remove(s.lru.Back().Value.(*openAICompactionRecoveryEntry))
+		s.remove(node.Value.(*openAICompactionRecoveryEntry), "memory_capacity")
 	}
 	e.element = s.lru.PushFront(e)
 	s.entries[e.key] = e
@@ -233,8 +322,8 @@ func (s *openAICompactionRecoveryStore) restore(scope string, body []byte, force
 func (s *openAICompactionRecoveryStore) lookup(scope, owner, digest string) *openAICompactionRecoveryEntry {
 	key := scope + ":" + digest
 	if e := s.entries[key]; e != nil {
-		if !time.Now().Before(e.expires) {
-			s.remove(e)
+		if !time.Now().Before(e.expires) && e.active == 0 {
+			s.remove(e, "idle_expired")
 		} else if !e.replacement && (owner == "" || e.owner == "" || e.owner == owner) {
 			return e
 		}
@@ -244,7 +333,7 @@ func (s *openAICompactionRecoveryStore) lookup(scope, owner, digest string) *ope
 	}
 	var match *openAICompactionRecoveryEntry
 	for _, e := range s.entries {
-		if e.replacement || e.owner != owner || !time.Now().Before(e.expires) || !strings.HasSuffix(e.key, ":"+digest) {
+		if e.replacement || e.owner != owner || (!time.Now().Before(e.expires) && e.active == 0) || !strings.HasSuffix(e.key, ":"+digest) {
 			continue
 		}
 		if match != nil && (match.compactionIndex != e.compactionIndex || !slices.Equal(match.output, e.output) || !bytes.Equal(match.input, e.input)) {
@@ -514,6 +603,14 @@ type openAICompactionRecoveryTurn struct {
 	maintenance          time.Duration
 	maintenanceCalls     int
 	started              time.Time
+	release              func()
+}
+
+func (t *openAICompactionRecoveryTurn) releaseHistory() {
+	if t != nil && t.release != nil {
+		t.release()
+		t.release = nil
+	}
 }
 
 type openAICompactionReplayRetry struct {
@@ -538,11 +635,13 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 	if s == nil || c == nil {
 		return body
 	}
+	compactionRecoveryTurn(c).releaseHistory()
 	t := &openAICompactionRecoveryTurn{body: body}
 	if value, ok := c.Get(openAICompactionFailoverResumeKey); ok {
 		if pending, ok := value.(*openAICompactionRecoveryTurn); ok && pending != nil {
 			*t = *pending
 			t.body = body
+			t.release = nil
 		}
 		c.Set(openAICompactionFailoverResumeKey, nil)
 	}
@@ -563,13 +662,25 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 	}
 	t.body = body
 	t.scope = fmt.Sprintf("%d:%s", getOpenAIGroupIDFromContext(c), scope)
-	ownerSeed := fmt.Sprintf("compaction-owner:%d:%d:%q:%q:%q", keyID, getOpenAIGroupIDFromContext(c),
+	identity := fmt.Sprintf("%q:%q:%q",
 		resolveOpenAIWSClientThreadID(c, body), resolveOpenAIWSExecutionLane(c, body), gjson.GetBytes(body, "stream_id").String())
-	t.owner = fmt.Sprintf("%x", sha256.Sum256([]byte(ownerSeed)))
+	var userID int64
+	if value, ok := c.Get("api_key"); ok {
+		if key, ok := value.(*APIKey); ok && key != nil {
+			userID = key.UserID
+		}
+	}
+	ownerSeed := fmt.Sprintf("compaction-owner-v3:%d:%d:%s", userID, keyID, identity)
+	t.owner = fmt.Sprintf("v3:%x", sha256.Sum256([]byte(ownerSeed)))
 	for _, item := range gjson.GetBytes(body, "input").Array() {
 		if isOpenAICompactionType(item.Get("type").String()) {
 			t.anchors = append(t.anchors, openAIEncryptedContentDigest(item.Get("encrypted_content").String()))
 		}
+	}
+	if len(t.anchors) > 0 {
+		store := s.compactionRecoveryStore()
+		store.migrateLegacyOwners(keyID, identity, t.owner)
+		t.release = store.hold(t.scope, t.owner, t.anchors)
 	}
 	if restored, ok := s.compactionRecoveryStore().restore(t.scope, body, s.knownInvalidCompaction(c, t.accountID, body), t.owner); ok {
 		t.body, body = restored, restored
@@ -638,6 +749,9 @@ func (s *OpenAIGatewayService) retryCompactionHistory(c *gin.Context) *openAICom
 
 func (s *OpenAIGatewayService) observeCompactionRecovery(c *gin.Context, data []byte, event string) {
 	t := compactionRecoveryTurn(c)
+	if event == "response.completed" || event == "response.done" || event == "json" || event == "response.failed" || event == "error" {
+		defer t.releaseHistory()
+	}
 	if t == nil || len(t.source) == 0 {
 		return
 	}
@@ -741,6 +855,7 @@ func resumeCompactionRecoveryTurn(c *gin.Context, previous *openAICompactionReco
 
 func finishCompactionRecoveryTurn(c *gin.Context) {
 	if t := compactionRecoveryTurn(c); t != nil {
+		t.releaseHistory()
 		t.body, t.source, t.output = nil, nil, nil
 		t.maintenanceReasoning = nil
 		t.anchors = nil

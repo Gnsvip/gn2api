@@ -318,10 +318,15 @@ func TestCompactionEditedSessionDoesNotSubstituteOldSnapshot(t *testing.T) {
 		recoveryItems(t, recoverySummary+","+recoveryRetained)))
 	_, ok := store.restore(scope, body, true)
 	require.True(t, ok, "make the old summary eligible for automatic substitution")
+	svc.beginCompactionRecoveryTurn(c, body, false)
 	replay := &openAIWSPassthroughRecovery{limit: 1 << 20}
 	replay.clientControl()
 	actual := svc.beginPassthroughCompaction(c, replay, body, "gpt-6-astra", nil, time.Now())
 	require.JSONEq(t, string(body), string(actual), "untracked session edits must retain transparent forwarding")
 	require.Nil(t, compactionRecoveryTurn(c))
 	require.False(t, replay.canRetry())
+	store.mu.Lock()
+	active := store.entries[scope+":"+openAIEncryptedContentDigest("recovery-test-cipher")].active
+	store.mu.Unlock()
+	require.Zero(t, active, "untracked edits must release the abandoned recovery turn")
 }
