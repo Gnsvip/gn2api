@@ -1682,6 +1682,12 @@ func normalizeOpenAIResponsesCompatibilityBodyWithOptions(body []byte, account *
 		}
 		normalized = oauthBody
 		changed = changed || oauthChanged
+		if next, optionsChanged, err := normalizeCodexStreamOptionsBody(normalized, opts.Compact); err != nil {
+			return body, false, err
+		} else if optionsChanged {
+			normalized = next
+			changed = true
+		}
 		for _, field := range openAIChatGPTInternalUnsupportedFields {
 			if !gjson.GetBytes(normalized, field).Exists() {
 				continue
@@ -1770,6 +1776,33 @@ func normalizeOpenAIResponsesCompatibilityBodyWithOptions(body []byte, account *
 	return normalized, changed, nil
 }
 
+// Only decode the small options object; preserve the potentially large history.
+func normalizeCodexStreamOptionsBody(body []byte, compact bool) ([]byte, bool, error) {
+	raw := gjson.GetBytes(body, "stream_options")
+	if !raw.Exists() {
+		return body, false, nil
+	}
+	var options any
+	if err := json.Unmarshal([]byte(raw.Raw), &options); err != nil {
+		return body, false, fmt.Errorf("decode Codex stream options: %w", err)
+	}
+	holder := map[string]any{"stream_options": options}
+	if !normalizeCodexStreamOptions(holder, compact) {
+		return body, false, nil
+	}
+	var normalized []byte
+	var err error
+	if value, ok := holder["stream_options"]; ok {
+		normalized, err = sjson.SetBytes(body, "stream_options", value)
+	} else {
+		normalized, err = sjson.DeleteBytes(body, "stream_options")
+	}
+	if err != nil {
+		return body, false, fmt.Errorf("normalize Codex stream options: %w", err)
+	}
+	return normalized, true, nil
+}
+
 // normalizeOpenAIPassthroughOAuthBody 将透传 OAuth 请求体收敛为旧链路关键行为：
 // 1) 删除 ChatGPT internal API 不支持的顶层 Responses 参数
 // 2) store=false 3) 非 compact 保持 stream=true；compact 强制 stream=false
@@ -1789,6 +1822,12 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool, officialClie
 		changed = true
 	}
 
+	if next, optionsChanged, err := normalizeCodexStreamOptionsBody(normalized, compact); err != nil {
+		return body, false, err
+	} else if optionsChanged {
+		normalized = next
+		changed = true
+	}
 	for _, field := range openAIChatGPTInternalUnsupportedFields {
 		if value := gjson.GetBytes(normalized, field); !value.Exists() {
 			continue

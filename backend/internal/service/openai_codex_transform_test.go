@@ -726,9 +726,10 @@ func TestApplyCodexOAuthTransform_ExplicitStoreTrueForcedFalse(t *testing.T) {
 
 func TestApplyCodexOAuthTransform_CompactForcesNonStreaming(t *testing.T) {
 	reqBody := map[string]any{
-		"model":  "gpt-5.1-codex",
-		"store":  true,
-		"stream": true,
+		"model":          "gpt-5.1-codex",
+		"store":          true,
+		"stream":         true,
+		"stream_options": map[string]any{"reasoning_summary_delivery": "sequential_cutoff"},
 	}
 
 	result := applyCodexOAuthTransform(reqBody, true, true)
@@ -737,6 +738,7 @@ func TestApplyCodexOAuthTransform_CompactForcesNonStreaming(t *testing.T) {
 	require.False(t, hasStore)
 	_, hasStream := reqBody["stream"]
 	require.False(t, hasStream)
+	require.NotContains(t, reqBody, "stream_options")
 	require.True(t, result.Modified)
 }
 
@@ -1870,6 +1872,28 @@ func TestApplyCodexOAuthTransform_StripsChatGPTInternalUnsupportedFields(t *test
 	require.True(t, result.Modified)
 	for _, field := range openAIChatGPTInternalUnsupportedFields {
 		require.NotContains(t, reqBody, field)
+	}
+	require.NotContains(t, reqBody, "stream_options")
+}
+
+func TestApplyCodexOAuthTransform_PreservesSummaryDeliveryThroughWS(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		t.Run(fmt.Sprintf("native=%v", native), func(t *testing.T) {
+			var body map[string]any
+			require.NoError(t, json.Unmarshal([]byte(`{"model":"gpt-6.1-sol","instructions":"Keep context","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"reasoning":{"effort":"xhigh","summary":"auto"},"stream_options":{"include_usage":true,"reasoning_summary_delivery":"sequential_cutoff"}}`), &body))
+			applyCodexOAuthTransformWithOptions(body, codexOAuthTransformOptions{IsCodexCLI: native, PreserveNativeInput: native})
+			require.Equal(t, map[string]any{"reasoning_summary_delivery": "sequential_cutoff"}, body["stream_options"])
+			require.Equal(t, map[string]any{"effort": "xhigh", "summary": "auto"}, body["reasoning"])
+			svc := &OpenAIGatewayService{}
+			payload := svc.buildOpenAIWSCreatePayload(body, &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth})
+			frame, err := marshalCodexWSCreateFrame(nil, payload, false)
+			require.NoError(t, err)
+			var decoded map[string]any
+			require.NoError(t, json.Unmarshal(frame, &decoded))
+			require.Equal(t, body["stream_options"], decoded["stream_options"])
+			require.Equal(t, body["reasoning"], decoded["reasoning"])
+			require.Equal(t, "gpt-6.1-sol", decoded["model"])
+		})
 	}
 }
 

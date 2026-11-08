@@ -156,8 +156,8 @@ func TestCursorMixedShape_JSONRoundtrip(t *testing.T) {
 
 // TestCursorMixedShape_StripsUnsupportedFields mirrors the strip loop in
 // ForwardAsChatCompletions (isResponsesShape branch). Cursor cloud sends
-// prompt_cache_retention, safety_identifier, metadata and stream_options
-// as top-level Responses API parameters, which Codex upstreams reject with
+// prompt_cache_retention, safety_identifier, metadata and Chat-specific
+// stream_options.include_usage, which Codex upstreams reject with
 // "Unsupported parameter: ...". The fix must remove them from the raw body
 // before it is forwarded, for BOTH OAuth and API Key account types.
 func TestCursorMixedShape_StripsUnsupportedFields(t *testing.T) {
@@ -185,6 +185,9 @@ func TestCursorMixedShape_StripsUnsupportedFields(t *testing.T) {
 		}
 	}
 
+	result, _, err := normalizeCodexStreamOptionsBody(result, false)
+	require.NoError(t, err)
+	assert.False(t, gjson.GetBytes(result, "stream_options").Exists())
 	// All unsupported fields must be gone.
 	for _, field := range cursorResponsesUnsupportedFields {
 		assert.False(t, gjson.GetBytes(result, field).Exists(),

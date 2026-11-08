@@ -16,8 +16,57 @@ func TestNormalizeOpenAIPassthroughOAuthBody_RemovesUnsupportedUser(t *testing.T
 	for _, field := range openAIChatGPTInternalUnsupportedFields {
 		require.False(t, gjson.GetBytes(normalized, field).Exists(), "%s should be stripped", field)
 	}
+	require.False(t, gjson.GetBytes(normalized, "stream_options").Exists())
 	require.True(t, gjson.GetBytes(normalized, "stream").Bool())
 	require.False(t, gjson.GetBytes(normalized, "store").Bool())
+}
+
+func TestOAuthStreamOptionsAcrossTransports(t *testing.T) {
+	for _, tc := range []struct {
+		name, options string
+		preserve      bool
+	}{
+		{"absent", "", false},
+		{"null", `,"stream_options":null`, false},
+		{"empty", `,"stream_options":{}`, false},
+		{"chat", `,"stream_options":{"include_usage":true}`, false},
+		{"valid", `,"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"}`, true},
+		{"mixed", `,"stream_options":{"include_usage":true,"reasoning_summary_delivery":"sequential_cutoff","unknown":1}`, true},
+		{"unknown", `,"stream_options":{"reasoning_summary_delivery":"unverified"}`, false},
+		{"wrong_type", `,"stream_options":{"reasoning_summary_delivery":true}`, false},
+		{"array", `,"stream_options":[]`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-6.1-sol","input":[{"role":"user","content":"hello"}],"reasoning":{"effort":"xhigh","summary":"auto"}` + tc.options + `}`)
+			for _, lane := range []string{"http", "ws", "compact_http", "compact_ws"} {
+				t.Run(lane, func(t *testing.T) {
+					compact := lane == "compact_http" || lane == "compact_ws"
+					var result []byte
+					var err error
+					if lane == "ws" || lane == "compact_ws" {
+						result, _, err = normalizeOpenAIResponsesCompatibilityBodyWithOptions(body, &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}, openAIResponsesCompatibilityOptions{Compact: compact})
+					} else {
+						result, _, err = normalizeOpenAIPassthroughOAuthBody(body, compact)
+					}
+					require.NoError(t, err)
+					if tc.preserve && !compact {
+						require.JSONEq(t, `{"reasoning_summary_delivery":"sequential_cutoff"}`, gjson.GetBytes(result, "stream_options").Raw)
+					} else {
+						require.False(t, gjson.GetBytes(result, "stream_options").Exists())
+					}
+					require.Equal(t, "xhigh", gjson.GetBytes(result, "reasoning.effort").String())
+					require.Equal(t, "auto", gjson.GetBytes(result, "reasoning.summary").String())
+					require.Equal(t, "hello", gjson.GetBytes(result, "input.0.content").String())
+					_, changed, err := normalizeCodexStreamOptionsBody(result, compact)
+					require.NoError(t, err)
+					require.False(t, changed)
+				})
+			}
+			apiBody, _, err := normalizeOpenAIResponsesWebSocketCompatibilityBody(body, &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, false)
+			require.NoError(t, err)
+			require.Equal(t, gjson.GetBytes(body, "stream_options").Raw, gjson.GetBytes(apiBody, "stream_options").Raw)
+		})
+	}
 }
 
 func TestNormalizeOpenAIPassthroughOAuthBody_NormalizesCompatibilityFields(t *testing.T) {

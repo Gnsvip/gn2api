@@ -850,7 +850,7 @@ func TestForwardAsChatCompletions_ResponsesShapeDoesNotAutoDerivePromptCacheKey(
 		Credentials: map[string]any{"api_key": "sk-compatible"},
 		Extra:       map[string]any{"openai_responses_supported": true},
 	}
-	firstBody := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"first unrelated input"}]}],"stream":false}`)
+	firstBody := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"first unrelated input"}]}],"stream":false,"stream_options":{"reasoning_summary_delivery":"sequential_cutoff","include_usage":true}}`)
 	secondBody := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"second unrelated input"}]}],"stream":false}`)
 
 	forward := func(body []byte, promptCacheKey string) {
@@ -868,11 +868,20 @@ func TestForwardAsChatCompletions_ResponsesShapeDoesNotAutoDerivePromptCacheKey(
 	forward(secondBody, "explicit-responses-key")
 
 	require.False(t, gjson.GetBytes(upstream.bodies[0], "prompt_cache_key").Exists())
+	require.False(t, gjson.GetBytes(upstream.bodies[0], "stream_options").Exists())
 	require.Empty(t, upstream.requests[0].Header.Get("session_id"))
 	require.False(t, gjson.GetBytes(upstream.bodies[1], "prompt_cache_key").Exists())
 	require.Empty(t, upstream.requests[1].Header.Get("session_id"))
 	require.Equal(t, "explicit-responses-key", gjson.GetBytes(upstream.bodies[2], "prompt_cache_key").String())
 	require.Equal(t, generateSessionUUID(isolateOpenAISessionID(99, "explicit-responses-key")), upstream.requests[2].Header.Get("session_id"))
+}
+
+func TestForwardAsChatCompletions_ResponsesShapePreservesOAuthSummaryDelivery(t *testing.T) {
+	body := []byte(`{"model":"gpt-6.1-sol","input":[{"role":"user","content":"hello"}],"reasoning":{"effort":"xhigh","summary":"auto"},"stream_options":{"reasoning_summary_delivery":"sequential_cutoff","include_usage":true}}`)
+	forwarded := forwardOAuthChatCompletionsForUpstreamBody(t, body)
+	require.JSONEq(t, `{"reasoning_summary_delivery":"sequential_cutoff"}`, gjson.GetBytes(forwarded, "stream_options").Raw)
+	require.Equal(t, "xhigh", gjson.GetBytes(forwarded, "reasoning.effort").String())
+	require.Equal(t, "auto", gjson.GetBytes(forwarded, "reasoning.summary").String())
 }
 
 func TestForwardAsChatCompletions_OAuthDoesNotInjectDefaultInstructions(t *testing.T) {

@@ -160,7 +160,6 @@ var openAIChatGPTInternalUnsupportedFields = []string{
 	"metadata",
 	"prompt_cache_retention",
 	"safety_identifier",
-	"stream_options",
 	"truncation",
 	"stop_sequences",
 }
@@ -173,6 +172,26 @@ var openAICodexOAuthUnsupportedFields = append([]string{
 	"frequency_penalty",
 	"presence_penalty",
 }, openAIChatGPTInternalUnsupportedFields...)
+
+// Codex supports summary delivery options, unlike Chat Completions include_usage.
+// Preserve the verified wire value without injecting summary preferences.
+func normalizeCodexStreamOptions(reqBody map[string]any, compact bool) bool {
+	raw, exists := reqBody["stream_options"]
+	if !exists {
+		return false
+	}
+	options, ok := raw.(map[string]any)
+	delivery, _ := options["reasoning_summary_delivery"].(string)
+	if compact || !ok || delivery != "sequential_cutoff" {
+		delete(reqBody, "stream_options")
+		return true
+	}
+	if len(options) == 1 {
+		return false
+	}
+	reqBody["stream_options"] = map[string]any{"reasoning_summary_delivery": delivery}
+	return true
+}
 
 func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact bool) codexTransformResult {
 	return applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{
@@ -225,6 +244,9 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 	}
 
 	// Strip parameters unsupported by ChatGPT internal Codex endpoint.
+	if normalizeCodexStreamOptions(reqBody, opts.IsCompact) {
+		result.Modified = true
+	}
 	for _, key := range openAICodexOAuthUnsupportedFields {
 		if _, ok := reqBody[key]; ok {
 			delete(reqBody, key)

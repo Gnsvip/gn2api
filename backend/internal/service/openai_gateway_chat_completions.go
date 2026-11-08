@@ -31,14 +31,12 @@ import (
 // short-circuit in ForwardAsChatCompletions (see isResponsesShape branch).
 // The normal Chat Completions → Responses conversion path is unaffected
 // because ChatCompletionsRequest has no fields for these parameters — unknown
-// fields are dropped naturally by json.Unmarshal. Kept semantically in sync
-// with the list in openai_gateway_service.go:2034 used by the /v1/responses
-// passthrough path.
+// fields are dropped naturally by json.Unmarshal. Codex summary delivery
+// stream options are normalized separately for OAuth accounts.
 var cursorResponsesUnsupportedFields = []string{
 	"prompt_cache_retention",
 	"safety_identifier",
 	"metadata",
-	"stream_options",
 }
 
 // ForwardAsChatCompletions accepts a Chat Completions request body, converts it
@@ -227,6 +225,16 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 			if stripped, derr := sjson.DeleteBytes(responsesBody, field); derr == nil {
 				responsesBody = stripped
 			}
+		}
+		if account.IsOpenAIOAuthLike() {
+			responsesBody, _, err = normalizeCodexStreamOptionsBody(responsesBody, false)
+		} else {
+			// Keep the existing API-key compatibility behavior; the internal
+			// summary delivery option has only been verified on Codex OAuth.
+			responsesBody, err = sjson.DeleteBytes(responsesBody, "stream_options")
+		}
+		if err != nil {
+			return nil, err
 		}
 		var normalizedServiceTier string
 		responsesBody, normalizedServiceTier, err = normalizeResponsesBodyServiceTier(responsesBody)
