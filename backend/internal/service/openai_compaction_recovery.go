@@ -321,25 +321,15 @@ func (s *openAICompactionRecoveryStore) restoreWindow(scope, owner string, body 
 			raw, err := io.ReadAll(io.LimitReader(r, openAICompactionRecoveryMaxRaw+1))
 			_ = r.Close()
 			var original []json.RawMessage
-			if err != nil || len(raw) > openAICompactionRecoveryMaxRaw || json.Unmarshal(raw, &original) != nil || start > len(original) {
+			if err != nil || len(raw) > openAICompactionRecoveryMaxRaw || json.Unmarshal(raw, &original) != nil {
 				continue
 			}
-			// Codex may prepend its unchanged native setup to the returned window.
-			// Verify that overlap instead of duplicating or dropping instructions.
-			for j := 0; j < start; j++ {
-				a, okA := compactionRecoveryDigest(items[j])
-				b, okB := compactionRecoveryDigest(original[j])
-				if !okA || !okB || a != b {
-					match = false
-					break
-				}
-			}
+			original, match = restoreCompactionInstalledPrefix(original, items[:start], len(e.output) == 1)
 			if !match {
 				continue
 			}
 			next := make([]json.RawMessage, 0, len(original)+len(items)-end)
-			next = append(next, items[:start]...)
-			next = append(next, original[start:]...)
+			next = append(next, original...)
 			next = append(next, items[end:]...)
 			if !compactionRecoveryItemsFit(next, openAICompactionRecoveryMaxRaw) {
 				return body, false
@@ -387,6 +377,68 @@ func (s *openAICompactionRecoveryStore) restoreWindow(scope, owner string, body 
 	}
 	s.mu.Unlock()
 	return next, true
+}
+
+// Codex V2 retains selected input messages before its single summary, then
+// reinjects current harness context. Verify those retained messages against the
+// saved source in order; they need not be a contiguous prefix. Keep all original
+// history exactly once, followed by any new system/developer updates, before the
+// client's new input. Never treat edited user/tool content as a context update.
+// Multi-item compact outputs still require their entire returned window intact.
+func restoreCompactionInstalledPrefix(original, prefix []json.RawMessage, singleSummary bool) ([]json.RawMessage, bool) {
+	if len(prefix) == 0 {
+		return original, true
+	}
+	digests := make([][sha256.Size]byte, len(original))
+	for i, item := range original {
+		var ok bool
+		digests[i], ok = compactionRecoveryDigest(item)
+		if !ok {
+			return nil, false
+		}
+	}
+	exactPrefix := len(prefix) <= len(original)
+	for i, item := range prefix {
+		if !exactPrefix {
+			break
+		}
+		digest, ok := compactionRecoveryDigest(item)
+		exactPrefix = ok && digest == digests[i]
+	}
+	if exactPrefix {
+		return original, true
+	}
+	if !singleSummary {
+		return nil, false
+	}
+	position := 0
+	var updates []json.RawMessage
+	for _, item := range prefix {
+		digest, ok := compactionRecoveryDigest(item)
+		if !ok {
+			return nil, false
+		}
+		if isCompactionRecoverySetup(item) {
+			// Reapplying an earlier environment can itself be an intentional
+			// update. Do not discard it just because its text occurred before.
+			updates = append(updates, item)
+			continue
+		}
+		for position < len(digests) && digests[position] != digest {
+			position++
+		}
+		if position >= len(digests) || digests[position] != digest {
+			return nil, false
+		}
+		position++
+	}
+	return append(original, updates...), true
+}
+
+func isCompactionRecoverySetup(item []byte) bool {
+	kind := gjson.GetBytes(item, "type").String()
+	role := gjson.GetBytes(item, "role").String()
+	return (kind == "" || kind == "message") && (role == "system" || role == "developer")
 }
 
 // Remember rejected summaries for the client's next request, without replaying
@@ -460,6 +512,7 @@ type openAICompactionRecoveryTurn struct {
 	restored             bool
 	recompacted          bool
 	maintenance          time.Duration
+	maintenanceCalls     int
 	started              time.Time
 }
 
@@ -486,6 +539,13 @@ func (s *OpenAIGatewayService) beginCompactionRecoveryTurn(c *gin.Context, body 
 		return body
 	}
 	t := &openAICompactionRecoveryTurn{body: body}
+	if value, ok := c.Get(openAICompactionFailoverResumeKey); ok {
+		if pending, ok := value.(*openAICompactionRecoveryTurn); ok && pending != nil {
+			*t = *pending
+			t.body = body
+		}
+		c.Set(openAICompactionFailoverResumeKey, nil)
+	}
 	if len(accounts) > 0 && accounts[0] != nil {
 		t.accountID = accounts[0].ID
 	}
@@ -664,13 +724,14 @@ func isCompactionCipherError(data []byte) bool {
 	return code == "thinking_signature_invalid" && strings.Contains(message, "encrypted") && strings.Contains(message, "could not")
 }
 
-// Resuming is the same billable turn: never reset its clock or recovery budget.
+// Resuming is the same billable turn: never reset its clock or maintenance count.
 func resumeCompactionRecoveryTurn(c *gin.Context, previous *openAICompactionRecoveryTurn) {
 	if next := compactionRecoveryTurn(c); next != nil && previous != nil {
 		next.retried = true
 		next.restored = next.restored || previous.restored
 		next.recompacted = previous.recompacted
 		next.maintenance = previous.maintenance
+		next.maintenanceCalls = previous.maintenanceCalls
 		next.started = previous.started
 		if len(next.anchors) == 0 {
 			next.anchors = previous.anchors

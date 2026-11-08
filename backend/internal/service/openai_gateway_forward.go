@@ -27,6 +27,13 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	for attempt := 0; ; attempt++ {
 		result, err := s.forwardOpenAIOnce(ctx, c, account, body)
+		if turn := compactionRecoveryTurn(c); err != nil && turn != nil && turn.needsCompact && !turn.recompacted && !openAIStreamClientOutputStarted(c, false) {
+			// A replacement can itself fail credential acquisition before its
+			// maintenance preflight. Carry the same full window and budget onward.
+			if failover := compactionAccountFailover(ctx, c, &openAICompactionReplayRetry{body: turn.body, recompact: true}, err); failover != nil {
+				return result, failover
+			}
+		}
 		var retry *openAICompactionReplayRetry
 		if attempt >= 2 || !errors.As(err, &retry) || ctx.Err() != nil || openAIStreamClientOutputStarted(c, false) {
 			return result, err
@@ -34,6 +41,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		previous := compactionRecoveryTurn(c)
 		replay, prepareErr := s.prepareCompactionRetry(ctx, c, account, retry)
 		if prepareErr != nil {
+			if failover := compactionAccountFailover(ctx, c, retry, prepareErr); failover != nil {
+				return nil, failover
+			}
 			return nil, writeOpenAIRecompactionError(c, prepareErr)
 		}
 		body = s.beginCompactionRecoveryTurn(c, replay, isOpenAIResponsesCompactPath(c), account)
@@ -1290,6 +1300,7 @@ func (s *OpenAIGatewayService) forwardOpenAIOnce(ctx context.Context, c *gin.Con
 		}
 		upstreamStart := time.Now()
 		resp, err := s.doTimedOpenAIUpstream(upstreamReq, proxyURL, account, body)
+		noteRecoveryCompactResponse(c, resp)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if headerGuard != nil && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {

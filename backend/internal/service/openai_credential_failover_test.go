@@ -259,3 +259,34 @@ func TestOpenAIBackgroundPermanentRefreshUsesCredentialCAS(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAICompactionRecoveryRefreshRejectedFailover(t *testing.T) {
+	svc, account, base, _ := recoveryFixture()
+	account.Credentials["expires_at"] = time.Now().Add(-time.Hour).Format(time.RFC3339)
+	base.account = snapshotOAuthRefreshAccount(account)
+	repo := &openAIFailureCASRepo{recoveryRepo: base}
+	executor := &failureExecutor{err: openai.NewRefreshTokenError(401, []byte(`{"error":"invalid_grant"}`))}
+	provider := NewOpenAITokenProvider(repo, nil, nil)
+	provider.SetRefreshAPI(NewOAuthRefreshAPI(repo, nil), executor)
+	svc.accountRepo, svc.openAITokenProvider = repo, provider
+	c, rec := httpBridgeContext("replacement-refresh-rejected")
+	body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	turn := compactionRecoveryTurn(c)
+	turn.restored = true
+	turn.maintenanceCalls = 1
+	retry := &openAICompactionReplayRetry{body: body, recompact: true}
+	first := compactionAccountFailover(c.Request.Context(), c, retry, &UpstreamFailoverError{StatusCode: 401})
+	body, ok := ResumeOpenAICompactionFailover(c, first)
+	require.True(t, ok)
+	_, err := svc.Forward(c.Request.Context(), c, account, body)
+	var auth *UpstreamFailoverError
+	require.ErrorAs(t, err, &auth)
+	require.True(t, auth.IsCredentialFailure())
+	full, ok := ResumeOpenAICompactionFailover(c, err)
+	require.True(t, ok, "refresh rejection must retain the restored-history handoff")
+	require.Contains(t, string(full), "7391")
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, 1, executor.calls)
+	require.Equal(t, 2, compactionRecoveryTurn(c).maintenanceCalls, "the failed compact attempt must remain in the shared count")
+}

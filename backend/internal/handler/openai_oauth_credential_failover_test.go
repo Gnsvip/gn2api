@@ -64,6 +64,7 @@ type openAICredentialHandlerUpstream struct {
 	accountResponses map[int64]string
 	accountStatuses  map[int64]int
 	userAgents       []string
+	respond          func(*http.Request, []byte, int64) (*http.Response, error)
 }
 
 func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64, _ int) (*http.Response, error) {
@@ -73,6 +74,9 @@ func (u *openAICredentialHandlerUpstream) Do(r *http.Request, _ string, id int64
 	u.bodies = append(u.bodies, string(body))
 	u.userAgents = append(u.userAgents, r.UserAgent())
 	u.mu.Unlock()
+	if u.respond != nil {
+		return u.respond(r, body, id)
+	}
 	responseBody := u.responseBody
 	if override, ok := u.accountResponses[id]; ok {
 		responseBody = override
@@ -153,6 +157,7 @@ func newOpenAICredentialHandlerWithBilling(t *testing.T, healthyType string, bal
 		c.Next()
 	})
 	router.POST("/v1/responses", h.Responses)
+	router.POST("/v1/responses/compact", h.Responses)
 	router.POST("/v1/chat/completions", h.ChatCompletions)
 	router.GET("/v1/responses", h.ResponsesWebSocket)
 	return repo, upstream, executor, router

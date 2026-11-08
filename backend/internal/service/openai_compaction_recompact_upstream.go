@@ -10,6 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -20,6 +23,146 @@ import (
 )
 
 const openAICompactionBillingContextKey = "openai_compaction_billing"
+
+const openAIRecoveryCompactAttemptKey = "openai_recovery_compact_attempt"
+
+// Attempt metadata stays in the private maintenance context. Original response
+// status/Retry-After must survive error mapping and already-started SSE streams.
+type openAIRecoveryCompactAttempt struct {
+	status       int
+	headers      http.Header
+	transportErr error
+}
+
+func noteRecoveryCompactResponse(c *gin.Context, resp *http.Response) {
+	if c == nil {
+		return
+	}
+	value, _ := c.Get(openAIRecoveryCompactAttemptKey)
+	if attempt, ok := value.(*openAIRecoveryCompactAttempt); ok && resp != nil {
+		attempt.status, attempt.headers, attempt.transportErr = resp.StatusCode, resp.Header.Clone(), nil
+	}
+}
+
+func noteRecoveryCompactTransportError(c *gin.Context, err error) {
+	if c == nil {
+		return
+	}
+	value, _ := c.Get(openAIRecoveryCompactAttemptKey)
+	if attempt, ok := value.(*openAIRecoveryCompactAttempt); ok {
+		attempt.transportErr = err
+	}
+}
+
+// Deliberately does not unwrap a scheduler failover: an exhausted transient
+// maintenance failure must not move to another account or replay user output.
+type openAIRecoveryCompactTransientError struct {
+	status    int
+	notBefore time.Time
+}
+
+func (e *openAIRecoveryCompactTransientError) Error() string {
+	return fmt.Sprintf("temporary automatic compaction upstream failure (status %d)", e.status)
+}
+
+func recoveryCompactRetryAfter(headers http.Header, body []byte, now time.Time) time.Time {
+	latest := now
+	for _, entry := range []struct {
+		name string
+		unit time.Duration
+	}{{"retry-after", time.Second}, {"retry-after-ms", time.Millisecond}} {
+		values := append([]string(nil), headers.Values(entry.name)...)
+		for _, prefix := range []string{"error.headers.", "response.error.headers."} {
+			values = append(values, gjson.GetBytes(body, prefix+entry.name).String())
+		}
+		for _, raw := range values {
+			raw = strings.TrimSpace(raw)
+			var until time.Time
+			if n, err := strconv.ParseFloat(raw, 64); err == nil && n > 0 {
+				// Saturate only beyond Duration's range, never shorten a provider
+				// cooldown. The caller can cancel even an unserviceably long wait.
+				delay := time.Duration(1<<63 - 1)
+				if n < float64(delay)/float64(entry.unit) {
+					delay = time.Duration(n * float64(entry.unit))
+				}
+				until = now.Add(delay)
+			} else if entry.unit == time.Second {
+				until, _ = http.ParseTime(raw)
+			}
+			if until.After(latest) {
+				latest = until
+			}
+		}
+	}
+	return latest
+}
+
+func recoveryCompactTransientTransport(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || classifyUpstreamTransportError(err).Persistent {
+		return false
+	}
+	var pluginErr *PluginTransportError
+	if errors.As(err, &pluginErr) && pluginErr.RequestSent {
+		return false
+	}
+	var network net.Error
+	if errors.As(err, &network) && (network.Timeout() || network.Temporary()) {
+		return true
+	}
+	code, _ := classifyOpenAIUpstreamStreamReadError(err)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, ErrOpenAIUpstreamStreamTruncated) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) || code == OpenAIUpstreamHTTP2StreamErrorCode
+}
+
+func recoveryCompactStatus(attempt *openAIRecoveryCompactAttempt, payload []byte) int {
+	if attempt.status >= 400 {
+		return attempt.status
+	}
+	for _, path := range openAIStreamErrorStatusPaths {
+		if status := int(gjson.GetBytes(payload, path).Int()); status >= 400 && status <= 599 {
+			return status
+		}
+	}
+	if openAIStreamCredentialAuthFailure(payload) {
+		return http.StatusUnauthorized
+	}
+	for _, path := range []string{"error.code", "response.error.code"} {
+		if gjson.GetBytes(payload, path).String() == "accounts_cooling_down" {
+			return http.StatusTooManyRequests
+		}
+	}
+	status := openAIStreamFailedEventSemanticStatus(payload, extractOpenAISSEErrorMessage(payload))
+	if status != http.StatusBadGateway || openAIStreamHasServerFailureSignal(payload) {
+		return status
+	}
+	return 0 // Unknown/malformed output is not evidence of a temporary 502.
+}
+
+func recoveryCompactTemporaryFailure(attempt *openAIRecoveryCompactAttempt, payload []byte) error {
+	status := recoveryCompactStatus(attempt, payload)
+	// Explicit credential, quota and request errors must not become transient
+	// retries just because a provider wrapped them in a generic 5xx envelope.
+	if openAIStreamCredentialAuthFailure(payload) || isOpenAIUpstreamAccessStateError("", payload) ||
+		isCompactionRecoveryError(payload) {
+		return nil
+	}
+	for _, path := range []string{"error.code", "response.error.code", "error.type", "response.error.type"} {
+		switch strings.ToLower(gjson.GetBytes(payload, path).String()) {
+		case "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached", "insufficient_balance", "invalid_request_error":
+			return nil
+		}
+	}
+	switch status {
+	case 500, 502, 503, 504, 529:
+		return &openAIRecoveryCompactTransientError{status: status, notBefore: recoveryCompactRetryAfter(attempt.headers, payload, time.Now())}
+	case 0:
+		if len(payload) == 0 && recoveryCompactTransientTransport(attempt.transportErr) {
+			return &openAIRecoveryCompactTransientError{}
+		}
+	}
+	return nil
+}
 
 // The handler freezes the same price/key/channel snapshot used for the outer
 // request. Internal compactions settle independently, including on later failure.
@@ -144,6 +287,8 @@ func (s *OpenAIGatewayService) runRecoveryCompact(ctx context.Context, parent *g
 	request.Body, request.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
 	writer := &openAICompactCapture{header: make(http.Header), status: 200, size: -1, ctx: ctx}
 	c := &gin.Context{Request: request, Writer: writer}
+	attemptState := &openAIRecoveryCompactAttempt{}
+	c.Set(openAIRecoveryCompactAttemptKey, attemptState)
 	for _, key := range []string{"api_key", "subscription"} {
 		if value, ok := parent.Get(key); ok {
 			c.Set(key, value)
@@ -180,6 +325,11 @@ func (s *OpenAIGatewayService) runRecoveryCompact(ctx context.Context, parent *g
 	}
 	start := time.Now()
 	result, forwardErr := s.forwardOpenAIOnce(childCtx, c, account, body)
+	if attemptState.transportErr == nil {
+		// Non-streaming compact bodies can also be cut off mid-read. Only
+		// positively identified network errors qualify in the classifier below.
+		attemptState.transportErr = forwardErr
+	}
 	var capturedError []byte
 	if value, ok := c.Get("openai_recovery_compact_error"); ok {
 		capturedError, _ = value.([]byte)
@@ -220,11 +370,31 @@ func (s *OpenAIGatewayService) runRecoveryCompact(ctx context.Context, parent *g
 		isOpenAIContextWindowError(extractOpenAISSEErrorMessage(writer.body.Bytes()), writer.body.Bytes()) {
 		return nil, &openAIRecoveryCompactLimitError{}
 	}
-	if forwardErr != nil {
-		return nil, fmt.Errorf("automatic compaction upstream failed: %w", forwardErr)
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	var failover *UpstreamFailoverError
+	if !errors.As(forwardErr, &failover) && openAIStreamCredentialAuthFailure(capturedError) &&
+		openAIStreamFailureStatus(capturedError, extractOpenAISSEErrorMessage(capturedError)) == http.StatusUnauthorized {
+		// Internal start/progress events went only to our capture writer. The
+		// ordinary relay correctly treats them as committed, but this outer
+		// client turn is still untouched. Restore the auth failure's type here;
+		// the relay has already applied credential health side effects once.
+		forwardErr = newOpenAIUpstreamFailoverError(http.StatusUnauthorized, nil, capturedError,
+			extractOpenAISSEErrorMessage(capturedError), false)
+	}
+	if recoveryCompactStatus(attemptState, capturedError) == http.StatusTooManyRequests {
+		// Internal events have not reached the client. Hand the restored input
+		// to the scheduler immediately; never sleep on this rate-limited account.
+		forwardErr = newOpenAIUpstreamFailoverError(http.StatusTooManyRequests, attemptState.headers, capturedError,
+			extractOpenAISSEErrorMessage(capturedError), false)
+	} else if forwardErr != nil || parseErr != nil {
+		if transient := recoveryCompactTemporaryFailure(attemptState, capturedError); transient != nil {
+			return nil, transient
+		}
+	}
+	if forwardErr != nil {
+		return nil, fmt.Errorf("automatic compaction upstream failed: %w", forwardErr)
 	}
 	if parseErr != nil {
 		return nil, parseErr

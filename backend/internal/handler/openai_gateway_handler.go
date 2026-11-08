@@ -920,6 +920,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					if recoveredBody, ok := service.ResumeOpenAICompactionFailover(c, err); ok {
+						forwardBody = recoveredBody
+					}
 					if openAIFirstOutputFailoverExhausted(failoverErr, &firstOutputTimeoutSwitchCount) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
@@ -3308,6 +3311,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "continuation context incomplete; resend full history without previous_response_id")
 					return
 				}
+				// Resume maintenance on the selected replacement using the current turn.
+				service.ResumeOpenAICompactionFailover(c, err)
 				wsAttemptMessage = nextAttemptMessage
 				if retryCurrentTurn {
 					previousResponseID = ""

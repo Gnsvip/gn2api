@@ -630,6 +630,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if status == 499 {
 			return err
 		}
+		// The failure event is already on the client socket. Do not leave an
+		// inner failover error for the scheduler to replay this delivered turn.
+		var failover *UpstreamFailoverError
+		if errors.As(err, &failover) {
+			err = errors.New("automatic context recovery failed")
+		}
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "automatic context recovery failed", err)
 	}
 
@@ -754,6 +760,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			previous := compactionRecoveryTurn(c)
 			replay, prepareErr := s.prepareWSCompactionRetry(ctx, c, account, retry)
 			if prepareErr != nil {
+				if failover := compactionAccountFailover(ctx, c, retry, prepareErr); failover != nil {
+					if hooks != nil && hooks.AfterTurn != nil {
+						hooks.AfterTurn(turn, nil, failover)
+					}
+					return newOpenAIWSCurrentTurnFailoverError(failover, RemovePreviousResponseIDFromBody(retry.body))
+				}
 				return finishRecoveryError(turn, prepareErr)
 			}
 			next, parseErr := parseClientPayload(turn, replay)
@@ -1676,6 +1688,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		previous := compactionRecoveryTurn(c)
 		replay, prepareErr := s.prepareWSCompactionRetry(ctx, c, account, retry)
 		if prepareErr != nil {
+			if failover := compactionAccountFailover(ctx, c, retry, prepareErr); failover != nil {
+				if hooks != nil && hooks.AfterTurn != nil {
+					hooks.AfterTurn(turn, nil, failover)
+				}
+				return newOpenAIWSCurrentTurnFailoverError(failover, RemovePreviousResponseIDFromBody(retry.body))
+			}
 			return finishRecoveryError(turn, prepareErr)
 		}
 		next, parseErr := parseClientPayload(turn, replay)

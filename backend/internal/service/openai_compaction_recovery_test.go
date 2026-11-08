@@ -345,6 +345,67 @@ func TestCompactionRecoveryCaptureRejectsIncompleteOrFailed(t *testing.T) {
 	}
 }
 
+// Codex V2 installs selected input items BEFORE its summary, with refreshed
+// harness context. That installed window is not a contiguous input prefix.
+func TestCompactionRecoveryCodexInstalledWindow(t *testing.T) {
+	oldSetup := `{"type":"message","role":"developer","content":"original environment"}`
+	newSetup := `{"type":"message","role":"developer","content":"current environment"}`
+	for _, scenario := range []string{"retained_subset", "refreshed_context", "moved_context", "restart", "edited_user", "reordered_users", "missing_tool_call", "legacy_window"} {
+		t.Run(scenario, func(t *testing.T) {
+			svc := &OpenAIGatewayService{}
+			store := svc.compactionRecoveryStore()
+			dir := t.TempDir()
+			require.NoError(t, store.startPersistence(dir, "installed-window-secret"))
+			t.Cleanup(store.closePersistence)
+			source := recoveryItems(t, oldSetup+","+recoveryImage+","+autoContinuationCall+","+autoContinuationTool+","+recoveryRetained)
+			output := recoveryItems(t, recoverySummary)
+			prefix := recoveryImage + "," + recoveryRetained
+			switch scenario {
+			case "refreshed_context", "restart":
+				prefix = recoveryImage + "," + newSetup + "," + recoveryRetained
+			case "moved_context":
+				prefix = recoveryImage + "," + oldSetup + "," + recoveryRetained
+			case "edited_user":
+				prefix = strings.ReplaceAll(prefix, "retained-tail", "changed-user-text")
+			case "reordered_users":
+				prefix = recoveryRetained + "," + recoveryImage
+			case "missing_tool_call":
+				prefix += "," + strings.ReplaceAll(autoContinuationTool, "call_lookup", "unknown-call")
+			case "legacy_window":
+				output = recoveryItems(t, recoverySummary+","+recoveryRetained)
+			}
+			require.True(t, store.put("scope", source, output, "owner"))
+			if scenario == "restart" {
+				store.closePersistence()
+				store = (&OpenAIGatewayService{}).compactionRecoveryStore()
+				require.NoError(t, store.startPersistence(dir, "installed-window-secret"))
+				t.Cleanup(store.closePersistence)
+			}
+			body := compactionTestBody(prefix+","+recoverySummary+","+recoveryUser, true)
+			restored, ok := store.restore("scope", body, true, "owner")
+			if scenario == "edited_user" || scenario == "reordered_users" || scenario == "missing_tool_call" || scenario == "legacy_window" {
+				require.False(t, ok, "unverified history must never be substituted")
+				require.Equal(t, body, restored)
+				return
+			}
+			require.True(t, ok, "official retained messages are a subsequence, not a prefix")
+			want := append([]json.RawMessage(nil), source...)
+			if scenario == "refreshed_context" || scenario == "restart" {
+				want = append(want, json.RawMessage(newSetup))
+			}
+			if scenario == "moved_context" {
+				want = append(want, json.RawMessage(oldSetup))
+			}
+			want = append(want, json.RawMessage(recoveryUser))
+			encoded, err := json.Marshal(want)
+			require.NoError(t, err)
+			require.JSONEq(t, string(encoded), gjson.GetBytes(restored, "input").Raw)
+			require.True(t, AnalyzeToolCallOutputContextCoverageBytes(restored).ContextCoversAllCallIDs)
+			require.NotContains(t, string(restored), "recovery-test-cipher")
+		})
+	}
+}
+
 func TestCompactionRecoveryLRUExpiryAndConcurrentIsolation(t *testing.T) {
 	store := (&OpenAIGatewayService{}).compactionRecoveryStore()
 	closeRecoveryStore(t, store)

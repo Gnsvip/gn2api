@@ -3,10 +3,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -315,5 +319,242 @@ func TestOpenAIWSHTTPBackupRequiresExplicitBridgeMode(t *testing.T) {
 				require.Equal(t, []int64{802}, upstream.hits)
 			}
 		})
+	}
+}
+
+// Exercise the real account scheduler, shared WS reader and current-turn replay.
+// Priming requests save and reject a compact window just as explicit client
+// requests do; the subsequent request must recover without leaking a 400.
+func TestOpenAICompactionCredentialFailover(t *testing.T) {
+	for _, route := range []string{"http", "http_sse401", "http_no_backup", "ws_ctx_pool", "ws_passthrough", "ws_http_bridge", "ws_billing", "ws_ctx_pool_503", "ws_passthrough_503", "ws_http_bridge_503", "http_429", "http_sse429", "http_no_backup_429", "ws_ctx_pool_429", "ws_passthrough_429", "ws_http_bridge_429", "ws_billing_429", "http_503_once", "ws_ctx_pool_503_once", "ws_passthrough_503_once", "ws_http_bridge_503_once", "ws_billing_503_once"} {
+		baseRoute := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(route, "_503_once"), "_503"), "_429")
+		temporary := strings.HasSuffix(route, "_503_once")
+		rateLimited := strings.HasSuffix(route, "429")
+		for _, backupWS := range []bool{false, true} {
+			if (strings.HasPrefix(route, "http") || baseRoute == "ws_http_bridge" || baseRoute == "ws_billing" || strings.HasSuffix(route, "_503") || temporary) && backupWS {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/backup_ws_%v", route, backupWS), func(t *testing.T) {
+				const summary = `{"type":"compaction","encrypted_content":"expired-compact-window"}`
+				const fresh = `{"type":"compaction","encrypted_content":"backup-compact-window"}`
+				const history = `{"role":"user","content":"remember 7391"},{"type":"function_call","name":"inspect","call_id":"call_old","arguments":"{}"},{"type":"function_call_output","call_id":"call_old","output":"old tool result"}`
+				const latest = `{"role":"user","content":"continue current turn"}`
+				const call = `{"type":"function_call","name":"inspect","call_id":"call_next","arguments":"{}"}`
+				var mu sync.Mutex
+				var compactIDs []int64
+				var backupBodies, wsBodies []string
+				primed := false
+				generation := 0
+				reply := func(body string) string {
+					return `{"type":"response.completed","response":{"id":"resp_answer","status":"completed","output":[` + body + `]}}`
+				}
+				upstreamWS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := coderws.Accept(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer conn.CloseNow()
+					for {
+						_, raw, err := conn.Read(r.Context())
+						if err != nil {
+							return
+						}
+						if strings.Contains(string(raw), "connection warmup") {
+							_ = conn.Write(r.Context(), coderws.MessageText, []byte(reply(`{"role":"assistant","content":"warmup complete"}`)))
+							continue
+						}
+						mu.Lock()
+						wsBodies = append(wsBodies, string(raw))
+						mu.Unlock()
+						if conn.Write(r.Context(), coderws.MessageText, []byte(reply(call))) != nil {
+							return
+						}
+					}
+				}))
+				defer upstreamWS.Close()
+				mode := service.OpenAIWSIngressModeHTTPBridge
+				if baseRoute == "ws_ctx_pool" || baseRoute == "ws_billing" {
+					mode = service.OpenAIWSIngressModeCtxPool
+				}
+				if baseRoute == "ws_passthrough" {
+					mode = service.OpenAIWSIngressModePassthrough
+				}
+				backupType := service.AccountTypeAPIKey
+				if baseRoute == "http_no_backup" {
+					backupType = "none"
+				}
+				var balanceCache *handlerInflightCache
+				var usageRepo service.UsageLogRepository
+				var billingRepo service.UsageBillingRepository
+				if baseRoute == "ws_billing" {
+					balanceCache = newHandlerInflightCache(100)
+					usageRepo = &openAIWSUsageHandlerUsageLogRepoStub{created: make(chan *service.UsageLog, 16)}
+					billingRepo = &compatStreamUsageBillingRepo{}
+				}
+				_, upstream, _, router := newOpenAICredentialHandlerWithBilling(t, backupType, balanceCache, usageRepo, billingRepo, func(cfg *config.Config, accounts []service.Account) {
+					cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+					cfg.Gateway.OpenAIWS.IngressModeDefault = mode
+					accounts[0].Type = service.AccountTypeAPIKey
+					accounts[0].Credentials = map[string]any{"api_key": "first-key", "base_url": upstreamWS.URL + "/v1"}
+					if rateLimited {
+						accounts[0].Credentials["pool_mode"] = true
+						accounts[0].Credentials["pool_mode_retry_count"] = 10
+					}
+					if len(accounts) < 2 {
+						return
+					}
+					accounts[1].Credentials["base_url"] = upstreamWS.URL + "/v1"
+					backupMode := service.OpenAIWSIngressModeHTTPBridge
+					if backupWS {
+						backupMode = mode
+					}
+					accounts[1].Extra = map[string]any{"openai_apikey_responses_websockets_v2_mode": backupMode}
+				})
+				upstream.respond = func(r *http.Request, raw []byte, id int64) (*http.Response, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					status, contentType, body := 200, "text/event-stream", ""
+					if strings.HasSuffix(r.URL.Path, "/compact") {
+						if !primed {
+							body = `{"id":"cmp_original","usage":{},"output":[` + summary + `]}`
+							primed = true
+						} else {
+							compactIDs = append(compactIDs, id)
+							if id == 801 && (!temporary || len(compactIDs) == 1) {
+								status = 401
+								body = `{"error":{"code":"invalid_api_key","message":"Invalid API key"}}`
+								if strings.HasSuffix(route, "_503") || temporary {
+									status = 503
+									body = `{"error":{"code":"upstream_error","message":"Service unavailable"}}`
+								}
+								if rateLimited {
+									status, body = 429, `{"error":{"code":"rate_limit_exceeded","message":"cooling down","headers":{"retry-after":"60"}}}`
+								}
+							} else {
+								backupBodies = append(backupBodies, string(raw))
+								body = `{"id":"cmp_backup","usage":{},"output":[` + fresh + `]}`
+							}
+						}
+						contentType = "application/json"
+						if (route == "http_sse401" && status == 401) || (route == "http_sse429" && status == 429) {
+							status, contentType = 200, "text/event-stream"
+							body = `data: {"type":"response.created","response":{"id":"resp_internal"}}` + "\n\ndata: " + `{"type":"response.failed","response":` + body + `}` + "\n\n"
+						}
+					} else if strings.Contains(string(raw), "connection warmup") {
+						body = "data: " + reply(`{"role":"assistant","content":"warmup complete"}`) + "\n\n"
+					} else if id == 801 && !(temporary && len(compactIDs) > 1) {
+						generation++
+						code, message := "invalid_encrypted_content", "encrypted content could not be verified"
+						if generation > 1 {
+							code, message = "context_length_exceeded", "maximum context length exceeded"
+						}
+						body = `data: {"type":"response.created","response":{"id":"resp_priming"}}` + "\n\ndata: " + fmt.Sprintf(`{"type":"response.failed","response":{"id":"resp_priming","status":"failed","error":{"code":%q,"message":%q}}}`, code, message) + "\n\n"
+					} else {
+						backupBodies = append(backupBodies, string(raw))
+						body = "data: " + reply(call) + "\n\n"
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {contentType}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				}
+				requestBody := func(input string) string {
+					return `{"model":"gpt-6-astra","stream":true,"reasoning":{"effort":"xhigh"},"instructions":"keep instructions","input":[` + input + `]}`
+				}
+				post := func(path, body string) *httptest.ResponseRecorder {
+					rec := httptest.NewRecorder()
+					req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+					req.Header.Set("session_id", "maintenance-failover-session")
+					router.ServeHTTP(rec, req)
+					return rec
+				}
+				priming := post("/v1/responses/compact", strings.Replace(requestBody(history), `"stream":true`, `"stream":false`, 1))
+				require.Equal(t, 200, priming.Code, "%s hits=%v primed=%v", priming.Body.String(), upstream.hits, primed)
+				body := requestBody(summary + "," + latest)
+				for range 2 {
+					rec := post("/v1/responses", body)
+					require.Contains(t, rec.Body.String(), "response.failed", "priming must retain the failed response")
+				}
+				if strings.HasPrefix(route, "http") {
+					rec := post("/v1/responses", body)
+					if baseRoute == "http_no_backup" {
+						require.NotEqual(t, 200, rec.Code)
+						require.NotEqual(t, 400, rec.Code)
+						require.NotContains(t, rec.Body.String(), "context_recovery_failed")
+						mu.Lock()
+						defer mu.Unlock()
+						require.Equal(t, []int64{801}, compactIDs)
+						require.Empty(t, backupBodies)
+						return
+					}
+					require.Equal(t, 200, rec.Code, rec.Body.String())
+					require.Contains(t, rec.Body.String(), "resp_answer")
+					require.NotContains(t, rec.Body.String(), "response.failed")
+				} else {
+					server := httptest.NewServer(router)
+					defer server.Close()
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					conn, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", &coderws.DialOptions{HTTPHeader: http.Header{"Session_id": {"maintenance-failover-session"}}})
+					require.NoError(t, err)
+					defer conn.CloseNow()
+					// Maintenance fails on turn 2, so the scheduler must not replay turn 1.
+					require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-6-astra","input":[{"role":"user","content":"connection warmup"}]}`)))
+					_, warmup, err := conn.Read(ctx)
+					require.NoError(t, err)
+					require.Equal(t, "response.completed", gjson.GetBytes(warmup, "type").String(), string(warmup))
+					create := strings.TrimSuffix(body, "}") + `,"type":"response.create"}`
+					require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(create)))
+					if strings.HasSuffix(route, "_503") {
+						require.Eventually(t, func() bool {
+							mu.Lock()
+							defer mu.Unlock()
+							return len(compactIDs) >= 2
+						}, 3*time.Second, 10*time.Millisecond)
+						require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(`{"type":"response.cancel"}`)))
+						_, _, err = conn.Read(ctx)
+						require.Error(t, err, "client cancellation must stop maintenance")
+						mu.Lock()
+						defer mu.Unlock()
+						require.Equal(t, []int64{801, 801}, compactIDs, "same-account recovery continues until canceled, without switching")
+						require.Empty(t, backupBodies)
+						return
+					}
+
+					_, data, err := conn.Read(ctx)
+					require.NoError(t, err)
+					require.Equal(t, "response.completed", gjson.GetBytes(data, "type").String(), string(data))
+					follow := `{"type":"response.create","model":"gpt-6-astra","previous_response_id":"resp_answer","input":[{"type":"function_call_output","call_id":"call_next","output":"next tool result"}]}`
+					require.NoError(t, conn.Write(ctx, coderws.MessageText, []byte(follow)))
+					_, data, err = conn.Read(ctx)
+					require.NoError(t, err)
+					require.Equal(t, "response.completed", gjson.GetBytes(data, "type").String(), string(data))
+					_ = conn.Close(coderws.StatusNormalClosure, "done")
+				}
+				if balanceCache != nil {
+					require.Eventually(t, func() bool { return balanceCache.count() == 0 }, time.Second, time.Millisecond)
+					balanceCache.mu.Lock()
+					reserved := balanceCache.reservations
+					balanceCache.mu.Unlock()
+					require.Equal(t, 8, reserved, "six client turns and two internal compacts; failover must reuse the current admission")
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if temporary {
+					require.Equal(t, []int64{801, 801}, compactIDs, "temporary failure resumes on the same account")
+				} else {
+					require.Equal(t, []int64{801, 802}, compactIDs, "recompact on the healthy account before generation")
+				}
+				require.Contains(t, backupBodies[0], "7391")
+				require.Contains(t, backupBodies[0], "old tool result")
+				require.NotContains(t, backupBodies[0], "expired-compact-window")
+				generated := backupBodies[1:]
+				if (backupWS || temporary) && mode != service.OpenAIWSIngressModeHTTPBridge {
+					generated = wsBodies
+				}
+				require.NotEmpty(t, generated)
+				require.Contains(t, generated[0], "backup-compact-window")
+				require.Contains(t, generated[0], "continue current turn")
+				require.Equal(t, "xhigh", gjson.Get(generated[0], "reasoning.effort").String())
+				require.Empty(t, gjson.Get(generated[0], "previous_response_id").String())
+			})
+		}
 	}
 }

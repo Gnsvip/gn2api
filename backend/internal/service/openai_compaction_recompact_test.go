@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,9 +11,12 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	coderws "github.com/coder/websocket"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -23,10 +27,368 @@ const recompactSummary = `{"type":"compaction","encrypted_content":"fresh-contex
 const recompactRetained = `{"type":"message","role":"user","content":"compactor-retained-item"}`
 const recompactLimit = `{"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}}`
 
+func TestCompactionRecompactTransientRetry(t *testing.T) {
+	for _, scenario := range []string{"http503", "repeated503", "passthrough503", "native503", "native_passthrough503", "native_eof", "native_passthrough_eof", "http429", "native429", "400", "403", "quota", "malformed", "long_cooldown", "cancel", "caller_deadline"} {
+		t.Run(scenario, func(t *testing.T) {
+			native := strings.HasPrefix(scenario, "native")
+			var mu sync.Mutex
+			var bodies []string
+			ctx, cancel := context.WithCancel(context.Background())
+			if scenario == "caller_deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 150*time.Millisecond)
+			}
+			defer cancel()
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				bodies = append(bodies, string(raw))
+				n := len(bodies)
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				if n > 1 && (scenario != "repeated503" || n > 4) {
+					if native {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", autoContinuationEvent("resp_compact", recompactSummary))
+					} else {
+						_, _ = fmt.Fprintf(w, `{"usage":{},"output":[%s]}`, recompactSummary)
+					}
+					return
+				}
+				status, payload := 503, `{"code":"server_error","message":"temporarily unavailable"}`
+				switch scenario {
+				case "http429", "native429":
+					status, payload = 429, `{"code":"rate_limit_exceeded","message":"cooling down","headers":{"retry-after":"60"}}`
+					w.Header().Set("Retry-After", "60")
+				case "400":
+					status, payload = 400, `{"code":"invalid_request_error"}`
+				case "403":
+					status, payload = 403, `{"code":"forbidden"}`
+				case "quota":
+					payload = `{"code":"insufficient_quota"}`
+				case "malformed":
+					_, _ = io.WriteString(w, `{"usage":{},"output":[]}`)
+					return
+				case "long_cooldown":
+					w.Header().Set("Retry-After", "300")
+					time.AfterFunc(100*time.Millisecond, cancel)
+				case "cancel":
+					time.AfterFunc(100*time.Millisecond, cancel)
+				}
+				if native {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: "+`{"type":"response.created","response":{"id":"resp_private"}}`+"\n\n")
+					w.(http.Flusher).Flush()
+					if strings.HasSuffix(scenario, "_eof") {
+						return
+					}
+					_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.failed\",\"response\":{\"error\":%s}}\n\n", payload)
+				} else {
+					w.WriteHeader(status)
+					_, _ = fmt.Fprintf(w, `{"error":%s}`, payload)
+				}
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			defer svc.openaiWSPool.Close()
+			base, _ := url.Parse(upstream.URL)
+			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+			if !native {
+				account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "same-key"}
+			}
+			if strings.Contains(scenario, "passthrough") {
+				account.Extra = map[string]any{"openai_passthrough": true}
+			}
+			closeRecoveryStore(t, svc.compactionRecoveryStore())
+			c, rec := httpBridgeContext("compact-transient-" + scenario)
+			body := compactionTestBody(autoContinuationBase+","+recoveryImage+","+recoveryUser, true)
+			svc.beginCompactionRecoveryTurn(c, body, false, account)
+			turn := compactionRecoveryTurn(c)
+			turn.restored = true
+			retry := &openAICompactionReplayRetry{body: body, recompact: true}
+			started := time.Now()
+			next, err := svc.prepareCompactionRetry(ctx, c, account, retry)
+			mu.Lock()
+			defer mu.Unlock()
+			require.Empty(t, rec.Body.String(), "maintenance events must remain private")
+			require.Equal(t, body, turn.body, "failed attempts must not overwrite restored history")
+			switch scenario {
+			case "http503", "repeated503", "passthrough503", "native503", "native_passthrough503", "native_eof", "native_passthrough_eof":
+				require.NoError(t, err)
+				wantCalls := 2
+				if scenario == "repeated503" {
+					wantCalls = 5
+				}
+				require.Len(t, bodies, wantCalls)
+				// Each independent upstream attempt has its own generated tracing
+				// IDs. All model settings, tools and input remain identical.
+				first, _ := sjson.Delete(bodies[0], "client_metadata")
+				for _, attempt := range bodies[1:] {
+					second, _ := sjson.Delete(attempt, "client_metadata")
+					require.JSONEq(t, first, second, "same segment, settings and original history")
+				}
+				require.Contains(t, string(next), "fresh-context-cipher")
+				require.GreaterOrEqual(t, time.Since(started), time.Second)
+				require.Equal(t, wantCalls, turn.maintenanceCalls)
+			case "http429", "native429":
+				require.Error(t, err)
+				require.Len(t, bodies, 1, "429 must not wait or retry the rate-limited account")
+				handoff := compactionAccountFailover(ctx, c, retry, err)
+				require.NotNil(t, handoff)
+				full, ok := ResumeOpenAICompactionFailover(c, handoff)
+				require.True(t, ok)
+				require.JSONEq(t, string(body), string(full))
+				require.Less(t, time.Since(started), 5*time.Second)
+			default:
+				require.Error(t, err)
+				require.Len(t, bodies, 1)
+				require.Nil(t, compactionAccountFailover(ctx, c, retry, err))
+				require.Empty(t, svc.compactionRecoveryStore().entries)
+				if scenario == "cancel" || scenario == "long_cooldown" {
+					require.ErrorIs(t, err, context.Canceled)
+					require.GreaterOrEqual(t, time.Since(started), 100*time.Millisecond)
+				}
+				if scenario == "caller_deadline" {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactionRecompactRetrySignals(t *testing.T) {
+	for attempt, seconds := range []int{1, 2, 4, 8, 16, 30, 30} {
+		require.Equal(t, time.Duration(seconds)*time.Second, recoveryCompactBackoff(attempt))
+	}
+	require.Equal(t, 30*time.Second, recoveryCompactBackoff(1000), "long recovery must not overflow into a tight retry loop")
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, tc := range []struct {
+		headers http.Header
+		body    string
+		want    time.Duration
+	}{
+		{http.Header{"Retry-After": {"30"}}, "", 30 * time.Second},
+		{http.Header{"Retry-After": {now.Add(time.Minute).Format(http.TimeFormat)}}, "", time.Minute},
+		{http.Header{"Retry-After-Ms": {"1250"}}, "", 1250 * time.Millisecond},
+		{nil, `{"response":{"error":{"headers":{"retry-after":"45"}}}}`, 45 * time.Second},
+		{http.Header{"Retry-After": {"10"}}, `{"error":{"headers":{"retry-after-ms":"20000"}}}`, 20 * time.Second},
+		{http.Header{"Retry-After": {"1e30"}}, "", time.Duration(1<<63 - 1)},
+		{http.Header{"Retry-After": {"NaN"}}, "", 0},
+	} {
+		require.Equal(t, tc.want, recoveryCompactRetryAfter(tc.headers, []byte(tc.body), now).Sub(now))
+	}
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{io.ErrUnexpectedEOF, true}, {ErrOpenAIUpstreamStreamTruncated, true},
+		{syscall.ECONNRESET, true}, {syscall.EPIPE, true},
+		{context.Canceled, false}, {syscall.ECONNREFUSED, false},
+		{errors.New("proxy authentication required"), false}, {errors.New("invalid configuration"), false},
+	} {
+		require.Equal(t, tc.want, recoveryCompactTransientTransport(tc.err), "%v", tc.err)
+	}
+}
+
+func TestCompactionRecompactTransportRetry(t *testing.T) {
+	for _, scenario := range []string{"reset", "short_body", "persistent_proxy"} {
+		t.Run(scenario, func(t *testing.T) {
+			svc, account, upstream := httpBridgeFixture(t, "http://unused.invalid")
+			account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "same"}
+			upstream.errs = []error{syscall.ECONNRESET}
+			if scenario == "persistent_proxy" {
+				upstream.errs[0] = errors.New("proxy authentication required")
+			}
+			upstream.responses = []*http.Response{nil, {StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"usage":{},"output":[` + recompactSummary + `]}`))}}
+			if scenario == "short_body" {
+				upstream.errs = nil
+				upstream.responses[0] = &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: &openAIStreamReadThenErrorCloser{reader: strings.NewReader(`{"output":[`), err: io.ErrUnexpectedEOF}}
+			}
+			closeRecoveryStore(t, svc.compactionRecoveryStore())
+			c, rec := httpBridgeContext("transport-retry")
+			body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+			svc.beginCompactionRecoveryTurn(c, body, false, account)
+			compactionRecoveryTurn(c).restored = true
+			next, err := svc.prepareCompactionRetry(c.Request.Context(), c, account, &openAICompactionReplayRetry{body: body, recompact: true})
+			if scenario == "persistent_proxy" {
+				require.Error(t, err)
+				require.Equal(t, 1, upstream.callCount)
+			} else {
+				require.NoError(t, err)
+				require.Contains(t, string(next), "fresh-context-cipher")
+				require.Equal(t, 2, upstream.callCount)
+				require.JSONEq(t, string(upstream.bodies[0]), string(upstream.bodies[1]))
+			}
+			require.Empty(t, rec.Body.String())
+		})
+	}
+}
+
+func TestCompactionRecompactNoMaintenanceCap(t *testing.T) {
+	svc, account, upstream := httpBridgeFixture(t, "http://unused.invalid")
+	account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "same"}
+	upstream.responses = nil
+	// Nine reductions, then two successful segments. The original fixed call
+	// budget would abort before even the first segment could finish.
+	for i := range 11 {
+		status, body := 200, `{"usage":{},"output":[`+recompactSummary+`]}`
+		if i < 9 {
+			status, body = 400, `{"error":`+gjson.Get(recompactLimit, "response.error").Raw+`}`
+		}
+		upstream.responses = append(upstream.responses, &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))})
+	}
+	closeRecoveryStore(t, svc.compactionRecoveryStore())
+	c, rec := httpBridgeContext("no-maintenance-cap")
+	var history []string
+	for i := range 512 {
+		history = append(history, fmt.Sprintf(`{"role":"user","content":"old-%d"}`, i))
+	}
+	body := compactionTestBody(strings.Join(history, ",")+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	turn := compactionRecoveryTurn(c)
+	turn.restored, turn.maintenanceCalls = true, 8
+	turn.started = time.Now().Add(-3 * time.Minute)
+	turn.maintenance = 3 * time.Minute
+	next, err := svc.prepareCompactionRetry(c.Request.Context(), c, account, &openAICompactionReplayRetry{body: body, recompact: true})
+	require.NoError(t, err)
+	require.Contains(t, string(next), "fresh-context-cipher")
+	require.Contains(t, string(next), "Continue using")
+	require.Empty(t, rec.Body.String())
+	require.Equal(t, 11, upstream.callCount)
+	require.Equal(t, 19, turn.maintenanceCalls, "counter remains observational, not a stop condition")
+	for _, request := range upstream.reqs {
+		_, hasDeadline := request.Context().Deadline()
+		require.False(t, hasDeadline, "maintenance must not inject its own two-minute deadline")
+	}
+}
+
+func TestCompactionRecompactWSBackoffCancellation(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		t.Run(fmt.Sprint(disconnect), func(t *testing.T) {
+			var calls atomic.Int32
+			arrived := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				calls.Add(1)
+				w.Header().Set("Retry-After", "30")
+				w.WriteHeader(503)
+				_, _ = io.WriteString(w, `{"error":{"code":"server_error"}}`)
+				w.(http.Flusher).Flush()
+				arrived <- struct{}{}
+			}))
+			defer upstream.Close()
+			svc, account, _ := httpBridgeFixture(t, upstream.URL)
+			base, _ := url.Parse(upstream.URL)
+			svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+			account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "same"}
+			closeRecoveryStore(t, svc.compactionRecoveryStore())
+			done := make(chan error, 1)
+			gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := coderws.Accept(w, r, nil)
+				if err != nil {
+					done <- err
+					return
+				}
+				defer conn.CloseNow()
+				c, rec := httpBridgeContext("ws-backoff")
+				body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+				svc.beginCompactionRecoveryTurn(c, body, false, account)
+				compactionRecoveryTurn(c).restored = true
+				_, err = svc.prepareWSCompactionRetry(WithOpenAIWSClientReadHandoff(r.Context(), conn), c, account, &openAICompactionReplayRetry{body: body, recompact: true})
+				if rec.Body.Len() != 0 {
+					t.Error("internal maintenance leaked output")
+				}
+				done <- err
+			}))
+			defer gateway.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, _, err := coderws.Dial(ctx, "ws"+strings.TrimPrefix(gateway.URL, "http"), nil)
+			require.NoError(t, err)
+			defer client.CloseNow()
+			select {
+			case <-arrived:
+			case <-ctx.Done():
+				t.Fatal("maintenance did not reach upstream")
+			}
+			// Let the completed 503 enter backoff before interrupting it.
+			time.Sleep(50 * time.Millisecond)
+			if disconnect {
+				_ = client.CloseNow()
+			} else {
+				require.NoError(t, client.Write(ctx, coderws.MessageText, []byte(`{"type":"response.cancel"}`)))
+			}
+			select {
+			case err := <-done:
+				var closed *OpenAIWSClientCloseError
+				require.ErrorAs(t, err, &closed)
+			case <-time.After(time.Second):
+				t.Fatal("client cancellation did not interrupt backoff")
+			}
+			require.EqualValues(t, 1, calls.Load(), "no upstream retry after the client stops")
+		})
+	}
+}
+
+func TestCompactionRecompactTransientSegmentResume(t *testing.T) {
+	var mu sync.Mutex
+	var requests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requests = append(requests, string(raw))
+		n := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			w.WriteHeader(400)
+			_, _ = fmt.Fprintf(w, `{"error":%s}`, gjson.Get(recompactLimit, "response.error").Raw)
+		case 2:
+			_, _ = io.WriteString(w, `{"usage":{},"output":[{"type":"compaction","encrypted_content":"completed-first-segment"}]}`)
+		case 3:
+			w.WriteHeader(503)
+			_, _ = io.WriteString(w, `{"error":{"code":"server_error"}}`)
+		default:
+			_, _ = fmt.Fprintf(w, `{"usage":{},"output":[%s]}`, recompactSummary)
+		}
+	}))
+	defer upstream.Close()
+	svc, account, _ := httpBridgeFixture(t, upstream.URL)
+	defer svc.openaiWSPool.Close()
+	account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "same"}
+	base, _ := url.Parse(upstream.URL)
+	svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+	closeRecoveryStore(t, svc.compactionRecoveryStore())
+	c, rec := httpBridgeContext("transient-segment")
+	var history []string
+	for i := range 8 {
+		history = append(history, fmt.Sprintf(`{"role":"user","content":"old-%d"}`, i))
+	}
+	body := compactionTestBody(strings.Join(history, ",")+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	compactionRecoveryTurn(c).restored = true
+	next, err := svc.prepareCompactionRetry(c.Request.Context(), c, account, &openAICompactionReplayRetry{body: body, recompact: true})
+	require.NoError(t, err)
+	require.Contains(t, string(next), "fresh-context-cipher")
+	require.Contains(t, string(next), "Continue using")
+	require.Empty(t, rec.Body.String())
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, requests, 4)
+	require.JSONEq(t, requests[2], requests[3], "retry the failed segment with the completed prefix, not the whole original history")
+	require.Contains(t, requests[3], "completed-first-segment")
+	require.Contains(t, requests[3], "old-7")
+	require.NotContains(t, requests[3], "old-0")
+	require.Equal(t, 4, compactionRecoveryTurn(c).maintenanceCalls)
+}
+
 func TestCompactionRecompactEndToEnd(t *testing.T) {
-	for _, route := range []string{"http", "http_json", "http_passthrough", "http_to_ws", "ws", "ws_to_http", "ws_passthrough", "ws_reconnect", "ws_to_http_reconnect", "ws_passthrough_reconnect"} {
-		path := strings.TrimSuffix(route, "_reconnect")
-		reconnect := path != route
+	for _, route := range []string{"http", "http_json", "http_passthrough", "http_to_ws", "ws", "ws_to_http", "ws_passthrough", "ws_reconnect", "ws_to_http_reconnect", "ws_passthrough_reconnect", "codex_http_to_ws", "codex_ws_reconnect", "codex_ws_passthrough_reconnect", "codex_http_passthrough"} {
+		installedWindow := strings.HasPrefix(route, "codex_")
+		baseRoute := strings.TrimPrefix(route, "codex_")
+		path := strings.TrimSuffix(baseRoute, "_reconnect")
+		reconnect := path != baseRoute
 		for _, failure := range []string{"response.failed", "error", "http400"} {
 			if failure == "http400" && (path == "ws" || path == "http_to_ws" || path == "ws_passthrough") {
 				continue
@@ -143,10 +505,17 @@ func TestCompactionRecompactEndToEnd(t *testing.T) {
 				}
 				c, _ := httpBridgeContext("recovery-e2e")
 				source := recoveryItems(t, autoContinuationBase+","+recoveryImage+","+recoveryRetained)
-				original := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, path != "http_json")
+				compactOutput := recoverySummary + "," + recoveryRetained
+				input := compactOutput + "," + recoveryUser
+				currentSetup := `{"type":"message","role":"developer","content":"current recovery environment"}`
+				if installedWindow {
+					compactOutput = recoverySummary
+					input = recoveryImage + "," + currentSetup + "," + recoveryRetained + "," + recoverySummary + "," + recoveryUser
+				}
+				original := compactionTestBody(input, path != "http_json")
 				svc.beginCompactionRecoveryTurn(c, original, false)
-				require.True(t, svc.compactionRecoveryStore().put(compactionRecoveryTurn(c).scope, source, recoveryItems(t, recoverySummary+","+recoveryRetained), compactionRecoveryTurn(c).owner))
-				bodies := [][]byte{original, compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser+","+strings.ReplaceAll(autoContinuationCall, "call_lookup", "fc_lookup")+","+strings.ReplaceAll(autoContinuationTool, "call_lookup", "fc_lookup"), path != "http_json")}
+				require.True(t, svc.compactionRecoveryStore().put(compactionRecoveryTurn(c).scope, source, recoveryItems(t, compactOutput), compactionRecoveryTurn(c).owner))
+				bodies := [][]byte{original, compactionTestBody(input+","+strings.ReplaceAll(autoContinuationCall, "call_lookup", "fc_lookup")+","+strings.ReplaceAll(autoContinuationTool, "call_lookup", "fc_lookup"), path != "http_json")}
 				explicit := path != "http_json" && failure != "http400"
 				completedNative := false
 				if explicit {
@@ -211,6 +580,9 @@ func TestCompactionRecompactEndToEnd(t *testing.T) {
 				require.NotContains(t, string(requests[2]), "7391")
 				require.NotContains(t, string(requests[3]), "data:image/png")
 				for _, raw := range requests[2:] {
+					if installedWindow && gjson.GetBytes(raw, "previous_response_id").String() == "" {
+						require.Contains(t, string(raw), "current recovery environment", "new context remains outside the encrypted summary")
+					}
 					for _, field := range []string{"model", "reasoning.effort", "tools"} {
 						require.JSONEq(t, gjson.GetBytes(original, field).Raw, gjson.GetBytes(raw, field).Raw,
 							"generation settings must survive internal compact: %s", field)
@@ -533,7 +905,8 @@ func TestCompactionRecompactBoundedFailure(t *testing.T) {
 			if permanent {
 				require.Equal(t, 1, calls)
 			} else {
-				require.Equal(t, openAIRecoveryCompactMaxCalls, calls)
+				require.Greater(t, calls, 8, "continue shrinking until the indivisible input is reached")
+				require.ErrorContains(t, err, "complete history item or tool exchange")
 			}
 			require.Contains(t, string(compactionRecoveryTurn(c).body), "old-511")
 		})
@@ -651,4 +1024,209 @@ func TestCompactionRecompactBalanceFailureKeeps403(t *testing.T) {
 	require.Equal(t, 403, rec.Code)
 	require.Equal(t, "insufficient_quota", gjson.Get(rec.Body.String(), "error.code").String())
 	require.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
+}
+
+func TestCompactionRecompactCredentialFailoverHTTP(t *testing.T) {
+	var backupBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer backup" {
+			raw, _ := io.ReadAll(r.Body)
+			backupBodies = append(backupBodies, string(raw))
+			if strings.HasSuffix(r.URL.Path, "/compact") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"usage":{},"output":[%s]}`, recompactSummary)
+			} else {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", autoContinuationEvent("resp_backup", autoContinuationAnswer))
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key","message":"Invalid API key"}}`)
+	}))
+	defer upstream.Close()
+	svc, account, _ := httpBridgeFixture(t, upstream.URL)
+	account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "test"}
+	base, _ := url.Parse(upstream.URL)
+	svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+	store := svc.compactionRecoveryStore()
+	closeRecoveryStore(t, store)
+	c, rec := httpBridgeContext("credential-maintenance")
+	body := compactionTestBody(recoverySummary+","+recoveryRetained+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	turn := compactionRecoveryTurn(c)
+	require.True(t, store.put(turn.scope, recoveryItems(t, recoveryImage+","+recoveryRetained), recoveryItems(t, recoverySummary+","+recoveryRetained), turn.owner))
+	svc.noteCompactionStreamFailure(c, []byte(recoveryCipherError))
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	svc.noteCompactionStreamFailure(c, []byte(recompactLimit))
+	_, err := svc.Forward(c.Request.Context(), c, account, body)
+	var failover *UpstreamFailoverError
+	require.ErrorAs(t, err, &failover, "internal compact 401 must reach the scheduler")
+	require.Empty(t, rec.Body.String(), "do not commit a recovery 400 before account failover")
+	replay, ok := ResumeOpenAICompactionFailover(c, err)
+	require.True(t, ok)
+	require.Contains(t, string(replay), "7391")
+	require.NotContains(t, string(replay), "recovery-test-cipher")
+	backup := *account
+	backup.ID++
+	backup.Credentials = map[string]any{"api_key": "backup"}
+	_, err = svc.Forward(c.Request.Context(), c, &backup, replay)
+	require.NoError(t, err)
+	require.Contains(t, rec.Body.String(), "resp_backup")
+	require.Len(t, backupBodies, 2)
+	require.Contains(t, backupBodies[0], "7391")
+	require.Contains(t, backupBodies[1], "fresh-context-cipher")
+	require.Equal(t, 2, compactionRecoveryTurn(c).maintenanceCalls, "the maintenance count spans both accounts")
+
+}
+
+func TestCompactionRecompactCredentialFailoverGuards(t *testing.T) {
+	for _, scenario := range []string{"401", "429", "revoked", "400", "403", "503", "balance", "cancel", "deadline", "stop", "unrestored", "reference"} {
+		t.Run(scenario, func(t *testing.T) {
+			svc := &OpenAIGatewayService{}
+			c, _ := httpBridgeContext("maintenance-guards")
+			body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+			svc.beginCompactionRecoveryTurn(c, body, false)
+			turn := compactionRecoveryTurn(c)
+			turn.restored = true
+			turn.started = time.Now().Add(-time.Second)
+			turn.maintenance = time.Second
+			turn.maintenanceCalls = 1
+			retry := &openAICompactionReplayRetry{body: body, recompact: true}
+			cause := error(&UpstreamFailoverError{StatusCode: 401})
+			switch scenario {
+			case "429":
+				cause = &UpstreamFailoverError{StatusCode: 429, RetryableOnSameAccount: true, SameAccountRetryDeadline: time.Now().Add(time.Minute), SameAccountRetryDelay: 30 * time.Second}
+			case "revoked":
+				cause = &UpstreamFailoverError{Stage: GatewayFailureStageAccountAuth, Scope: GatewayFailureScopeAccount}
+			case "400":
+				cause = &UpstreamFailoverError{StatusCode: 400}
+			case "403":
+				cause = &UpstreamFailoverError{StatusCode: 403}
+			case "503":
+				cause = &UpstreamFailoverError{StatusCode: 503}
+			case "balance":
+				cause = errors.Join(cause, ErrInsufficientBalance)
+			case "cancel":
+				cause = errors.Join(cause, context.Canceled)
+			case "deadline":
+				cause = errors.Join(cause, context.DeadlineExceeded)
+			case "stop":
+				cause = &UpstreamFailoverError{StatusCode: 401, NextAccountAction: NextAccountStop}
+			case "unrestored":
+				turn.restored = false
+			case "reference":
+				retry.body = compactionTestBody(`{"type":"item_reference","id":"msg_missing"},`+recoveryUser, true)
+			}
+			handoff := compactionAccountFailover(context.Background(), c, retry, cause)
+			if scenario != "401" && scenario != "429" && scenario != "revoked" {
+				require.Nil(t, handoff)
+				return
+			}
+			require.NotNil(t, handoff)
+			if scenario == "429" {
+				var failover *UpstreamFailoverError
+				require.ErrorAs(t, handoff, &failover)
+				require.False(t, failover.RetryableOnSameAccount)
+				require.True(t, failover.SameAccountRetryDeadline.IsZero())
+				require.Zero(t, failover.SameAccountRetryDelay)
+			}
+			full, ok := ResumeOpenAICompactionFailover(c, handoff)
+			require.True(t, ok)
+			started := turn.started
+			finishCompactionRecoveryTurn(c)
+			if scenario == "401" {
+				svc.beginPassthroughCompaction(c, &openAIWSPassthroughRecovery{limit: openAICompactionRecoveryMaxRaw}, full, "gpt-6-astra", &Account{ID: 99}, time.Now())
+			} else {
+				svc.beginCompactionRecoveryTurn(c, full, false, &Account{ID: 99})
+			}
+			next := compactionRecoveryTurn(c)
+			require.Equal(t, started, next.started)
+			require.Equal(t, turn.maintenanceCalls, next.maintenanceCalls)
+			maintenance := pendingCompactionMaintenance(c)
+			require.NotNil(t, maintenance)
+			svc.beginCompactionRecoveryTurn(c, full, false, &Account{ID: 99})
+			require.Nil(t, pendingCompactionMaintenance(c), "handoff consumed exactly once")
+		})
+	}
+}
+
+func TestCompactionRecompactNativeStreamCredentialFailover(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_maintenance"}}`+"\n\ndata: "+`{"type":"response.failed","response":{"error":{"code":"invalid_api_key","message":"Invalid API key"}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+	svc, account, _ := httpBridgeFixture(t, upstream.URL)
+	base, _ := url.Parse(upstream.URL)
+	svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+	c, rec := httpBridgeContext("native-compact-401")
+	body := compactionTestBody(recoveryImage+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	turn := compactionRecoveryTurn(c)
+	turn.restored = true
+	retry := &openAICompactionReplayRetry{body: body, recompact: true}
+	_, err := svc.prepareCompactionRetry(c.Request.Context(), c, account, retry)
+	require.NotNil(t, compactionAccountFailover(c.Request.Context(), c, retry, err), "internal start events must not hide stream auth failure: %v", err)
+	require.Empty(t, rec.Body.String())
+}
+
+func TestCompactionRecompactPartialCredentialFailover(t *testing.T) {
+	var failedBodies, backupBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer backup" {
+			backupBodies = append(backupBodies, string(raw))
+			_, _ = fmt.Fprintf(w, `{"usage":{},"output":[%s]}`, recompactSummary)
+			return
+		}
+		failedBodies = append(failedBodies, string(raw))
+		switch len(failedBodies) {
+		case 1:
+			w.WriteHeader(400)
+			_, _ = fmt.Fprintf(w, `{"error":%s}`, gjson.Get(recompactLimit, "response.error").Raw)
+		case 2:
+			_, _ = io.WriteString(w, `{"usage":{},"output":[{"type":"compaction","encrypted_content":"failed-account-partial-cipher"}]}`)
+		default:
+			w.WriteHeader(401)
+			_, _ = io.WriteString(w, `{"error":{"code":"invalid_api_key","message":"Invalid API key"}}`)
+		}
+	}))
+	defer upstream.Close()
+	svc, account, _ := httpBridgeFixture(t, upstream.URL)
+	account.Type, account.Credentials = AccountTypeAPIKey, map[string]any{"api_key": "first"}
+	base, _ := url.Parse(upstream.URL)
+	svc.httpUpstream = compactionRecoveryLocalHTTP{base}
+	closeRecoveryStore(t, svc.compactionRecoveryStore())
+	c, _ := httpBridgeContext("partial-compact-auth")
+	var history []string
+	for i := 0; i < 8; i++ {
+		history = append(history, fmt.Sprintf(`{"role":"user","content":"original-%d"}`, i))
+	}
+	body := compactionTestBody(strings.Join(history, ",")+","+recoveryUser, true)
+	svc.beginCompactionRecoveryTurn(c, body, false, account)
+	compactionRecoveryTurn(c).restored = true
+	retry := &openAICompactionReplayRetry{body: body, recompact: true}
+	_, err := svc.prepareCompactionRetry(c.Request.Context(), c, account, retry)
+	require.Len(t, failedBodies, 3)
+	require.Contains(t, failedBodies[2], "failed-account-partial-cipher")
+	failover := compactionAccountFailover(c.Request.Context(), c, retry, err)
+	require.NotNil(t, failover)
+	full, ok := ResumeOpenAICompactionFailover(c, failover)
+	require.True(t, ok)
+	require.NotContains(t, string(full), "failed-account-partial-cipher")
+	backup := *account
+	backup.ID++
+	backup.Credentials = map[string]any{"api_key": "backup"}
+	svc.beginCompactionRecoveryTurn(c, full, false, &backup)
+	_, err = svc.prepareCompactionRetry(c.Request.Context(), c, &backup, pendingCompactionMaintenance(c))
+	require.NoError(t, err)
+	require.Len(t, backupBodies, 1)
+	for i := 0; i < 8; i++ {
+		require.Contains(t, backupBodies[0], fmt.Sprintf("original-%d", i))
+	}
+	require.Equal(t, 4, compactionRecoveryTurn(c).maintenanceCalls)
 }

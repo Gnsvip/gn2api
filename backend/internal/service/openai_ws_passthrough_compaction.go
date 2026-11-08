@@ -111,6 +111,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(ctx context.
 				requesttiming.FinishRecorder(c, recovery.recorder, 499)
 				return err
 			}
+			if failover := compactionAccountFailover(ctx, c, recovery.retry, err); failover != nil {
+				if hooks != nil && hooks.AfterTurn != nil {
+					hooks.AfterTurn(offset+recovery.completed+1, nil, failover)
+				}
+				return newOpenAIWSCurrentTurnFailoverError(failover, RemovePreviousResponseIDFromBody(recovery.retry.body))
+			}
 			writeCtx, cancel := newOpenAIWSDownstreamWriteContext(ctx, hooks, s.openAIWSWriteTimeout())
 			_ = client.Write(writeCtx, coderws.MessageText, openAIRecompactionErrorEvent(err))
 			cancel()
@@ -203,9 +209,7 @@ func (s *OpenAIGatewayService) beginPassthroughCompaction(c *gin.Context, replay
 		}
 	}
 	body = s.beginCompactionRecoveryWithReplay(c, body, history, id, complete, account)
-	if turn := compactionRecoveryTurn(c); turn != nil {
-		turn.started = started
-	}
+	compactionRecoveryStartTime(c, started)
 	replay.begin(body, model)
 	if !replay.canRetry() {
 		if turn := compactionRecoveryTurn(c); turn != nil {

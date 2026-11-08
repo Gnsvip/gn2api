@@ -16,11 +16,71 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const (
-	openAIRecoveryCompactInternalKey = "openai_recovery_compact_internal"
-	openAIRecoveryCompactMaxCalls    = 8
-	openAIRecoveryCompactTimeout     = 2 * time.Minute
-)
+const openAIRecoveryCompactInternalKey = "openai_recovery_compact_internal"
+
+// Only a verified restored window may cross accounts after maintenance auth/429
+// failure. Keep this request-local, never in wire JSON or a persistent cache.
+const openAICompactionFailoverResumeKey = "openai_compaction_failover_resume"
+
+type openAICompactionAccountFailover struct {
+	cause error
+	body  []byte
+	state openAICompactionRecoveryTurn
+}
+
+func (e *openAICompactionAccountFailover) Error() string { return e.cause.Error() }
+func (e *openAICompactionAccountFailover) Unwrap() error { return e.cause }
+
+func compactionAccountFailover(ctx context.Context, c *gin.Context, retry *openAICompactionReplayRetry, cause error) error {
+	var failover *UpstreamFailoverError
+	var interrupted *OpenAIWSClientCloseError
+	turn := compactionRecoveryTurn(c)
+	if ctx.Err() != nil || errors.As(cause, &interrupted) || errors.Is(cause, context.Canceled) ||
+		errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, ErrInsufficientBalance) ||
+		retry == nil || !retry.recompact || turn == nil || !turn.restored ||
+		!errors.As(cause, &failover) || !failover.ShouldRetryNextAccount() ||
+		!(failover.StatusCode == http.StatusUnauthorized || failover.StatusCode == http.StatusTooManyRequests ||
+			(failover.IsCredentialFailure() && failover.Scope == GatewayFailureScopeAccount)) {
+		return nil
+	}
+	items, exists, err := openAIWSExtractNormalizedInputSequence(retry.body)
+	if err != nil || !exists || !openAIWSReplayInputPortable(items) {
+		return nil
+	}
+	// Use the input BEFORE any partial compact pass, not that account's new cipher.
+	body := RemovePreviousResponseIDFromBody(retry.body)
+	state := openAICompactionRecoveryTurn{
+		restored: true, retried: true, needsCompact: true,
+		started: turn.started, maintenance: turn.maintenance,
+		maintenanceCalls: turn.maintenanceCalls,
+	}
+	if failover.StatusCode == http.StatusTooManyRequests {
+		// Maintenance 429 switches immediately, even when the account/pool's
+		// ordinary inference policy would wait and retry this credential.
+		next := *failover
+		next.RetryableOnSameAccount = false
+		next.SameAccountRetryDeadline = time.Time{}
+		next.SameAccountRetryDelay = 0
+		cause = &next
+	}
+	return &openAICompactionAccountFailover{cause: cause, body: bytes.Clone(body), state: state}
+}
+
+// ResumeOpenAICompactionFailover hands the scheduler the current restored turn.
+// The next selected account must compact it before generation. Model policy is
+// evaluated again on that account; maintenance counters and TTFT are retained.
+func ResumeOpenAICompactionFailover(c *gin.Context, err error) ([]byte, bool) {
+	var recovery *openAICompactionAccountFailover
+	if c == nil || !errors.As(err, &recovery) {
+		return nil, false
+	}
+	state := recovery.state
+	c.Set(openAICompactionFailoverResumeKey, &state)
+	if c.Request != nil {
+		c.Request.Header.Del(openAIWSTurnStateHeader)
+	}
+	return bytes.Clone(recovery.body), true
+}
 
 // The last response's error was already delivered. Its next explicit create
 // can repair the verified history before any generation event is committed.
@@ -306,6 +366,11 @@ func compactionRecoveryCuts(items []json.RawMessage) ([]int, int, error) {
 			end = cut
 		}
 	}
+	// Keep freshly reinjected harness instructions with the new input. They
+	// must retain their system/developer role after the maintenance pass.
+	for end > 0 && isCompactionRecoverySetup(items[end-1]) {
+		end--
+	}
 	if end == 0 {
 		return nil, 0, errors.New("no complete history prefix can be compacted")
 	}
@@ -323,8 +388,8 @@ func (s *OpenAIGatewayService) prepareCompactionRetry(ctx context.Context, c *gi
 			turn.maintenance += time.Since(started)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(ctx, openAIRecoveryCompactTimeout)
-	defer cancel()
+	// Use the caller's lifetime. A long but progressing recovery must not be
+	// cut off by a separate maintenance deadline or a fixed number of calls.
 	items, exists, err := openAIWSExtractNormalizedInputSequence(retry.body)
 	if err != nil || !exists {
 		return nil, errors.New("restored history is unavailable for compaction")
@@ -334,20 +399,39 @@ func (s *OpenAIGatewayService) prepareCompactionRetry(ctx context.Context, c *gi
 		return nil, err
 	}
 	var window []json.RawMessage
-	consumed, target, calls := 0, prefixEnd, 0
+	consumed, target, calls, transientRetries := 0, prefixEnd, 0, 0
 	for consumed < prefixEnd {
 		if err := ctx.Err(); err != nil {
 			return nil, err
-		}
-		if calls >= openAIRecoveryCompactMaxCalls {
-			return nil, errors.New("automatic compaction call limit reached")
 		}
 		input := make([]json.RawMessage, 0, len(window)+target-consumed)
 		input = append(input, window...)
 		input = append(input, items[consumed:target]...)
 		calls++
+		if turn != nil {
+			turn.maintenanceCalls++
+		}
 		output, compactErr := s.runRecoveryCompact(ctx, c, account, retry.body, input, calls)
 		if compactErr != nil {
+			var transient *openAIRecoveryCompactTransientError
+			if errors.As(compactErr, &transient) {
+				delay := recoveryCompactBackoff(transientRetries)
+				if remaining := time.Until(transient.notBefore); remaining > delay {
+					delay = remaining
+				}
+				transientRetries++
+				logOpenAIWSModeInfo("compaction_retry_backoff account_id=%d call=%d retry=%d status=%d delay_ms=%d", account.ID, calls, transientRetries, transient.status, delay.Milliseconds())
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, ctx.Err()
+				case <-timer.C:
+				}
+				// Retry this exact segment. Do not advance past failed input or
+				// throw away the compact windows already completed on this account.
+				continue
+			}
 			var limit *openAIRecoveryCompactLimitError
 			if !errors.As(compactErr, &limit) {
 				return nil, compactErr
@@ -371,12 +455,13 @@ func (s *OpenAIGatewayService) prepareCompactionRetry(ctx context.Context, c *gi
 			if next == consumed {
 				return nil, errors.New("a complete history item or tool exchange exceeds the compaction window")
 			}
-			target = next
+			target, transientRetries = next, 0
 			continue
 		}
 		// The entire returned window is the next compact pass's prefix. Never
 		// extract just its opaque summary and discard retained user/tool items.
 		window, consumed, target = prependCompactionRecoverySetup(items[:prefixEnd], output), target, prefixEnd
+		transientRetries = 0
 	}
 	// Codex prepends its native system/developer setup to the compact window.
 	// Keep the client's original setup too: otherwise a summary-only window
@@ -397,6 +482,15 @@ func (s *OpenAIGatewayService) prepareCompactionRetry(ctx context.Context, c *gi
 	}
 	logOpenAIWSModeInfo("compaction_context_recompacted account_id=%d calls=%d input_items=%d compacted_items=%d output_items=%d", account.ID, calls, len(items), prefixEnd, len(nextItems))
 	return next, nil
+}
+
+// Cap the polling frequency, not recovery duration or attempt count. Retry-After
+// may require a longer wait; the caller can interrupt either delay at any time.
+func recoveryCompactBackoff(retries int) time.Duration {
+	if retries >= 5 {
+		return 30 * time.Second
+	}
+	return time.Second << retries
 }
 
 func prependCompactionRecoverySetup(source, output []json.RawMessage) []json.RawMessage {
